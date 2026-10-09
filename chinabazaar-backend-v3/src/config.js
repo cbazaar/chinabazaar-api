@@ -27,6 +27,11 @@ const cfg = {
   })(),
   shippingCents: parseInt(process.env.SHIPPING_CENTS || '0', 10),
 
+  // İlk admin kurulum anahtarı: doluysa, kayıt sırasında body.admin_key
+  // bu değerle eşleşen kullanıcı is_admin=TRUE olur. Kurulumdan sonra
+  // Railway değişkenlerinden KALDIRILMASI önerilir.
+  adminSetupKey: process.env.ADMIN_SETUP_KEY || '',
+
   iyzico: {
     enabled: Boolean(process.env.IYZICO_API_KEY && process.env.IYZICO_SECRET_KEY),
     apiKey: process.env.IYZICO_API_KEY || '',

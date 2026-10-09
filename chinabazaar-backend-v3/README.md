@@ -13,10 +13,15 @@ Türkiye odaklı dikey video e-ticaret backend'i. **Node.js + Express + PostgreS
 | Metod | Yol | Açıklama |
 |---|---|---|
 | GET | `/healthz` | Railway healthcheck |
-| GET | `/api/products?category=&q=&limit=&offset=&sort=` | Ürün listesi (ön yüz sözleşmesi: `name, tagline, description, price_cents, price_display, sold_count, stock, category, video_url, thumb_url`) |
+| GET | `/api/products` | Ürün listesi (ön yüz sözleşmesi: `name, tagline, description, price_cents, price_display, sold_count, stock, category, video_url, thumb_url`); admin `?all=true` ile pasifleri de görür |
 | GET | `/api/products/:id` | Ürün detayı |
-| POST | `/api/auth/register` | Kayıt `{email, password, name, phone?}` → JWT |
+| POST | `/api/products` | Ürün ekle — `name, price(TRY), stock?, description?, tagline?, sku?, image_url?, video_url?, category(slug/UUID)?, is_active?` (yalnız admin) |
+| PUT | `/api/products/:id` | Ürün güncelle — kısmi alanlar (yalnız admin) |
+| DELETE | `/api/products/:id` | Ürün sil — geçmiş siparişler korunur (FK SET NULL) (yalnız admin) |
+| POST | `/api/auth/register` | Kayıt `{email, password, name, phone?, admin_key?}` → JWT (`admin_key` = `ADMIN_SETUP_KEY` ise admin) |
 | POST | `/api/auth/login` | Giriş `{email, password}` → JWT |
+| GET | `/api/auth/me` | Profil `{id, email, name, phone, is_admin}` (JWT) |
+| GET | `/api/orders` | Kendi siparişleri (created_at DESC, JWT); admin `?all=true` ile tüm siparişler (kullanıcı e-postasıyla) |
 | GET | `/api/addresses` | Adres listesi (JWT) |
 | POST | `/api/addresses` | Adres ekle (il/ilçe/mahalle, JWT) |
 | GET | `/api/favorites` | Favori ürünler (JWT) |
@@ -31,6 +36,12 @@ Türkiye odaklı dikey video e-ticaret backend'i. **Node.js + Express + PostgreS
 | POST | `/api/payments/iyzico/callback` | Ödeme sonucu `{token}` → sipariş `paid` olur |
 
 JWT kullanımı: `Authorization: Bearer <token>`
+
+## İlk admin kurulumu
+
+1. Railway → API servisi → Variables → `ADMIN_SETUP_KEY` için güçlü rastgele değer gir (örn. `openssl rand -hex 16`).
+2. `admin.html` kayıt formundaki "Kurulum anahtarı" alanına bu değeri yazarak kaydol → `is_admin=TRUE`.
+3. Kurulum bitince `ADMIN_SETUP_KEY` değişkenini Railway'den SİL (artık gerekmez; mevcut admin'ler etkilenmez).
 
 ## Sipariş durumları (6 aşamalı kanonik enum)
 

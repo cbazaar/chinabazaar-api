@@ -20,4 +20,17 @@ function requireAuth(req, res, next) {
   }
 }
 
-module.exports = { signToken, requireAuth };
+// Geçerli token varsa req.user doldurur, yoksa sessizce devam eder.
+function optionalAuth(req, _res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (token) {
+    try {
+      const payload = jwt.verify(token, cfg.jwtSecret);
+      req.user = { id: payload.sub, email: payload.email };
+    } catch { /* yok say */ }
+  }
+  next();
+}
+
+module.exports = { signToken, requireAuth, optionalAuth };

@@ -4,6 +4,7 @@ const { body, param } = require('express-validator');
 const asyncHandler = require('../middleware/asyncHandler');
 const { checkValidation } = require('../middleware/validate');
 const { requireAuth } = require('../middleware/auth');
+const { requireAdmin } = require('../middleware/admin');
 const { STAGES, TERMINAL } = require('../orderStages');
 const cfg = require('../config');
 const pool = require('../db');
@@ -16,6 +17,29 @@ function nextOrderNo() {
   const rand = Math.floor(100000 + Math.random() * 900000);
   return `CB-${new Date().getFullYear()}-${rand}`;
 }
+
+// GET /api/orders — kendi siparişleri (created_at DESC).
+// Admin ?all=true ile tüm siparişleri (kullanıcı e-postasıyla) görür.
+router.get(
+  '/',
+  asyncHandler(async (req, res) => {
+    if (req.query.all === 'true') {
+      const { rows: me } = await pool.query('SELECT is_admin FROM users WHERE id = $1', [req.user.id]);
+      if (!me[0]?.is_admin) return res.status(403).json({ error: 'forbidden' });
+      const { rows } = await pool.query(
+        `SELECT o.*, u.email AS user_email FROM orders o
+         LEFT JOIN users u ON u.id = o.user_id
+         ORDER BY o.created_at DESC LIMIT 200`
+      );
+      return res.json({ items: rows });
+    }
+    const { rows } = await pool.query(
+      'SELECT * FROM orders WHERE user_id = $1 ORDER BY created_at DESC',
+      [req.user.id]
+    );
+    res.json({ items: rows });
+  })
+);
 
 // POST /api/orders  { address_id, items: [{ product_id, qty }] }
 router.post(
@@ -144,14 +168,12 @@ router.get(
 // PATCH /api/orders/:id/tracking — kargo bilgisi güncelleme (yalnız admin)
 router.patch(
   '/:id/tracking',
+  requireAdmin,
   param('id').isUUID(),
   body('cargo_company').optional().trim().isLength({ max: 60 }),
   body('tracking_number').optional().trim().isLength({ max: 60 }),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
-    const { rows: me } = await pool.query('SELECT is_admin FROM users WHERE id = $1', [req.user.id]);
-    if (!me[0]?.is_admin) return res.status(403).json({ error: 'forbidden' });
-
     const { cargo_company, tracking_number } = req.body;
     if (cargo_company === undefined && tracking_number === undefined) {
       return res.status(400).json({ error: 'nothing_to_update' });
@@ -176,6 +198,7 @@ router.patch(
 // + cancelled/refunded. Geçersiz değer 400 ile reddedilir.
 router.patch(
   '/:id/status',
+  requireAdmin,
   param('id').isUUID(),
   body('status')
     .isString()
@@ -183,9 +206,6 @@ router.patch(
     .withMessage('invalid_status'),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
-    const { rows: me } = await pool.query('SELECT is_admin FROM users WHERE id = $1', [req.user.id]);
-    if (!me[0]?.is_admin) return res.status(403).json({ error: 'forbidden' });
-
     const { rows } = await pool.query(
       `UPDATE orders SET status = $2, updated_at = now() WHERE id = $1
        RETURNING id, order_no, status, cargo_company, tracking_number, updated_at`,

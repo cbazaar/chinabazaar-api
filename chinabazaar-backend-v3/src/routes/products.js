@@ -2,9 +2,11 @@
 // { id, name, tagline, description, price_cents, price_display, currency,
 //   sold_count, stock, category: {id, slug, name}, video_url, thumb_url }
 const express = require('express');
-const { param } = require('express-validator');
+const { body, param } = require('express-validator');
 const asyncHandler = require('../middleware/asyncHandler');
 const { checkValidation } = require('../middleware/validate');
+const { requireAuth, optionalAuth } = require('../middleware/auth');
+const { requireAdmin } = require('../middleware/admin');
 const pool = require('../db');
 
 const router = express.Router();
@@ -40,15 +42,25 @@ const SELECT = `
 `;
 
 // GET /api/products?category=electronics&q=kulaklik&limit=20&offset=0&sort=popular
+// Admin ?all=true ile pasif ürünleri de görür (token gerekli).
 router.get(
   '/',
+  optionalAuth,
   asyncHandler(async (req, res) => {
     const { category, q } = req.query;
     const limit = Math.min(parseInt(req.query.limit || '20', 10), 100);
     const offset = Math.max(parseInt(req.query.offset || '0', 10), 0);
     const sort = req.query.sort || 'popular'; // popular | newest | price_asc | price_desc
 
-    const where = ['p.is_active = TRUE'];
+    let showAll = false;
+    if (req.query.all === 'true') {
+      if (!req.user) return res.status(401).json({ error: 'unauthorized' });
+      const { rows: me } = await pool.query('SELECT is_admin FROM users WHERE id = $1', [req.user.id]);
+      showAll = !!me[0]?.is_admin;
+      if (!showAll) return res.status(403).json({ error: 'forbidden' });
+    }
+
+    const where = [showAll ? 'TRUE' : 'p.is_active = TRUE'];
     const params = [];
     if (category) {
       params.push(category);
@@ -83,6 +95,134 @@ router.get(
     const { rows } = await pool.query(`${SELECT} WHERE p.id = $1 AND p.is_active = TRUE`, [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: 'product_not_found' });
     res.json(toProduct(rows[0]));
+  })
+);
+
+// ---- Admin CRUD (yalnız is_admin) ----
+
+const productValidators = [
+  body('name').trim().isLength({ min: 2, max: 200 }),
+  body('price').isFloat({ min: 0, max: 10000000 }).withMessage('price_must_be_non_negative'),
+  body('stock').optional().isInt({ min: 0, max: 1000000 }),
+  body('description').optional().trim().isLength({ max: 10000 }),
+  body('tagline').optional().trim().isLength({ max: 200 }),
+  body('sku').optional().trim().isLength({ max: 60 }),
+  body('image_url').optional({ values: 'falsy' }).isURL({ max_length: 2048 }),
+  body('video_url').optional({ values: 'falsy' }).isURL({ max_length: 2048 }),
+  body('category').optional({ values: 'falsy' }).trim().isLength({ max: 100 }),
+  body('is_active').optional().isBoolean(),
+];
+
+// category: slug veya UUID kabul eder → category_id çözer (boşsa NULL)
+async function resolveCategoryId(category) {
+  if (!category) return null;
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(category)) return category;
+  const { rows } = await pool.query('SELECT id FROM categories WHERE slug = $1', [category]);
+  return rows[0]?.id || null;
+}
+
+function toCents(price) {
+  return Math.round(Number(price) * 100);
+}
+
+// POST /api/products — yeni ürün (admin)
+router.post(
+  '/',
+  requireAuth,
+  requireAdmin,
+  ...productValidators,
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    const { name, price, stock, description, tagline, sku, image_url, video_url, category, is_active } = req.body;
+    const categoryId = await resolveCategoryId(category);
+    try {
+      const { rows } = await pool.query(
+        `INSERT INTO products (sku, name, tagline, description, price_cents, stock, category_id, video_url, thumb_url, is_active)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+        [
+          sku || null, name, tagline || null, description || null, toCents(price),
+          stock ?? 0, categoryId, video_url || null, image_url || null,
+          is_active === undefined ? true : is_active,
+        ]
+      );
+      res.status(201).json(toProduct({ ...rows[0], category_slug: null, category_name: null }));
+    } catch (err) {
+      if (err.code === '23505') return res.status(409).json({ error: 'sku_in_use' });
+      throw err;
+    }
+  })
+);
+
+// PUT /api/products/:id — ürün güncelleme (admin, kısmi)
+router.put(
+  '/:id',
+  requireAuth,
+  requireAdmin,
+  param('id').isUUID(),
+  body('name').optional().trim().isLength({ min: 2, max: 200 }),
+  body('price').optional().isFloat({ min: 0, max: 10000000 }),
+  body('stock').optional().isInt({ min: 0, max: 1000000 }),
+  body('description').optional().trim().isLength({ max: 10000 }),
+  body('tagline').optional().trim().isLength({ max: 200 }),
+  body('sku').optional().trim().isLength({ max: 60 }),
+  body('image_url').optional({ values: 'falsy' }).isURL({ max_length: 2048 }),
+  body('video_url').optional({ values: 'falsy' }).isURL({ max_length: 2048 }),
+  body('category').optional({ values: 'falsy' }).trim().isLength({ max: 100 }),
+  body('is_active').optional().isBoolean(),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    const map = {
+      name: 'name', tagline: 'tagline', description: 'description', sku: 'sku',
+      video_url: 'video_url', image_url: 'thumb_url', is_active: 'is_active',
+    };
+    const sets = [];
+    const params = [req.params.id];
+    for (const [key, col] of Object.entries(map)) {
+      if (req.body[key] !== undefined) {
+        params.push(key === 'image_url' && !req.body[key] ? null : req.body[key]);
+        sets.push(`${col} = $${params.length}`);
+      }
+    }
+    if (req.body.price !== undefined) {
+      params.push(toCents(req.body.price));
+      sets.push(`price_cents = $${params.length}`);
+    }
+    if (req.body.stock !== undefined) {
+      params.push(req.body.stock);
+      sets.push(`stock = $${params.length}`);
+    }
+    if (req.body.category !== undefined) {
+      params.push(await resolveCategoryId(req.body.category));
+      sets.push(`category_id = $${params.length}`);
+    }
+    if (!sets.length) return res.status(400).json({ error: 'nothing_to_update' });
+    sets.push('updated_at = now()');
+    try {
+      const { rows } = await pool.query(
+        `UPDATE products SET ${sets.join(', ')} WHERE id = $1 RETURNING *`,
+        params
+      );
+      if (!rows.length) return res.status(404).json({ error: 'product_not_found' });
+      res.json(toProduct({ ...rows[0], category_slug: null, category_name: null }));
+    } catch (err) {
+      if (err.code === '23505') return res.status(409).json({ error: 'sku_in_use' });
+      throw err;
+    }
+  })
+);
+
+// DELETE /api/products/:id — ürün silme (admin).
+// order_items FK'si ON DELETE SET NULL: geçmiş siparişler korunur (ad/fiyat snapshot'ı durur).
+router.delete(
+  '/:id',
+  requireAuth,
+  requireAdmin,
+  param('id').isUUID(),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    const { rows } = await pool.query('DELETE FROM products WHERE id = $1 RETURNING id', [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'product_not_found' });
+    res.json({ deleted: true, id: rows[0].id });
   })
 );
 

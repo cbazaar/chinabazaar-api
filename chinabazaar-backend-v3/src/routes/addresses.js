@@ -1,6 +1,6 @@
 // Teslimat adresleri (Türkiye: il / ilçe / mahalle)
 const express = require('express');
-const { body } = require('express-validator');
+const { body, param } = require('express-validator');
 const asyncHandler = require('../middleware/asyncHandler');
 const { checkValidation } = require('../middleware/validate');
 const { requireAuth } = require('../middleware/auth');
@@ -12,7 +12,7 @@ router.use(requireAuth);
 const validators = [
   body('label').optional().trim().isLength({ max: 30 }),
   body('full_name').trim().isLength({ min: 2, max: 100 }),
-  body('phone').isMobilePhone('tr-TR'),
+  body('phone').matches(/^\+?[0-9][0-9\s\-().]{6,19}$/),
   body('city').trim().notEmpty(),          // il
   body('district').trim().notEmpty(),      // ilçe
   body('neighborhood').optional().trim(),   // mahalle
@@ -59,6 +59,21 @@ router.post(
     } finally {
       client.release();
     }
+  })
+);
+
+// DELETE /api/addresses/:id — yalnız kendi adresini silebilir
+router.delete(
+  '/:id',
+  param('id').isUUID(),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    const { rows } = await pool.query(
+      'DELETE FROM addresses WHERE id = $1 AND user_id = $2 RETURNING id',
+      [req.params.id, req.user.id]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'address_not_found' });
+    res.json({ deleted: true, id: rows[0].id });
   })
 );
 
