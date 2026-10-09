@@ -1,24 +1,14 @@
 // Kimlik doğrulama: kayıt + giriş (JWT)
 const express = require('express');
 const bcrypt = require('bcryptjs');
-const rateLimit = require('express-rate-limit');
-const { body, validationResult } = require('express-validator');
+const { body } = require('express-validator');
 const asyncHandler = require('../middleware/asyncHandler');
+const { checkValidation } = require('../middleware/validate');
+const { loginLimiter, registerLimiter } = require('../middleware/rateLimit');
 const { signToken } = require('../middleware/auth');
 const pool = require('../db');
 
 const router = express.Router();
-
-const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30 });
-
-function checkValidation(req, res) {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) {
-    res.status(400).json({ error: 'validation_failed', details: errors.array() });
-    return false;
-  }
-  return true;
-}
 
 function publicUser(row) {
   return { id: row.id, email: row.email, name: row.name, phone: row.phone };
@@ -27,7 +17,7 @@ function publicUser(row) {
 // POST /api/auth/register  { email, password, name, phone? }
 router.post(
   '/register',
-  authLimiter,
+  registerLimiter,
   body('email').isEmail().normalizeEmail(),
   body('password').isLength({ min: 8 }),
   body('name').trim().isLength({ min: 2, max: 100 }),
@@ -54,7 +44,7 @@ router.post(
 // POST /api/auth/login  { email, password }
 router.post(
   '/login',
-  authLimiter,
+  loginLimiter,
   body('email').isEmail().normalizeEmail(),
   body('password').notEmpty(),
   asyncHandler(async (req, res) => {
