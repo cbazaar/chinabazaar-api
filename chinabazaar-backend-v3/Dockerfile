@@ -1,4 +1,5 @@
-FROM node:20-alpine
+# Docker Hub yerine AWS ECR Public aynası (registry-1.docker.io erişim sorunlarına karşı)
+FROM public.ecr.aws/docker/library/node:20-alpine
 WORKDIR /app
 COPY package*.json ./
 RUN npm install --omit=dev
