@@ -38,6 +38,12 @@ const cfg = {
     secretKey: process.env.IYZICO_SECRET_KEY || '',
     baseUrl: process.env.IYZICO_BASE_URL || 'https://sandbox-api.iyzipay.com',
   },
+
+  // Cloudflare Stream — ürün videoları (token YALNIZCA sunucuda tutulur)
+  stream: {
+    accountId: process.env.CLOUDFLARE_ACCOUNT_ID || '',
+    apiToken: process.env.CLOUDFLARE_STREAM_API_TOKEN || '',
+  },
 };
 
 if (!cfg.databaseUrl) {
