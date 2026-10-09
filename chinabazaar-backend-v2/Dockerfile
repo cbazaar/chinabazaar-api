@@ -4,6 +4,7 @@ COPY package*.json ./
 RUN npm install --omit=dev
 COPY src ./src
 COPY schema.sql ./
+COPY migrations ./migrations
 EXPOSE 3000
 # Önce şemayı uygula, sonra API'yi başlat
 CMD ["sh", "-c", "node src/migrate.js && node src/index.js"]

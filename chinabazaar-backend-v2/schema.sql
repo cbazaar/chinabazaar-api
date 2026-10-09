@@ -90,13 +90,19 @@ CREATE TABLE IF NOT EXISTS orders (
   id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id          UUID NOT NULL REFERENCES users(id),
   order_no         TEXT UNIQUE NOT NULL,                       -- CB-2026-000123
-  status           TEXT NOT NULL DEFAULT 'pending',            -- pending|paid|preparing|shipped|delivered|cancelled|refunded
+  status           TEXT NOT NULL DEFAULT 'pending'
+                   CONSTRAINT chk_orders_status
+                   CHECK (status IN ('pending','packing','ready','shipped','in_transit','arriving','delivered','cancelled','refunded')),
+                                                              -- 6 aşamalı kanonik: packing→ready→shipped→in_transit→arriving→delivered
   subtotal_cents   INT NOT NULL CHECK (subtotal_cents >= 0),
   shipping_cents   INT NOT NULL DEFAULT 0 CHECK (shipping_cents >= 0),
   total_cents      INT NOT NULL CHECK (total_cents >= 0),
   currency         CHAR(3) NOT NULL DEFAULT 'TRY',
   address_id       UUID REFERENCES addresses(id) ON DELETE SET NULL,
   address_snapshot TEXT,                                      -- teslimat adresi anlık kopyası (JSON)
+  cargo_company    TEXT,                                      -- kargo firması (örn. Aras, Yurtiçi)
+  tracking_number  TEXT,                                      -- kargo takip numarası
+  shipped_at       TIMESTAMPTZ,                               -- kargoya verilme zamanı
   created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
