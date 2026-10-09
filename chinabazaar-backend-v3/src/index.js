@@ -60,6 +60,7 @@ app.use('/api/favorites', require('./routes/favorites'));
 app.use('/api/orders', require('./routes/orders'));
 app.use('/api/payments', require('./routes/payments'));
 app.use('/api/tracking', require('./routes/tracking')); // herkese açık, sınırlı kargo sorgusu
+app.use('/api/payment-methods', require('./routes/paymentMethods'));
 
 // 404
 app.use((_req, res) => res.status(404).json({ error: 'not_found' }));
