@@ -11,8 +11,13 @@ const pool = require('../db');
 
 const router = express.Router();
 
-function formatTRY(cents) {
-  return new Intl.NumberFormat('tr-TR', { style: 'currency', currency: 'TRY' }).format(cents / 100);
+function formatPrice(cents, currency) {
+  const cur = ['TRY', 'USD', 'RUB'].includes(currency) ? currency : 'TRY';
+  try {
+    return new Intl.NumberFormat('tr-TR', { style: 'currency', currency: cur }).format(cents / 100);
+  } catch {
+    return new Intl.NumberFormat('tr-TR', { style: 'currency', currency: 'TRY' }).format(cents / 100);
+  }
 }
 
 function toProduct(row) {
@@ -23,8 +28,13 @@ function toProduct(row) {
     tagline: row.tagline,
     description: row.description,
     price_cents: row.price_cents,
-    price_display: formatTRY(row.price_cents),
+    price_display: formatPrice(row.price_cents, row.currency),
     currency: row.currency,
+    color: row.color,
+    size: row.size,
+    dimensions: row.dimensions,
+    box_dimensions: row.box_dimensions,
+    weight: row.weight,
     sold_count: row.sold_count,
     stock: row.stock,
     category: row.category_id
@@ -111,6 +121,12 @@ const productValidators = [
   body('video_url').optional({ values: 'falsy' }).isURL({ max_length: 2048 }),
   body('category').optional({ values: 'falsy' }).trim().isLength({ max: 100 }),
   body('is_active').optional().isBoolean(),
+  body('currency').optional().trim().isIn(['TRY', 'USD', 'RUB']),
+  body('color').optional().trim().isLength({ max: 200 }),
+  body('size').optional().trim().isLength({ max: 200 }),
+  body('dimensions').optional().trim().isLength({ max: 200 }),
+  body('box_dimensions').optional().trim().isLength({ max: 200 }),
+  body('weight').optional().trim().isLength({ max: 200 }),
 ];
 
 // category: slug veya UUID kabul eder → category_id çözer (boşsa NULL)
@@ -133,16 +149,18 @@ router.post(
   ...productValidators,
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
-    const { name, price, stock, description, tagline, sku, image_url, video_url, category, is_active } = req.body;
+    const { name, price, stock, description, tagline, sku, image_url, video_url, category, is_active, currency, color, size, dimensions, box_dimensions, weight } = req.body;
     const categoryId = await resolveCategoryId(category);
     try {
       const { rows } = await pool.query(
-        `INSERT INTO products (sku, name, tagline, description, price_cents, stock, category_id, video_url, thumb_url, is_active)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+        `INSERT INTO products (sku, name, tagline, description, price_cents, currency, stock, category_id, video_url, thumb_url, is_active, color, size, dimensions, box_dimensions, weight)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
         [
           sku || null, name, tagline || null, description || null, toCents(price),
+          ['TRY','USD','RUB'].includes(currency) ? currency : 'TRY',
           stock ?? 0, categoryId, video_url || null, image_url || null,
           is_active === undefined ? true : is_active,
+          color || null, size || null, dimensions || null, box_dimensions || null, weight || null,
         ]
       );
       res.status(201).json(toProduct({ ...rows[0], category_slug: null, category_name: null }));
@@ -169,11 +187,19 @@ router.put(
   body('video_url').optional({ values: 'falsy' }).isURL({ max_length: 2048 }),
   body('category').optional({ values: 'falsy' }).trim().isLength({ max: 100 }),
   body('is_active').optional().isBoolean(),
+  body('currency').optional().trim().isIn(['TRY', 'USD', 'RUB']),
+  body('color').optional().trim().isLength({ max: 200 }),
+  body('size').optional().trim().isLength({ max: 200 }),
+  body('dimensions').optional().trim().isLength({ max: 200 }),
+  body('box_dimensions').optional().trim().isLength({ max: 200 }),
+  body('weight').optional().trim().isLength({ max: 200 }),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     const map = {
       name: 'name', tagline: 'tagline', description: 'description', sku: 'sku',
       video_url: 'video_url', image_url: 'thumb_url', is_active: 'is_active',
+      currency: 'currency', color: 'color', size: 'size', dimensions: 'dimensions',
+      box_dimensions: 'box_dimensions', weight: 'weight',
     };
     const sets = [];
     const params = [req.params.id];

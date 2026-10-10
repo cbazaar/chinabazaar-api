@@ -39,6 +39,11 @@ CREATE TABLE IF NOT EXISTS products (
   category_id UUID REFERENCES categories(id) ON DELETE SET NULL,
   video_url   TEXT,                                           -- dikey video (Cloudflare Stream / mp4)
   thumb_url   TEXT,                                           -- kapak görseli
+  color       TEXT,                                           -- renk (örn: "Siyah")
+  size        TEXT,                                           -- boyut (örn: "42mm" / "M")
+  dimensions  TEXT,                                           -- ürün ölçüleri (örn: "15 x 10 x 5 cm")
+  box_dimensions TEXT,                                        -- kutu ölçüleri
+  weight      TEXT,                                           -- ağırlık (örn: "250 g")
   is_active   BOOLEAN NOT NULL DEFAULT TRUE,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
