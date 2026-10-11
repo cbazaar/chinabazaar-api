@@ -26,12 +26,29 @@ router.post('/send', asyncHandler(async (req, res) => {
   res.json({ ok: true, message: m.rows[0] });
 }));
 
-// Müşterinin mesajları
+// Müşterinin mesajları (?conversation_id ile geçmiş sohbet de okunabilir)
 router.get('/messages', asyncHandler(async (req, res) => {
-  const conv = await myConv(req.user.id);
+  let conv;
+  const cid = parseInt(req.query.conversation_id, 10);
+  if (cid) {
+    const chk = await pool.query(`SELECT * FROM chat_conversations WHERE id=$1 AND user_id=$2`, [cid, req.user.id]);
+    if (!chk.rows.length) return res.status(404).json({ ok: false, error: 'not_found' });
+    conv = chk.rows[0];
+  } else {
+    conv = await myConv(req.user.id);
+  }
   const r = await pool.query(`SELECT * FROM chat_messages WHERE conversation_id=$1 ORDER BY id ASC LIMIT 200`, [conv.id]);
   await pool.query(`UPDATE chat_messages SET read_by_customer=true WHERE conversation_id=$1 AND sender='admin'`, [conv.id]);
   res.json({ ok: true, conversation_id: conv.id, status: conv.status, messages: r.rows });
+}));
+
+// Geçmiş konuşmalar
+router.get('/history', asyncHandler(async (req, res) => {
+  const r = await pool.query(
+    `SELECT c.*, (SELECT body FROM chat_messages m WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1) AS last_body,
+     (SELECT count(*)::int FROM chat_messages m WHERE m.conversation_id=c.id) AS msg_count
+     FROM chat_conversations c WHERE c.user_id=$1 ORDER BY c.last_message_at DESC LIMIT 20`, [req.user.id]);
+  res.json({ ok: true, items: r.rows });
 }));
 
 // Okunmamış admin cevabı var mı

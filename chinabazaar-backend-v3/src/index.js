@@ -63,7 +63,8 @@ app.use('/api/tracking', require('./routes/tracking')); // herkese açık, sın�
 app.use('/api/chat', require('./routes/chat')); // müşteri canlı destek
 app.use('/api/payment-methods', require('./routes/paymentMethods'));
 app.use('/api/admin/stream', require('./routes/stream')); // Cloudflare Stream video yönetimi (admin)
-app.use('/api/admin', require('./routes/admin')); // kullanıcı + yorum yönetimi (admin)
+app.use('/api/admin', require('./routes/admin'));
+app.use('/api/accounting', require('./routes/accounting')); // muhasebe // kullanıcı + yorum yönetimi (admin)
 
 // 404
 app.use((_req, res) => res.status(404).json({ error: 'not_found' }));

@@ -16,9 +16,9 @@ router.get(
   '/users',
   asyncHandler(async (_req, res) => {
     const { rows } = await pool.query(
-      `SELECT u.id, u.email, u.name, u.phone, u.is_admin, u.is_blocked, u.email_verified, u.created_at,
+      `SELECT u.id, u.email, u.name, u.nickname, u.phone, u.is_admin, u.is_blocked, u.email_verified, u.created_at,
               (SELECT count(*)::int FROM orders o WHERE o.user_id = u.id) AS order_count
-       FROM users u ORDER BY u.created_at DESC LIMIT 500`
+       FROM users u ORDER BY u.name ASC LIMIT 500`
     );
     res.json({ items: rows });
   })
@@ -30,6 +30,7 @@ router.patch(
   param('id').isUUID(),
   body('is_blocked').optional().isBoolean(),
   body('is_admin').optional().isBoolean(),
+  body('nickname').optional().isString().isLength({ min: 2, max: 30 }).matches(/^[a-zA-Z0-9_.\-]+$/),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     if (req.params.id === req.user.id) return res.status(400).json({ error: 'cannot_modify_self' });
@@ -37,11 +38,12 @@ router.patch(
     const vals = [];
     if (typeof req.body.is_blocked === 'boolean') { vals.push(req.body.is_blocked); sets.push(`is_blocked = $${vals.length}`); }
     if (typeof req.body.is_admin === 'boolean') { vals.push(req.body.is_admin); sets.push(`is_admin = $${vals.length}`); }
+    if (typeof req.body.nickname === 'string') { vals.push(req.body.nickname); sets.push(`nickname = $${vals.length}`); }
     if (!sets.length) return res.status(400).json({ error: 'nothing_to_update' });
     vals.push(req.params.id);
     const { rows } = await pool.query(
       `UPDATE users SET ${sets.join(', ')}, updated_at = now() WHERE id = $${vals.length}
-       RETURNING id, email, name, is_admin, is_blocked`,
+       RETURNING id, email, name, nickname, is_admin, is_blocked`,
       vals
     );
     if (!rows.length) return res.status(404).json({ error: 'user_not_found' });
