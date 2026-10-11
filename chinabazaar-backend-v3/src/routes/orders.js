@@ -115,6 +115,19 @@ router.post(
       }
 
       await client.query('COMMIT');
+
+      // OTOMATİK FATURA OLUŞTUR
+      try {
+        const invNo = 'FTR-' + order.order_no;
+        const itemsJson = JSON.stringify(lines.map(l => ({ name: l.product.name, qty: l.qty, price_cents: l.product.price_cents })));
+        const userName = (await pool.query('SELECT name FROM users WHERE id=$1', [req.user.id])).rows[0]?.name || '';
+        await pool.query(
+          `INSERT INTO invoices (invoice_no, order_id, customer_name, items, subtotal_cents, vat_cents, total_cents, currency, status, invoice_date)
+           VALUES ($1,$2,$3,$4,$5,0,$5,'TRY','pending',now()) ON CONFLICT (invoice_no) DO NOTHING`,
+          [invNo, order.id, userName, itemsJson, total]
+        );
+      } catch (e) { console.error('auto-invoice failed', e.message); }
+
       res.status(201).json({
         id: order.id,
         order_no: order.order_no,
