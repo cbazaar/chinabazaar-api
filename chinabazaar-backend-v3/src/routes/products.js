@@ -38,6 +38,10 @@ function toProduct(row) {
     sold_count: row.sold_count,
     stock: row.stock,
     view_count: row.view_count || 0,
+    like_count: row.like_count || 0,
+    favorite_count: row.favorite_count || 0,
+    comment_count: row.comment_count || 0,
+    share_count: row.share_count || 0,
     barcode: row.barcode || null,
     storage: row.storage || null,
     is_upcoming: !!row.is_upcoming,
@@ -58,7 +62,11 @@ function streamThumb(videoUrl){
 }
 
 const SELECT = `
-  SELECT p.*, c.slug AS category_slug, c.name AS category_name
+  SELECT p.*, c.slug AS category_slug, c.name AS category_name,
+    (SELECT COUNT(*) FROM product_likes l WHERE l.product_id = p.id)::int AS like_count,
+    (SELECT COUNT(*) FROM favorites f WHERE f.product_id = p.id)::int AS favorite_count,
+    (SELECT COUNT(*) FROM comments cm WHERE cm.product_id = p.id)::int AS comment_count,
+    (SELECT COUNT(*) FROM product_shares s WHERE s.product_id = p.id)::int AS share_count
   FROM products p
   LEFT JOIN categories c ON c.id = p.category_id
 `;
@@ -106,6 +114,44 @@ router.get(
       params
     );
     res.json({ items: rows.map(toProduct), limit, offset });
+  })
+);
+
+// POST /api/products/:id/like — beğeni aç/kapa (toggle)
+router.post(
+  '/:id/like',
+  param('id').isUUID(),
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    const { rows: pr } = await pool.query('SELECT id FROM products WHERE id=$1', [req.params.id]);
+    if (!pr.length) return res.status(404).json({ error: 'product_not_found' });
+    const { rows: ex } = await pool.query('SELECT 1 FROM product_likes WHERE user_id=$1 AND product_id=$2', [req.user.id, req.params.id]);
+    let liked;
+    if (ex.length) {
+      await pool.query('DELETE FROM product_likes WHERE user_id=$1 AND product_id=$2', [req.user.id, req.params.id]);
+      liked = false;
+    } else {
+      await pool.query('INSERT INTO product_likes (user_id, product_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [req.user.id, req.params.id]);
+      liked = true;
+    }
+    const { rows: c } = await pool.query('SELECT COUNT(*)::int AS n FROM product_likes WHERE product_id=$1', [req.params.id]);
+    res.json({ liked, like_count: c[0].n });
+  })
+);
+
+// POST /api/products/:id/share — paylaşım sayacı
+router.post(
+  '/:id/share',
+  param('id').isUUID(),
+  optionalAuth,
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    const { rows: pr } = await pool.query('SELECT id FROM products WHERE id=$1', [req.params.id]);
+    if (!pr.length) return res.status(404).json({ error: 'product_not_found' });
+    await pool.query('INSERT INTO product_shares (product_id, user_id) VALUES ($1,$2)', [req.params.id, req.user ? req.user.id : null]);
+    const { rows: c } = await pool.query('SELECT COUNT(*)::int AS n FROM product_shares WHERE product_id=$1', [req.params.id]);
+    res.json({ share_count: c[0].n });
   })
 );
 

@@ -1,7 +1,7 @@
 -- Canlı destek mesajlaşma
 CREATE TABLE IF NOT EXISTS chat_conversations (
   id SERIAL PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed')),
   last_message_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
