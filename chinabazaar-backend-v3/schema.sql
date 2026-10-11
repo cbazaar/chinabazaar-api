@@ -59,6 +59,7 @@ CREATE TABLE IF NOT EXISTS users (
   email         CITEXT UNIQUE NOT NULL,
   password_hash TEXT NOT NULL,              -- bcrypt
   name          TEXT NOT NULL,
+  nickname      TEXT,
   phone         TEXT,                       -- E.164 (+905...)
   is_admin      BOOLEAN NOT NULL DEFAULT FALSE,
   created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),

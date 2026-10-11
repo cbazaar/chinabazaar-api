@@ -15,7 +15,7 @@ const crypto = require('crypto');
 const router = express.Router();
 
 function publicUser(row) {
-  return { id: row.id, email: row.email, name: row.name, phone: row.phone, is_admin: !!row.is_admin };
+  return { id: row.id, email: row.email, name: row.name, nickname: row.nickname || null, phone: row.phone, is_admin: !!row.is_admin };
 }
 
 // POST /api/auth/register  { email, password, name, phone?, admin_key? }
@@ -164,11 +164,33 @@ router.get(
   requireAuth,
   asyncHandler(async (req, res) => {
     const { rows } = await pool.query(
-      'SELECT id, email, name, phone, is_admin FROM users WHERE id = $1',
+      'SELECT id, email, name, nickname, phone, is_admin FROM users WHERE id = $1',
       [req.user.id]
     );
     if (!rows.length) return res.status(404).json({ error: 'user_not_found' });
     res.json(publicUser(rows[0]));
+  })
+);
+
+
+// PATCH /api/auth/me — { nickname } (kullanıcı adı, yorumlarda görünür)
+router.patch(
+  '/me',
+  requireAuth,
+  body('nickname').trim().isLength({ min: 2, max: 30 }).matches(/^[\p{L}\p{N}_.-]+$/u),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    const nick = req.body.nickname.trim();
+    try {
+      const { rows } = await pool.query(
+        'UPDATE users SET nickname = $1, updated_at = now() WHERE id = $2 RETURNING id, email, name, nickname, phone, is_admin',
+        [nick, req.user.id]
+      );
+      res.json(publicUser(rows[0]));
+    } catch (err) {
+      if (err.code === '23505') return res.status(409).json({ error: 'nickname_in_use' });
+      throw err;
+    }
   })
 );
 
