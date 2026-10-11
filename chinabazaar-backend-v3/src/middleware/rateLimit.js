@@ -16,7 +16,7 @@ function limiter({ windowMs, max, message }) {
 const apiLimiter = limiter({ windowMs: 15 * 60 * 1000, max: 300 });
 
 // Kimlik doğrulama — sıkı limit (credential stuffing'e karşı)
-const loginLimiter = limiter({ windowMs: 15 * 60 * 1000, max: 10 });
+const loginLimiter = limiter({ windowMs: 15 * 60 * 1000, max: 50 });
 const registerLimiter = limiter({ windowMs: 60 * 60 * 1000, max: 20 });
 
 // Herkese açık kargo takip sorgusu — numaralandırmaya (enumeration) karşı

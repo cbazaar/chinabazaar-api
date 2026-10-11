@@ -99,6 +99,28 @@ router.post(
   })
 );
 
+// POST /api/auth/admin-reset-password { email, admin_key, new_password } — kurulum anahtarıyla şifre sıfırla
+router.post(
+  '/admin-reset-password',
+  body('email').isEmail().normalizeEmail(),
+  body('admin_key').notEmpty(),
+  body('new_password').isLength({ min: 6 }),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    const { email, admin_key, new_password } = req.body;
+    if (!cfg.adminSetupKey || admin_key !== cfg.adminSetupKey) {
+      return res.status(403).json({ error: 'invalid_setup_key' });
+    }
+    const { rows } = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    const row = rows[0];
+    if (!row) return res.status(404).json({ error: 'user_not_found' });
+    const hash = await bcrypt.hash(new_password, 10);
+    await pool.query('UPDATE users SET password_hash = $1 WHERE email = $2', [hash, email]);
+    const user = publicUser(row);
+    res.json({ user, token: signToken(user) });
+  })
+);
+
 // POST /api/auth/send-code { email } — 6 haneli doğrulama kodu gönderir (10 dk geçerli)
 // Kayıt ve giriş için ortak adım. E-posta sağlayıcı yoksa 503.
 router.post(
