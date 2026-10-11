@@ -121,7 +121,12 @@ router.get(
          FROM orders WHERE ${day} >= date_trunc('month', ${todayLocal})::date GROUP BY currency`, []),
     ]);
 
-    const [hourly, daily, weekly, monthly] = await Promise.all([
+    const [yearR] = await Promise.all([
+      q(`SELECT count(*)::int AS orders, coalesce(sum(total_cents),0)::bigint AS revenue_cents, currency
+         FROM orders WHERE ${day} >= date_trunc('year', ${todayLocal})::date GROUP BY currency`, []),
+    ]);
+
+    const [hourly, daily, weekly, monthly, yearly] = await Promise.all([
       q(`SELECT extract(hour from created_at AT TIME ZONE '${TZ}')::int AS h, count(*)::int AS orders
          FROM orders WHERE ${day} = ${todayLocal} GROUP BY 1 ORDER BY 1`, []),
       q(`SELECT to_char(${day}, 'YYYY-MM-DD') AS d, count(*)::int AS orders
@@ -130,6 +135,8 @@ router.get(
          FROM orders WHERE created_at >= now() - interval '12 weeks' GROUP BY 1 ORDER BY 1`, []),
       q(`SELECT to_char(created_at AT TIME ZONE '${TZ}', 'YYYY-MM') AS m, count(*)::int AS orders
          FROM orders WHERE created_at >= now() - interval '12 months' GROUP BY 1 ORDER BY 1`, []),
+      q(`SELECT to_char(created_at AT TIME ZONE '${TZ}', 'YYYY') AS y, count(*)::int AS orders
+         FROM orders WHERE created_at >= now() - interval '5 years' GROUP BY 1 ORDER BY 1`, []),
     ]);
 
     // Muhasebe: ödeme yöntemi dağılımı (başarılı ödemeler)
@@ -165,8 +172,8 @@ router.get(
 
     res.json({
       by_status: statusMap,
-      today: todayR, week: weekR, month: monthR,
-      hourly, daily, weekly, monthly,
+      today: todayR, week: weekR, month: monthR, year: yearR,
+      hourly, daily, weekly, monthly, yearly,
       top_products: topProducts, top_viewed: topViewed, tracking,
       pay_methods: payMethods, all_time: allTime, units_sold: unitsSold[0]?.units || 0,
     });
