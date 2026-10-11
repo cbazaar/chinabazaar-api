@@ -282,11 +282,16 @@ router.get(
 /* ================= canlı destek (admin) ================= */
 router.get('/chat', asyncHandler(async (req, res) => {
   const r = await pool.query(`
-    SELECT c.id, c.user_id, c.status, c.last_message_at, u.name AS user_name, u.email AS user_email,
-      (SELECT body FROM chat_messages m WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1) AS last_body,
-      (SELECT count(*)::int FROM chat_messages m WHERE m.conversation_id=c.id AND m.sender='customer' AND NOT m.read_by_admin) AS unread
-    FROM chat_conversations c LEFT JOIN users u ON u.id=c.user_id
-    ORDER BY c.last_message_at DESC LIMIT 100`);
+    SELECT DISTINCT ON (m.conversation_id)
+      m.conversation_id AS id,
+      c.user_id, c.status, c.last_message_at,
+      u.name AS user_name, u.email AS user_email,
+      m.body AS last_body,
+      (SELECT count(*)::int FROM chat_messages m2 WHERE m2.conversation_id=m.conversation_id AND m2.sender='customer' AND NOT m2.read_by_admin) AS unread
+    FROM chat_messages m
+    LEFT JOIN chat_conversations c ON c.id=m.conversation_id
+    LEFT JOIN users u ON u.id=c.user_id
+    ORDER BY m.conversation_id, m.id DESC LIMIT 100`);
   res.json({ ok: true, items: r.rows });
 }));
 router.get('/chat/unread-total', asyncHandler(async (req, res) => {
