@@ -60,6 +60,7 @@ app.use('/api/favorites', require('./routes/favorites'));
 app.use('/api/orders', require('./routes/orders'));
 app.use('/api/payments', require('./routes/payments'));
 app.use('/api/tracking', require('./routes/tracking')); // herkese açık, sınırlı kargo sorgusu
+app.use('/api/chat', require('./routes/chat')); // müşteri canlı destek
 app.use('/api/payment-methods', require('./routes/paymentMethods'));
 app.use('/api/admin/stream', require('./routes/stream')); // Cloudflare Stream video yönetimi (admin)
 app.use('/api/admin', require('./routes/admin')); // kullanıcı + yorum yönetimi (admin)

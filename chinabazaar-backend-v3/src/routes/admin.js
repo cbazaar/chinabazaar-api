@@ -276,4 +276,39 @@ router.get(
   })
 );
 
+
+/* ================= canlı destek (admin) ================= */
+router.get('/chat', asyncHandler(async (req, res) => {
+  const r = await pool.query(`
+    SELECT c.id, c.user_id, c.status, c.last_message_at, u.name AS user_name, u.email AS user_email,
+      (SELECT body FROM chat_messages m WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1) AS last_body,
+      (SELECT count(*)::int FROM chat_messages m WHERE m.conversation_id=c.id AND m.sender='customer' AND NOT m.read_by_admin) AS unread
+    FROM chat_conversations c JOIN users u ON u.id=c.user_id
+    ORDER BY c.last_message_at DESC LIMIT 100`);
+  res.json({ ok: true, items: r.rows });
+}));
+router.get('/chat/unread-total', asyncHandler(async (req, res) => {
+  const r = await pool.query(`SELECT count(*)::int AS c FROM chat_messages WHERE sender='customer' AND NOT read_by_admin`);
+  res.json({ ok: true, unread: r.rows[0].c });
+}));
+router.get('/chat/:id/messages', asyncHandler(async (req, res) => {
+  const r = await pool.query(`SELECT * FROM chat_messages WHERE conversation_id=$1 ORDER BY id ASC LIMIT 300`, [req.params.id]);
+  await pool.query(`UPDATE chat_messages SET read_by_admin=true WHERE conversation_id=$1 AND sender='customer'`, [req.params.id]);
+  res.json({ ok: true, messages: r.rows });
+}));
+router.post('/chat/:id/reply', asyncHandler(async (req, res) => {
+  const body = String(req.body.body || '').trim().slice(0, 2000);
+  if (!body) return res.status(400).json({ ok: false, error: 'empty' });
+  const m = await pool.query(
+    `INSERT INTO chat_messages (conversation_id, sender, body, read_by_admin) VALUES ($1,'admin',$2,true) RETURNING *`,
+    [req.params.id, body]);
+  await pool.query(`UPDATE chat_conversations SET last_message_at=now(), status='open' WHERE id=$1`, [req.params.id]);
+  res.json({ ok: true, message: m.rows[0] });
+}));
+router.patch('/chat/:id', asyncHandler(async (req, res) => {
+  const st = req.body.status === 'closed' ? 'closed' : 'open';
+  await pool.query(`UPDATE chat_conversations SET status=$2 WHERE id=$1`, [req.params.id, st]);
+  res.json({ ok: true, status: st });
+}));
+
 module.exports = router;
