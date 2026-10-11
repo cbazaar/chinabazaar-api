@@ -48,6 +48,37 @@ router.post(
   })
 );
 
+// POST /api/auth/phone-login  { phone, code } — demo: kod 123456 (gerçek SMS bağlanana kadar)
+router.post(
+  '/phone-login',
+  loginLimiter,
+  body('phone').matches(/^\+?[0-9][0-9\s\-().]{6,19}$/),
+  body('code').isLength({ min: 4, max: 10 }),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    let { phone, code } = req.body;
+    phone = String(phone).replace(/[\s\-().]/g, '');
+    if (!phone.startsWith('+')) phone = '+' + phone;
+    // Demo doğrulama — gerçek SMS sağlayıcısı bağlanınca burası değişecek
+    if (String(code).trim() !== '123456') return res.status(401).json({ error: 'invalid_code' });
+    let { rows } = await pool.query('SELECT id, email, name, nickname, phone, is_admin FROM users WHERE phone=$1', [phone]);
+    let user;
+    if (rows.length) {
+      user = publicUser(rows[0]);
+    } else {
+      const email = 'phone_' + phone.replace(/\D/g, '') + '@phone.chinabazaar.local';
+      const hash = await bcrypt.hash(crypto.randomBytes(16).toString('hex'), 12);
+      const ins = await pool.query(
+        `INSERT INTO users (email, password_hash, name, phone) VALUES ($1,$2,$3,$4)
+         RETURNING id, email, name, nickname, phone, is_admin`,
+        [email, hash, phone, phone]
+      );
+      user = publicUser(ins.rows[0]);
+    }
+    res.json({ user, token: signToken(user) });
+  })
+);
+
 // POST /api/auth/login  { email, password }
 router.post(
   '/login',
