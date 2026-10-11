@@ -285,7 +285,7 @@ router.get('/chat', asyncHandler(async (req, res) => {
     SELECT c.id, c.user_id, c.status, c.last_message_at, u.name AS user_name, u.email AS user_email,
       (SELECT body FROM chat_messages m WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1) AS last_body,
       (SELECT count(*)::int FROM chat_messages m WHERE m.conversation_id=c.id AND m.sender='customer' AND NOT m.read_by_admin) AS unread
-    FROM chat_conversations c JOIN users u ON u.id=c.user_id
+    FROM chat_conversations c LEFT JOIN users u ON u.id=c.user_id
     ORDER BY c.last_message_at DESC LIMIT 100`);
   res.json({ ok: true, items: r.rows });
 }));
