@@ -16,10 +16,12 @@
 // Üretim URL'i temsilciniz tarafından verilir; ARAS_CARGO_WSDL_URL'e yazılır.
 // Takip metodu adı da hesaba göre değişebilir (ARAS_CARGO_TRACK_METHOD).
 
-const WSDL_URL = (process.env.ARAS_CARGO_WSDL_URL || '').trim();
-const USERNAME = (process.env.ARAS_CARGO_USERNAME || '').trim();
+const cfg = require('../config').arasCargo || {};
+const CUSTOMER_CODE = cfg.customerCode || '';
+const WSDL_URL = cfg.wsdlUrl || '';
+const USERNAME = cfg.username || '';
 const PASSWORD = process.env.ARAS_CARGO_PASSWORD || '';
-const TRACK_METHOD = (process.env.ARAS_CARGO_TRACK_METHOD || 'getOrder').trim();
+const TRACK_METHOD = cfg.trackMethod || 'getOrder';
 
 function isEnabled() {
   return Boolean(WSDL_URL && USERNAME && PASSWORD);
@@ -64,6 +66,7 @@ async function getTrackingStatus(trackingNumber) {
     `<${esc(TRACK_METHOD)} xmlns="http://tempuri.org/">` +
     `<userName>${esc(USERNAME)}</userName>` +
     `<password>${esc(PASSWORD)}</password>` +
+    (CUSTOMER_CODE ? `<customerCode>${esc(CUSTOMER_CODE)}</customerCode>` : '') +
     `<TradingWaybillNumber>${esc(trackingNumber)}</TradingWaybillNumber>` +
     `</${esc(TRACK_METHOD)}>` +
     `</soap:Body></soap:Envelope>`;
@@ -89,4 +92,4 @@ async function getTrackingStatus(trackingNumber) {
   }
 }
 
-module.exports = { isEnabled, getTrackingStatus };
+module.exports = { isEnabled, getTrackingStatus, getCustomerCode: () => CUSTOMER_CODE };

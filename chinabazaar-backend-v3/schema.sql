@@ -45,6 +45,8 @@ CREATE TABLE IF NOT EXISTS products (
   box_dimensions TEXT,                                        -- kutu ölçüleri
   weight      TEXT,                                           -- ağırlık (örn: "250 g")
   is_active   BOOLEAN NOT NULL DEFAULT TRUE,
+  view_count  INT NOT NULL DEFAULT 0 CHECK (view_count >= 0), -- PulSee izlenme
+  barcode     TEXT,                                           -- EAN-13 otomatik barkod
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -103,6 +105,9 @@ CREATE TABLE IF NOT EXISTS orders (
   shipping_cents   INT NOT NULL DEFAULT 0 CHECK (shipping_cents >= 0),
   total_cents      INT NOT NULL CHECK (total_cents >= 0),
   currency         CHAR(3) NOT NULL DEFAULT 'TRY',
+  payment_method   TEXT NOT NULL DEFAULT 'card',              -- card (PayTR) | transfer (Havale/EFT)
+  payment_status   TEXT NOT NULL DEFAULT 'unpaid'              -- unpaid | paid
+                   CONSTRAINT chk_payment_status CHECK (payment_status IN ('unpaid','paid')),
   address_id       UUID REFERENCES addresses(id) ON DELETE SET NULL,
   address_snapshot TEXT,                                      -- teslimat adresi anlık kopyası (JSON)
   cargo_company    TEXT,                                      -- kargo firması (örn. Aras, Yurtiçi)
@@ -125,20 +130,31 @@ CREATE TABLE IF NOT EXISTS order_items (
 );
 CREATE INDEX IF NOT EXISTS idx_order_items_order ON order_items(order_id);
 
--- Ödemeler (iyzico; kart verisi ASLA tutulmaz — yalnız token/referans)
+-- Ödemeler (PayTR; kart verisi ASLA tutulmaz — yalnız token/referans)
 CREATE TABLE IF NOT EXISTS payments (
   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   order_id        UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
-  provider        TEXT NOT NULL DEFAULT 'iyzico',
+  provider        TEXT NOT NULL DEFAULT 'paytr',
   status          TEXT NOT NULL DEFAULT 'pending',  -- pending|success|failed
-  token           TEXT,                             -- iyzico checkout token
-  payment_id      TEXT,                             -- iyzico paymentId
-  conversation_id TEXT,                             -- order_no
+  token           TEXT,                             -- PayTR iframe token
+  payment_id      TEXT,                             -- PayTR ödeme referansı
+  conversation_id TEXT,                             -- PayTR merchant_oid (order_no + deneme eki)
   amount_cents    INT NOT NULL,
   currency        CHAR(3) NOT NULL DEFAULT 'TRY',
-  raw_response    JSONB,                            -- iyzico yanıtı (denetim için)
+  raw_response    JSONB,                            -- PayTR yanıtı (denetim için)
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_payments_order ON payments(order_id);
 CREATE INDEX IF NOT EXISTS idx_payments_token ON payments(token);
+
+-- Yorumlar (ürün sayfası / PulSee)
+CREATE TABLE IF NOT EXISTS comments (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  product_id  UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  body        TEXT NOT NULL CHECK (char_length(body) BETWEEN 1 AND 1000),
+  is_blocked  BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_comments_product ON comments(product_id, created_at DESC);

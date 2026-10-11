@@ -45,6 +45,7 @@ router.get(
 router.post(
   '/',
   body('address_id').isUUID(),
+  body('payment_method').optional().isIn(['card', 'transfer']),
   body('items').isArray({ min: 1 }),
   body('items.*.product_id').isUUID(),
   body('items.*.qty').isInt({ min: 1, max: 99 }),
@@ -52,6 +53,7 @@ router.post(
     if (!checkValidation(req, res)) return;
 
     const { address_id, items } = req.body;
+    const paymentMethod = req.body.payment_method === 'transfer' ? 'transfer' : 'card';
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -95,16 +97,16 @@ router.post(
 
       const orderNo = nextOrderNo();
       const { rows: orderRows } = await client.query(
-        `INSERT INTO orders (user_id, order_no, status, subtotal_cents, shipping_cents, total_cents, currency, address_id, address_snapshot)
-         VALUES ($1,$2,'pending',$3,$4,$5,'TRY',$6,$7) RETURNING *`,
+        `INSERT INTO orders (user_id, order_no, status, subtotal_cents, shipping_cents, total_cents, currency, address_id, address_snapshot, payment_method)
+         VALUES ($1,$2,'pending',$3,$4,$5,'TRY',$6,$7,$8) RETURNING *`,
         [req.user.id, orderNo, subtotal, shipping, total, address_id, JSON.stringify(addr.rows[0])]
       );
       const order = orderRows[0];
 
       for (const l of lines) {
         await client.query(
-          'INSERT INTO order_items (order_id, product_id, name, qty, price_cents) VALUES ($1,$2,$3,$4,$5)',
-          [order.id, l.product.id, l.product.name, l.qty, l.product.price_cents]
+          'INSERT INTO order_items (order_id, product_id, name, qty, price_cents, barcode) VALUES ($1,$2,$3,$4,$5,$6)',
+          [order.id, l.product.id, l.product.name, l.qty, l.product.price_cents, l.product.barcode || null]
         );
         await client.query('UPDATE products SET stock = stock - $1, updated_at = now() WHERE id = $2', [
           l.qty,
@@ -147,7 +149,7 @@ router.get(
       return res.status(403).json({ error: 'forbidden' });
     }
 
-    const { rows: items } = await pool.query('SELECT product_id, name, qty, price_cents FROM order_items WHERE order_id = $1', [order.id]);
+    const { rows: items } = await pool.query('SELECT product_id, name, qty, price_cents, barcode FROM order_items WHERE order_id = $1', [order.id]);
     const { rows: payments } = await pool.query(
       'SELECT provider, status, payment_id, amount_cents, currency, created_at FROM payments WHERE order_id = $1 ORDER BY created_at DESC',
       [order.id]

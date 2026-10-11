@@ -37,6 +37,8 @@ function toProduct(row) {
     weight: row.weight,
     sold_count: row.sold_count,
     stock: row.stock,
+    view_count: row.view_count || 0,
+    barcode: row.barcode || null,
     category: row.category_id
       ? { id: row.category_id, slug: row.category_slug, name: row.category_name }
       : null,
@@ -127,6 +129,7 @@ const productValidators = [
   body('dimensions').optional().trim().isLength({ max: 200 }),
   body('box_dimensions').optional().trim().isLength({ max: 200 }),
   body('weight').optional().trim().isLength({ max: 200 }),
+  body('barcode').optional().trim().matches(/^[0-9]{8,14}$/),
 ];
 
 // category: slug veya UUID kabul eder → category_id çözer (boşsa NULL)
@@ -149,18 +152,19 @@ router.post(
   ...productValidators,
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
-    const { name, price, stock, description, tagline, sku, image_url, video_url, category, is_active, currency, color, size, dimensions, box_dimensions, weight } = req.body;
+    const { name, price, stock, description, tagline, sku, image_url, video_url, category, is_active, currency, color, size, dimensions, box_dimensions, weight, barcode } = req.body;
     const categoryId = await resolveCategoryId(category);
     try {
       const { rows } = await pool.query(
-        `INSERT INTO products (sku, name, tagline, description, price_cents, currency, stock, category_id, video_url, thumb_url, is_active, color, size, dimensions, box_dimensions, weight)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
+        `INSERT INTO products (sku, name, tagline, description, price_cents, currency, stock, category_id, video_url, thumb_url, is_active, color, size, dimensions, box_dimensions, weight, barcode)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
         [
           sku || null, name, tagline || null, description || null, toCents(price),
           ['TRY','USD','RUB'].includes(currency) ? currency : 'TRY',
           stock ?? 0, categoryId, video_url || null, image_url || null,
           is_active === undefined ? true : is_active,
           color || null, size || null, dimensions || null, box_dimensions || null, weight || null,
+          barcode || null,
         ]
       );
       res.status(201).json(toProduct({ ...rows[0], category_slug: null, category_name: null }));
@@ -193,13 +197,14 @@ router.put(
   body('dimensions').optional().trim().isLength({ max: 200 }),
   body('box_dimensions').optional().trim().isLength({ max: 200 }),
   body('weight').optional().trim().isLength({ max: 200 }),
+  body('barcode').optional().trim().matches(/^[0-9]{8,14}$/),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     const map = {
       name: 'name', tagline: 'tagline', description: 'description', sku: 'sku',
       video_url: 'video_url', image_url: 'thumb_url', is_active: 'is_active',
       currency: 'currency', color: 'color', size: 'size', dimensions: 'dimensions',
-      box_dimensions: 'box_dimensions', weight: 'weight',
+      box_dimensions: 'box_dimensions', weight: 'weight', barcode: 'barcode',
     };
     const sets = [];
     const params = [req.params.id];
@@ -249,6 +254,53 @@ router.delete(
     const { rows } = await pool.query('DELETE FROM products WHERE id = $1 RETURNING id', [req.params.id]);
     if (!rows.length) return res.status(404).json({ error: 'product_not_found' });
     res.json({ deleted: true, id: rows[0].id });
+  })
+);
+
+// POST /api/products/:id/view — izlenme sayacı (herkese açık, sessiz artar)
+router.post(
+  '/:id/view',
+  param('id').isUUID(),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    await pool.query('UPDATE products SET view_count = view_count + 1 WHERE id = $1', [req.params.id]);
+    res.json({ ok: true });
+  })
+);
+
+// GET /api/products/:id/comments — görünür yorumlar (herkese açık)
+router.get(
+  '/:id/comments',
+  param('id').isUUID(),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    const { rows } = await pool.query(
+      `SELECT c.id, c.body, c.created_at, u.name AS user_name
+       FROM comments c JOIN users u ON u.id = c.user_id
+       WHERE c.product_id = $1 AND c.is_blocked = FALSE
+       ORDER BY c.created_at DESC LIMIT 100`,
+      [req.params.id]
+    );
+    res.json({ items: rows });
+  })
+);
+
+// POST /api/products/:id/comments — yorum ekle (giriş gerekli)
+router.post(
+  '/:id/comments',
+  requireAuth,
+  param('id').isUUID(),
+  body('body').trim().isLength({ min: 1, max: 1000 }),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    const me = await pool.query('SELECT is_blocked FROM users WHERE id = $1', [req.user.id]);
+    if (me.rows[0]?.is_blocked) return res.status(403).json({ error: 'user_blocked' });
+    const { rows } = await pool.query(
+      `INSERT INTO comments (product_id, user_id, body) VALUES ($1, $2, $3)
+       RETURNING id, body, created_at`,
+      [req.params.id, req.user.id, req.body.body.trim()]
+    );
+    res.status(201).json(rows[0]);
   })
 );
 

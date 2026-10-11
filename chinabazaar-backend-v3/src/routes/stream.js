@@ -27,8 +27,13 @@ router.post(
   '/upload-url',
   asyncHandler(async (_req, res) => {
     if (!stream.enabled()) return res.status(503).json({ error: 'stream_not_configured' });
-    const r = await stream.createDirectUpload();
-    res.json({ upload_url: r.uploadURL, uid: r.uid });
+    try {
+      const r = await stream.createDirectUpload();
+      return res.json({ upload_url: r.uploadURL, uid: r.uid });
+    } catch (e) {
+      // Cloudflare'in gerçek hata mesajını döndür (token sızdırmaz)
+      return res.status(502).json({ error: 'stream_api_failed', detail: String((e && e.message) || e).slice(0, 300) });
+    }
   })
 );
 

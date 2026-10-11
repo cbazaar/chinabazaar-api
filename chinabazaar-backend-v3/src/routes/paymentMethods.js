@@ -1,5 +1,5 @@
 // Kayıtlı ödeme yöntemleri — PCI DSS: yalnız son 4 hane saklanır.
-// TAM kart numarası (PAN) ve CVV ASLA alınmaz/kaydedilmez; tahsilat iyzico üzerinden.
+// TAM kart numarası (PAN) ve CVV ASLA alınmaz/kaydedilmez; tahsilat PayTR üzerinden.
 const express = require('express');
 const { body, param } = require('express-validator');
 const asyncHandler = require('../middleware/asyncHandler');

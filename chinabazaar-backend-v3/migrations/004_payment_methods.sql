@@ -1,7 +1,7 @@
 -- 004: kayıtlı ödeme yöntemleri (idempotent)
 -- PCI DSS gereği TAM kart numarası (PAN) ve CVV ASLA saklanmaz.
 -- Yalnızca son 4 hane + marka + son kullanma tarihi tutulur.
--- Gerçek tahsilat iyzico üzerinden yapılır.
+-- Gerçek tahsilat PayTR üzerinden yapılır.
 CREATE TABLE IF NOT EXISTS payment_methods (
   id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
