@@ -43,8 +43,16 @@ function toProduct(row) {
       ? { id: row.category_id, slug: row.category_slug, name: row.category_name }
       : null,
     video_url: row.video_url,
-    thumb_url: row.thumb_url,
+    thumb_url: row.thumb_url || streamThumb(row.video_url),
   };
+}
+
+// video_url bir Cloudflare Stream adresiyse otomatik küçük resim üret
+function streamThumb(videoUrl){
+  if(!videoUrl) return null;
+  const m = String(videoUrl).match(/videodelivery\.net\/([a-f0-9]{32})/i)
+         || String(videoUrl).match(/cloudflarestream\.com\/([a-f0-9]{32})/i);
+  return m ? ('https://videodelivery.net/'+m[1]+'/thumbnails/thumbnail.jpg') : null;
 }
 
 const SELECT = `
