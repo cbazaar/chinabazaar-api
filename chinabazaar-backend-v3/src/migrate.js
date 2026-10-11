@@ -16,7 +16,11 @@ async function main() {
     const files = fs.readdirSync(migDir).filter((f) => f.endsWith('.sql')).sort();
     for (const f of files) {
       console.log(`[migrate] ${f} uygulanıyor...`);
-      await pool.query(fs.readFileSync(path.join(migDir, f), 'utf8'));
+      try {
+        await pool.query(fs.readFileSync(path.join(migDir, f), 'utf8'));
+      } catch (e) {
+        console.log(`[migrate] UYARI ${f} atlandı: ${e.message}`);
+      }
     }
   }
 
