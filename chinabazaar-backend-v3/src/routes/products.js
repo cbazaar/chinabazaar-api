@@ -39,6 +39,7 @@ function toProduct(row) {
     stock: row.stock,
     view_count: row.view_count || 0,
     barcode: row.barcode || null,
+    storage: row.storage || null,
     category: row.category_id
       ? { id: row.category_id, slug: row.category_slug, name: row.category_name }
       : null,
@@ -133,6 +134,7 @@ const productValidators = [
   body('is_active').optional().isBoolean(),
   body('currency').optional().trim().isIn(['TRY', 'USD', 'RUB']),
   body('color').optional().trim().isLength({ max: 200 }),
+  body('storage').optional().trim().isLength({ max: 200 }),
   body('size').optional().trim().isLength({ max: 200 }),
   body('dimensions').optional().trim().isLength({ max: 200 }),
   body('box_dimensions').optional().trim().isLength({ max: 200 }),
@@ -160,19 +162,19 @@ router.post(
   ...productValidators,
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
-    const { name, price, stock, description, tagline, sku, image_url, video_url, category, is_active, currency, color, size, dimensions, box_dimensions, weight, barcode } = req.body;
+    const { name, price, stock, description, tagline, sku, image_url, video_url, category, is_active, currency, color, size, dimensions, box_dimensions, weight, barcode, storage } = req.body;
     const categoryId = await resolveCategoryId(category);
     try {
       const { rows } = await pool.query(
-        `INSERT INTO products (sku, name, tagline, description, price_cents, currency, stock, category_id, video_url, thumb_url, is_active, color, size, dimensions, box_dimensions, weight, barcode)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
+        `INSERT INTO products (sku, name, tagline, description, price_cents, currency, stock, category_id, video_url, thumb_url, is_active, color, size, dimensions, box_dimensions, weight, barcode, storage)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
         [
           sku || null, name, tagline || null, description || null, toCents(price),
           ['TRY','USD','RUB'].includes(currency) ? currency : 'TRY',
           stock ?? 0, categoryId, video_url || null, image_url || null,
           is_active === undefined ? true : is_active,
           color || null, size || null, dimensions || null, box_dimensions || null, weight || null,
-          barcode || null,
+          barcode || null, storage || null,
         ]
       );
       res.status(201).json(toProduct({ ...rows[0], category_slug: null, category_name: null }));
@@ -201,6 +203,7 @@ router.put(
   body('is_active').optional().isBoolean(),
   body('currency').optional().trim().isIn(['TRY', 'USD', 'RUB']),
   body('color').optional().trim().isLength({ max: 200 }),
+  body('storage').optional().trim().isLength({ max: 200 }),
   body('size').optional().trim().isLength({ max: 200 }),
   body('dimensions').optional().trim().isLength({ max: 200 }),
   body('box_dimensions').optional().trim().isLength({ max: 200 }),
@@ -211,7 +214,7 @@ router.put(
     const map = {
       name: 'name', tagline: 'tagline', description: 'description', sku: 'sku',
       video_url: 'video_url', image_url: 'thumb_url', is_active: 'is_active',
-      currency: 'currency', color: 'color', size: 'size', dimensions: 'dimensions',
+      currency: 'currency', color: 'color', storage: 'storage', size: 'size', dimensions: 'dimensions',
       box_dimensions: 'box_dimensions', weight: 'weight', barcode: 'barcode',
     };
     const sets = [];
