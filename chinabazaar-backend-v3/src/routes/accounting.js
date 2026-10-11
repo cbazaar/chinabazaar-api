@@ -1,7 +1,8 @@
 // Muhasebe: özet, işlemler, banka/kasa, cari, fatura
 const express = require('express');
 const asyncHandler = require('../middleware/asyncHandler');
-const { requireAuth, requireAdmin } = require('../middleware/auth');
+const { requireAuth } = require('../middleware/auth');
+const { requireAdmin } = require('../middleware/admin');
 const pool = require('../db');
 
 const router = express.Router();
