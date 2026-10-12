@@ -27,7 +27,7 @@ router.get(
       const { rows: me } = await pool.query('SELECT is_admin FROM users WHERE id = $1', [req.user.id]);
       if (!me[0]?.is_admin) return res.status(403).json({ error: 'forbidden' });
       const { rows } = await pool.query(
-        `SELECT o.*, u.email AS user_email FROM orders o
+        `SELECT o.*, u.email AS user_email, u.customer_code AS user_customer_code FROM orders o
          LEFT JOIN users u ON u.id = o.user_id
          ORDER BY o.created_at DESC LIMIT 200`
       );
