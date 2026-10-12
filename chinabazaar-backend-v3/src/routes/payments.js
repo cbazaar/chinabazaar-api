@@ -16,12 +16,20 @@ const paytr = require('../services/paytr');
 
 const router = express.Router();
 
+const PAYTR_IPS = new Set(['185.21.211.51', '185.21.211.52', '185.21.211.53', '185.21.211.54']);
+function isPaytrIp(req) {
+  const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket?.remoteAddress || '';
+  const clean = ip.replace(/^::ffff:/, '');
+  if (process.env.PAYTR_TEST_MODE === '1') return true;
+  return PAYTR_IPS.has(clean);
+}
 // ---- PayTR geri bildirimi (auth'suz; PayTR sunucusu çağırır, form-encoded) ----
 router.post(
   '/paytr/callback',
   express.urlencoded({ extended: false }),
   asyncHandler(async (req, res) => {
-    const { merchant_oid, status, total_amount, hash } = req.body || {};
+        if (!isPaytrIp(req)) { return res.status(403).send('FORBIDDEN'); }
+const { merchant_oid, status, total_amount, hash } = req.body || {};
     if (!paytr.verifyCallback({ merchant_oid, status, total_amount, hash })) {
       return res.status(400).send('INVALID_HASH');
     }
