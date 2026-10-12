@@ -61,7 +61,7 @@ router.post(
     if (!phone.startsWith('+')) phone = '+' + phone;
     // Demo doğrulama — gerçek SMS sağlayıcısı bağlanınca burası değişecek
     if (String(code).trim() !== '123456') return res.status(401).json({ error: 'invalid_code' });
-    let { rows } = await pool.query('SELECT id, email, name, nickname, phone, is_admin FROM users WHERE phone=$1', [phone]);
+    let { rows } = await pool.query('SELECT id, email, name, nickname, phone, is_admin, customer_code FROM users WHERE phone=$1', [phone]);
     let user;
     if (rows.length) {
       user = publicUser(rows[0]);
@@ -217,7 +217,7 @@ router.get(
   requireAuth,
   asyncHandler(async (req, res) => {
     const { rows } = await pool.query(
-      'SELECT id, email, name, nickname, phone, is_admin FROM users WHERE id = $1',
+      'SELECT id, email, name, nickname, phone, is_admin, customer_code FROM users WHERE id = $1',
       [req.user.id]
     );
     if (!rows.length) return res.status(404).json({ error: 'user_not_found' });
