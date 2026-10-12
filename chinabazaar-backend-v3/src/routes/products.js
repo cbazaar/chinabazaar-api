@@ -167,16 +167,17 @@ router.post(
 // ALL /api/products/enable-mp4 (GET/POST) — tüm Cloudflare videoları için MP4 indirmeyi etkinleştir (admin)
 router.all('/enable-mp4', requireAuth, requireAdmin, async (req, res) => {
   try {
-    const { enableMp4Download } = require('../services/stream');
+    const { enableMp4DownloadDebug } = require('../services/stream');
     const { rows } = await pool.query("SELECT id, video_url FROM products WHERE video_url LIKE '%videodelivery.net%'");
     let ok = 0, fail = 0;
+    const errors = [];
     for (const r of rows) {
       const m = String(r.video_url).match(/videodelivery\.net\/([a-f0-9]+)/i);
-      if (!m) { fail++; continue; }
-      const success = await enableMp4Download(m[1]);
-      if (success) ok++; else fail++;
+      if (!m) { fail++; errors.push('no-uid'); continue; }
+      const result = await enableMp4DownloadDebug(m[1]);
+      if (result.ok) ok++; else { fail++; if(errors.length<3) errors.push(result.error); }
     }
-    res.json({ ok: true, enabled: ok, failed: fail, total: rows.length });
+    res.json({ ok: true, enabled: ok, failed: fail, total: rows.length, errors });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
   }

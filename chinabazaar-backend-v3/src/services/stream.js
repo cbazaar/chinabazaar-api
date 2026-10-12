@@ -88,6 +88,16 @@ async function enableMp4Download(uid) {
   } catch (e) { return false; }
 }
 
+// Debug versiyonu - hata detayını döner
+async function enableMp4DownloadDebug(uid) {
+  if (!enabled()) return { ok: false, error: 'stream-not-configured' };
+  try {
+    const res = await cfFetch(`/stream/${uid}/downloads`, { method: 'POST' });
+    if (res.ok) return { ok: true };
+    return { ok: false, error: 'api-' + (res.status || 'unknown') };
+  } catch (e) { return { ok: false, error: e.message }; }
+}
+
 function thumbnailUrl(uid) {
   return `https://videodelivery.net/${uid}/thumbnails/thumbnail.jpg`;
 }
@@ -100,5 +110,6 @@ module.exports = {
   playbackUrl,
   thumbnailUrl,
   mp4Url,
-  enableMp4Download
+  enableMp4Download,
+  enableMp4DownloadDebug
 };
