@@ -165,7 +165,7 @@ router.post(
 
 // GET /api/products/:id
 // ALL /api/products/enable-mp4 (GET/POST) — tüm Cloudflare videoları için MP4 indirmeyi etkinleştir (admin)
-router.all('/enable-mp4', requireAdmin, async (req, res) => {
+router.all('/enable-mp4', requireAuth, requireAdmin, async (req, res) => {
   try {
     const { enableMp4Download } = require('../services/stream');
     const { rows } = await pool.query("SELECT id, video_url FROM products WHERE video_url LIKE '%videodelivery.net%'");
