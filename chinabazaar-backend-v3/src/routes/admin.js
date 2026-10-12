@@ -58,7 +58,7 @@ router.get(
     const limit = Math.min(parseInt(req.query.limit || '200', 10), 500);
     const { rows } = await pool.query(
       `SELECT c.id, c.body, c.is_blocked, c.created_at,
-              p.name AS product_name, u.id AS user_id, u.name AS user_name, u.email AS user_email
+              p.name AS product_name, u.id AS user_id, u.name AS user_name, u.email AS user_email, u.customer_code
        FROM comments c
        JOIN products p ON p.id = c.product_id
        JOIN users u ON u.id = c.user_id
