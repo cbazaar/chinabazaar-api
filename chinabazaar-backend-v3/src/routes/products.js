@@ -49,8 +49,16 @@ function toProduct(row) {
       ? { id: row.category_id, slug: row.category_slug, name: row.category_name }
       : null,
     video_url: row.video_url,
+    video_mp4_url: streamMp4(row.video_url),
     thumb_url: row.thumb_url || streamThumb(row.video_url),
   };
+}
+
+// video_url'den MP4 adresi üret (iOS için)
+function streamMp4(videoUrl){
+  if(!videoUrl) return null;
+  const m = String(videoUrl).match(/videodelivery\.net\/([a-f0-9]+)/i);
+  return m ? `https://videodelivery.net/${m[1]}/downloads/default.mp4` : null;
 }
 
 // video_url bir Cloudflare Stream adresiyse otomatik küçük resim üret
@@ -166,6 +174,25 @@ router.get(
     res.json(toProduct(rows[0]));
   })
 );
+
+
+// POST /api/products/enable-mp4 — tüm Cloudflare videoları için MP4 indirmeyi etkinleştir (admin)
+router.post('/enable-mp4', requireAdmin, async (req, res) => {
+  try {
+    const { enableMp4Download } = require('../services/stream');
+    const { rows } = await pool.query("SELECT id, video_url FROM products WHERE video_url LIKE '%videodelivery.net%'");
+    let ok = 0, fail = 0;
+    for (const r of rows) {
+      const m = String(r.video_url).match(/videodelivery\.net\/([a-f0-9]+)/i);
+      if (!m) { fail++; continue; }
+      const success = await enableMp4Download(m[1]);
+      if (success) ok++; else fail++;
+    }
+    res.json({ ok: true, enabled: ok, failed: fail, total: rows.length });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 // ---- Admin CRUD (yalnız is_admin) ----
 

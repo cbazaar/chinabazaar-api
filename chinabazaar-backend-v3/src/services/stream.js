@@ -74,6 +74,20 @@ function playbackUrl(uid) {
   return `https://videodelivery.net/${uid}/manifest/video.m3u8`;
 }
 
+// MP4 doğrudan indirme adresi (iOS uyumluluğu için; downloads etkin olmalı).
+function mp4Url(uid) {
+  return `https://videodelivery.net/${uid}/downloads/default.mp4`;
+}
+
+// Bir video için MP4 indirmeyi etkinleştir (Cloudflare API).
+async function enableMp4Download(uid) {
+  if (!isConfigured()) return false;
+  try {
+    const res = await cfFetch(`/stream/${uid}/downloads`, { method: 'POST' });
+    return res.ok;
+  } catch (e) { return false; }
+}
+
 function thumbnailUrl(uid) {
   return `https://videodelivery.net/${uid}/thumbnails/thumbnail.jpg`;
 }
@@ -85,4 +99,6 @@ module.exports = {
   getVideo,
   playbackUrl,
   thumbnailUrl,
+  mp4Url,
+  enableMp4Download
 };
