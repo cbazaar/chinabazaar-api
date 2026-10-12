@@ -81,7 +81,7 @@ function mp4Url(uid) {
 
 // Bir video için MP4 indirmeyi etkinleştir (Cloudflare API).
 async function enableMp4Download(uid) {
-  if (!isConfigured()) return false;
+  if (!enabled()) return false;
   try {
     const res = await cfFetch(`/stream/${uid}/downloads`, { method: 'POST' });
     return res.ok;
