@@ -16,7 +16,7 @@ router.get(
   '/users',
   asyncHandler(async (_req, res) => {
     const { rows } = await pool.query(
-      `SELECT u.id, u.email, u.name, u.nickname, u.phone, u.is_admin, u.is_blocked, u.email_verified, u.created_at,
+      `SELECT u.id, u.email, u.name, u.nickname, u.phone, u.is_admin, u.is_blocked, u.email_verified, u.created_at, u.customer_code,
               (SELECT count(*)::int FROM orders o WHERE o.user_id = u.id) AS order_count
        FROM users u ORDER BY u.name ASC LIMIT 500`
     );
@@ -317,20 +317,145 @@ router.patch('/chat/:id', asyncHandler(async (req, res) => {
   await pool.query(`UPDATE chat_conversations SET status=$2 WHERE id=$1`, [req.params.id, st]);
   res.json({ ok: true, status: st });
 }));
+
 // Konuşmadaki müşterinin profil bilgileri + otomatik müşteri kodu
 router.get('/chat/:id/customer', asyncHandler(async (req, res) => {
   const conv = await pool.query(`SELECT user_id FROM chat_conversations WHERE id=$1`, [req.params.id]);
   if (!conv.rows[0]) return res.status(404).json({ ok: false, error: 'not_found' });
   const uid = conv.rows[0].user_id;
-  const u = await pool.query(`SELECT id, email, name, phone, customer_code, created_at FROM users WHERE id=$1`, [uid]);
+  const u = await pool.query(
+    `SELECT id, email, name, phone, customer_code, created_at FROM users WHERE id=$1`, [uid]);
   const user = u.rows[0] || {};
+  // Müşteri kodu yoksa üret ve kaydet
   if (user.id && !user.customer_code) {
     const code = 'CBM' + String(user.id).padStart(6, '0');
     await pool.query(`UPDATE users SET customer_code=$2 WHERE id=$1`, [user.id, code]);
     user.customer_code = code;
   }
-  const ord = await pool.query(`SELECT COUNT(*)::int AS cnt, COALESCE(SUM(total_cents),0)::bigint AS total FROM orders WHERE user_id=$1 AND payment_status='paid'`, [uid]);
-  res.json({ ok: true, customer: { ...user, order_count: ord.rows[0]?.cnt || 0, total_spent: Number(ord.rows[0]?.total || 0) / 100 } });
+  const ord = await pool.query(
+    `SELECT COUNT(*)::int AS cnt, COALESCE(SUM(total_cents),0)::bigint AS total
+     FROM orders WHERE user_id=$1 AND payment_status='paid'`, [uid]);
+  res.json({ ok: true, customer: {
+    ...user,
+    order_count: ord.rows[0]?.cnt || 0,
+    total_spent: Number(ord.rows[0]?.total || 0) / 100,
+  }});
+}));
+
+
+// ============ KUPONLAR ============
+router.get('/coupons', asyncHandler(async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM coupons ORDER BY created_at DESC');
+  res.json({ items: rows });
+}));
+router.post('/coupons', asyncHandler(async (req, res) => {
+  const { code, discount_type, discount_value, min_order_cents, max_uses, ends_at } = req.body;
+  const { rows } = await pool.query(
+    `INSERT INTO coupons (code, discount_type, discount_value, min_order_cents, max_uses, ends_at)
+     VALUES (UPPER($1),$2,$3,$4,$5,$6) RETURNING *`,
+    [code, discount_type||'percent', discount_value||0, min_order_cents||0, max_uses||0, ends_at||null]
+  );
+  res.json({ item: rows[0] });
+}));
+router.patch('/coupons/:id', asyncHandler(async (req, res) => {
+  const { is_active } = req.body;
+  await pool.query('UPDATE coupons SET is_active=$1 WHERE id=$2', [is_active, req.params.id]);
+  res.json({ ok: true });
+}));
+router.delete('/coupons/:id', asyncHandler(async (req, res) => {
+  await pool.query('DELETE FROM coupons WHERE id=$1', [req.params.id]);
+  res.json({ ok: true });
+}));
+
+// ============ BANNERLAR ============
+router.get('/banners', asyncHandler(async (req, res) => {
+  const { rows } = await pool.query('SELECT * FROM banners ORDER BY sort_order, created_at DESC');
+  res.json({ items: rows });
+}));
+router.post('/banners', asyncHandler(async (req, res) => {
+  const { title, subtitle, image_url, link_url, position, sort_order } = req.body;
+  const { rows } = await pool.query(
+    `INSERT INTO banners (title, subtitle, image_url, link_url, position, sort_order)
+     VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+    [title, subtitle||'', image_url||'', link_url||'', position||'home_top', sort_order||0]
+  );
+  res.json({ item: rows[0] });
+}));
+router.patch('/banners/:id', asyncHandler(async (req, res) => {
+  const { is_active, title, subtitle, image_url, link_url, sort_order } = req.body;
+  const sets = [], vals = []; let i = 1;
+  if (is_active !== undefined) { sets.push(`is_active=$${i++}`); vals.push(is_active); }
+  if (title !== undefined) { sets.push(`title=$${i++}`); vals.push(title); }
+  if (subtitle !== undefined) { sets.push(`subtitle=$${i++}`); vals.push(subtitle); }
+  if (image_url !== undefined) { sets.push(`image_url=$${i++}`); vals.push(image_url); }
+  if (link_url !== undefined) { sets.push(`link_url=$${i++}`); vals.push(link_url); }
+  if (sort_order !== undefined) { sets.push(`sort_order=$${i++}`); vals.push(sort_order); }
+  if (sets.length) { vals.push(req.params.id); await pool.query(`UPDATE banners SET ${sets.join(', ')} WHERE id=$${i}`, vals); }
+  res.json({ ok: true });
+}));
+router.delete('/banners/:id', asyncHandler(async (req, res) => {
+  await pool.query('DELETE FROM banners WHERE id=$1', [req.params.id]);
+  res.json({ ok: true });
+}));
+
+// ============ İADELER ============
+router.get('/returns', asyncHandler(async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT r.*, o.order_no, u.email AS user_email, u.name AS user_name, u.customer_code
+     FROM returns r LEFT JOIN orders o ON o.id=r.order_id LEFT JOIN users u ON u.id=r.user_id
+     ORDER BY r.created_at DESC LIMIT 200`
+  );
+  res.json({ items: rows });
+}));
+router.patch('/returns/:id', asyncHandler(async (req, res) => {
+  const { status, admin_note } = req.body;
+  await pool.query('UPDATE returns SET status=$1, admin_note=$2, updated_at=now() WHERE id=$3',
+    [status, admin_note||'', req.params.id]);
+  res.json({ ok: true });
+}));
+
+// ============ STOK ============
+router.get('/stock', asyncHandler(async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT p.id, p.name, p.stock, p.barcode,
+      (SELECT count(*)::int FROM stock_moves sm WHERE sm.product_id=p.id) AS move_count
+     FROM products p ORDER BY p.stock ASC LIMIT 200`
+  );
+  res.json({ items: rows });
+}));
+router.post('/stock/:id/adjust', asyncHandler(async (req, res) => {
+  const { qty_change, reason } = req.body;
+  const q = parseInt(qty_change, 10) || 0;
+  await pool.query('UPDATE products SET stock = GREATEST(0, stock + $1) WHERE id=$2', [q, req.params.id]);
+  await pool.query('INSERT INTO stock_moves (product_id, qty_change, reason, created_by) VALUES ($1,$2,$3,$4)',
+    [req.params.id, q, reason||'manuel', req.user.id]);
+  res.json({ ok: true });
+}));
+
+// ============ KATEGORİLER ============
+router.get('/categories', asyncHandler(async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT c.*, (SELECT count(*)::int FROM products p WHERE p.category_id=c.id) AS product_count
+     FROM categories c ORDER BY c.sort_order, c.name`
+  );
+  res.json({ items: rows });
+}));
+router.post('/categories', asyncHandler(async (req, res) => {
+  const { name, slug, icon, sort_order } = req.body;
+  const { rows } = await pool.query(
+    'INSERT INTO categories (name, slug, icon, sort_order) VALUES ($1,$2,$3,$4) RETURNING *',
+    [name, slug||name.toLowerCase().replace(/[^a-z0-9]+/g,'-'), icon||'', sort_order||0]
+  );
+  res.json({ item: rows[0] });
+}));
+router.patch('/categories/:id', asyncHandler(async (req, res) => {
+  const { name, is_active, sort_order } = req.body;
+  const sets = [], vals = []; let i = 1;
+  if (name !== undefined) { sets.push(`name=$${i++}`); vals.push(name); }
+  if (is_active !== undefined) { sets.push(`is_active=$${i++}`); vals.push(is_active); }
+  if (sort_order !== undefined) { sets.push(`sort_order=$${i++}`); vals.push(sort_order); }
+  if (sets.length) { vals.push(req.params.id); await pool.query(`UPDATE categories SET ${sets.join(', ')} WHERE id=$${i}`, vals); }
+  res.json({ ok: true });
 }));
 
 module.exports = router;
