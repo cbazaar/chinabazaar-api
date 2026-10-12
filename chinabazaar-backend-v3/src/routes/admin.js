@@ -285,7 +285,7 @@ router.get('/chat', asyncHandler(async (req, res) => {
     SELECT DISTINCT ON (m.conversation_id)
       m.conversation_id AS id,
       c.user_id, c.status, c.last_message_at,
-      u.name AS user_name, u.email AS user_email,
+      u.name AS user_name, u.email AS user_email, u.customer_code,
       m.body AS last_body,
       (SELECT count(*)::int FROM chat_messages m2 WHERE m2.conversation_id=m.conversation_id AND m2.sender='customer' AND NOT m2.read_by_admin) AS unread
     FROM chat_messages m
