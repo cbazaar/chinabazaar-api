@@ -193,7 +193,38 @@ router.post(
       const user = publicUser(row);
       return res.json({ user, token: signToken(user) });
     }
-    // Yeni kayıt
+    // POST /api/auth/login-with-code { email, code } — şifresiz e-posta koduyla giriş
+router.post(
+  '/login-with-code',
+  codeLimiter,
+  body('email').isEmail().normalizeEmail(),
+  body('code').matches(/^[0-9]{6}$/),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    const { email, code } = req.body;
+    const { rows } = await pool.query(
+      `SELECT * FROM email_codes WHERE email = $1 AND consumed_at IS NULL AND expires_at > now()
+       ORDER BY created_at DESC LIMIT 1`,
+      [email]
+    );
+    const rec = rows[0];
+    if (!rec) return res.status(400).json({ error: 'code_expired' });
+    if (rec.attempts >= 5) return res.status(429).json({ error: 'too_many_attempts' });
+    const ok = await bcrypt.compare(code, rec.code_hash);
+    await pool.query('UPDATE email_codes SET attempts = attempts + 1 WHERE id = $1', [rec.id]);
+    if (!ok) return res.status(400).json({ error: 'code_invalid' });
+    await pool.query('UPDATE email_codes SET consumed_at = now() WHERE id = $1', [rec.id]);
+    const { rows: urows } = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+    if (!urows[0]) return res.status(404).json({ error: 'user_not_found' });
+    const row = urows[0];
+    if (row.is_blocked) return res.status(403).json({ error: 'user_blocked' });
+    await pool.query('UPDATE users SET email_verified = TRUE WHERE id = $1', [row.id]);
+    const user = publicUser(row);
+    res.json({ user, token: signToken(user) });
+  })
+);
+
+// Yeni kayıt
     if (!name) return res.status(400).json({ error: 'name_required' });
     const hash = await bcrypt.hash(password, 12);
     try {
