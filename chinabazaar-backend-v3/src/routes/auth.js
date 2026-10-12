@@ -15,7 +15,7 @@ const crypto = require('crypto');
 const router = express.Router();
 
 function publicUser(row) {
-  return { id: row.id, email: row.email, name: row.name, nickname: row.nickname || null, phone: row.phone, is_admin: !!row.is_admin };
+  return { id: row.id, email: row.email, name: row.name, nickname: row.nickname || null, phone: row.phone, is_admin: !!row.is_admin, customer_code: row.customer_code || null };
 }
 
 // POST /api/auth/register  { email, password, name, phone?, admin_key? }
