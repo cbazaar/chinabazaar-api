@@ -164,20 +164,8 @@ router.post(
 );
 
 // GET /api/products/:id
-router.get(
-  '/:id',
-  param('id').isUUID(),
-  asyncHandler(async (req, res) => {
-    if (!checkValidation(req, res)) return;
-    const { rows } = await pool.query(`${SELECT} WHERE p.id = $1 AND p.is_active = TRUE`, [req.params.id]);
-    if (!rows.length) return res.status(404).json({ error: 'product_not_found' });
-    res.json(toProduct(rows[0]));
-  })
-);
-
-
-// POST /api/products/enable-mp4 — tüm Cloudflare videoları için MP4 indirmeyi etkinleştir (admin)
-router.post('/enable-mp4', requireAdmin, async (req, res) => {
+// ALL /api/products/enable-mp4 (GET/POST) — tüm Cloudflare videoları için MP4 indirmeyi etkinleştir (admin)
+router.all('/enable-mp4', requireAdmin, async (req, res) => {
   try {
     const { enableMp4Download } = require('../services/stream');
     const { rows } = await pool.query("SELECT id, video_url FROM products WHERE video_url LIKE '%videodelivery.net%'");
@@ -193,6 +181,19 @@ router.post('/enable-mp4', requireAdmin, async (req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
+router.get(
+  '/:id',
+  param('id').isUUID(),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    const { rows } = await pool.query(`${SELECT} WHERE p.id = $1 AND p.is_active = TRUE`, [req.params.id]);
+    if (!rows.length) return res.status(404).json({ error: 'product_not_found' });
+    res.json(toProduct(rows[0]));
+  })
+);
+
+
 
 // ---- Admin CRUD (yalnız is_admin) ----
 
