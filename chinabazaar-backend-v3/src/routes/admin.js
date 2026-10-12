@@ -317,5 +317,20 @@ router.patch('/chat/:id', asyncHandler(async (req, res) => {
   await pool.query(`UPDATE chat_conversations SET status=$2 WHERE id=$1`, [req.params.id, st]);
   res.json({ ok: true, status: st });
 }));
+// Konuşmadaki müşterinin profil bilgileri + otomatik müşteri kodu
+router.get('/chat/:id/customer', asyncHandler(async (req, res) => {
+  const conv = await pool.query(`SELECT user_id FROM chat_conversations WHERE id=$1`, [req.params.id]);
+  if (!conv.rows[0]) return res.status(404).json({ ok: false, error: 'not_found' });
+  const uid = conv.rows[0].user_id;
+  const u = await pool.query(`SELECT id, email, name, phone, customer_code, created_at FROM users WHERE id=$1`, [uid]);
+  const user = u.rows[0] || {};
+  if (user.id && !user.customer_code) {
+    const code = 'CBM' + String(user.id).padStart(6, '0');
+    await pool.query(`UPDATE users SET customer_code=$2 WHERE id=$1`, [user.id, code]);
+    user.customer_code = code;
+  }
+  const ord = await pool.query(`SELECT COUNT(*)::int AS cnt, COALESCE(SUM(total_cents),0)::bigint AS total FROM orders WHERE user_id=$1 AND payment_status='paid'`, [uid]);
+  res.json({ ok: true, customer: { ...user, order_count: ord.rows[0]?.cnt || 0, total_spent: Number(ord.rows[0]?.total || 0) / 100 } });
+}));
 
 module.exports = router;
