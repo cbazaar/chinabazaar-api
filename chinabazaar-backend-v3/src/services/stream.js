@@ -83,8 +83,8 @@ function mp4Url(uid) {
 async function enableMp4Download(uid) {
   if (!enabled()) return false;
   try {
-    const res = await cfFetch(`/stream/${uid}/downloads`, { method: 'POST' });
-    return res.ok;
+    await call(`/stream/${uid}/downloads`, { method: 'POST' });
+    return true;
   } catch (e) { return false; }
 }
 
@@ -92,9 +92,8 @@ async function enableMp4Download(uid) {
 async function enableMp4DownloadDebug(uid) {
   if (!enabled()) return { ok: false, error: 'stream-not-configured' };
   try {
-    const res = await cfFetch(`/stream/${uid}/downloads`, { method: 'POST' });
-    if (res.ok) return { ok: true };
-    return { ok: false, error: 'api-' + (res.status || 'unknown') };
+    await call(`/stream/${uid}/downloads`, { method: 'POST' });
+    return { ok: true };
   } catch (e) { return { ok: false, error: e.message }; }
 }
 
