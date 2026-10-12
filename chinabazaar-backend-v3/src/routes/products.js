@@ -164,6 +164,41 @@ router.post(
 );
 
 // GET /api/products/:id
+// GET /api/products/video/:uid — video proxy (videodelivery.net engelini aşar)
+router.get('/video/:uid', async (req, res) => {
+  try {
+    const uid = req.params.uid;
+    if (!/^[a-f0-9]{32}$/i.test(uid)) return res.status(400).json({ error: 'invalid_uid' });
+    const mp4Url = `https://videodelivery.net/${uid}/downloads/default.mp4`;
+    const headers = {};
+    if (req.headers.range) headers.Range = req.headers.range;
+    const upstream = await fetch(mp4Url, { headers, redirect: 'follow' });
+    if (!upstream.ok && upstream.status !== 206) {
+      return res.status(upstream.status).json({ error: 'upstream_error' });
+    }
+    // Üst akış başlıklarını ilet
+    for (const [k, v] of upstream.headers) {
+      const lk = k.toLowerCase();
+      if (['content-type','content-length','content-range','accept-ranges','cache-control'].includes(lk)) {
+        res.setHeader(k, v);
+      }
+    }
+    res.status(upstream.status);
+    const reader = upstream.body.getReader();
+    const pump = async () => {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!res.write(value)) await new Promise(r => res.once('drain', r));
+      }
+      res.end();
+    };
+    pump().catch(() => { try { res.end(); } catch(e){} });
+  } catch (e) {
+    if (!res.headersSent) res.status(502).json({ error: 'proxy_error' });
+  }
+});
+
 // ALL /api/products/enable-mp4 (GET/POST) — tüm Cloudflare videoları için MP4 indirmeyi etkinleştir (admin)
 router.all('/enable-mp4', requireAuth, requireAdmin, async (req, res) => {
   try {
