@@ -44,6 +44,9 @@ function getTransport() {
       port: e.smtpPort,
       secure: e.smtpSecure, // true: 465, false: STARTTLS
       auth: { user: e.smtpUser, pass: e.smtpPass },
+      connectionTimeout: 10000,
+      greetingTimeout: 10000,
+      socketTimeout: 15000,
     });
   }
   return getTransport.t;
