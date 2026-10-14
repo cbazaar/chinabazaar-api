@@ -71,6 +71,19 @@ const cfg = {
     username: (process.env.ARAS_CARGO_USERNAME || '').trim(),
     trackMethod: (process.env.ARAS_CARGO_TRACK_METHOD || 'getOrder').trim(),
   },
+
+  // Sovos e-Arşiv Fatura — e-Arşiv fatura gönderimi (Railway değişkenlerinden)
+  sovos: {
+    enabled: process.env.SOVOS_ENABLED === '1',
+    endpoint: (process.env.SOVOS_EARSIV_ENDPOINT || '').trim(),
+    username: (process.env.SOVOS_USERNAME || '').trim(),
+    senderVkn: (process.env.SOVOS_SENDER_VKN || '').trim(),
+    senderName: (process.env.SOVOS_SENDER_NAME || '').trim(),
+    senderAddress: (process.env.SOVOS_SENDER_ADDRESS || '').trim(),
+    senderCity: (process.env.SOVOS_SENDER_CITY || '').trim(),
+    senderTaxOffice: (process.env.SOVOS_SENDER_TAX_OFFICE || '').trim(),
+    branch: (process.env.SOVOS_BRANCH || 'default').trim(),
+  },
 };
 
 if (!cfg.databaseUrl) {
