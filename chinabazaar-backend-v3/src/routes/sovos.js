@@ -3,11 +3,12 @@
 // GET  /api/admin/sovos/status — Sovos yapılandırma durumu
 const express = require('express');
 const router = express.Router();
-const { requireAdmin } = require('../middleware/auth');
+const { requireAuth } = require('../middleware/auth');
+const { requireAdmin } = require('../middleware/admin');
 const sovos = require('../services/sovos');
 const { pool } = require('../db');
 
-router.get('/status', requireAdmin, async (_req, res) => {
+router.get('/status', requireAuth, requireAdmin, async (_req, res) => {
   const c = sovos.cfg();
   res.json({
     enabled: sovos.isEnabled(),
@@ -20,7 +21,7 @@ router.get('/status', requireAdmin, async (_req, res) => {
   });
 });
 
-router.post('/send-invoice', requireAdmin, async (req, res) => {
+router.post('/send-invoice', requireAuth, requireAdmin, async (req, res) => {
   const { order_id } = req.body || {};
   if (!order_id) return res.status(400).json({ error: 'order_id_required' });
   if (!sovos.isEnabled()) {
