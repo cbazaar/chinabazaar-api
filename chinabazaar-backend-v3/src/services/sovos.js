@@ -92,22 +92,31 @@ function buildUblInvoice(order, sender) {
     </cac:InvoiceLine>`;
   }).join('\n');
 
-  const customerTax = order.customer_tax_no || order.customer_tckn || '11111111111';
-  const customerName = order.customer_name || 'Müşteri';
+  // Fatura türü: bireysel -> e-Arşiv (EARSIVFATURA, TCKN), kurumsal -> e-Fatura (TEMELFATURA, VKN)
+  const isCorporate = (order.invoice_type === 'kurumsal') || Boolean(order.invoice_vkn || order.invoice_company);
+  const profileId = isCorporate ? 'TEMELFATURA' : 'EARSIVFATURA';
+  const idScheme = isCorporate ? 'VKN' : 'TCKN';
+  const customerTax = isCorporate
+    ? (order.invoice_vkn || order.customer_tax_no || order.customer_vkn || '1111111111')
+    : (order.invoice_tckn || order.customer_tckn || order.customer_tax_no || '11111111111');
+  const customerName = isCorporate
+    ? (order.invoice_company || order.customer_name || 'Firma')
+    : (order.customer_name || 'Müşteri');
+  const customerTaxOffice = order.invoice_tax_office || order.customer_tax_office || '';
   const customerAddr = order.customer_address || order.shipping_address || '';
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Invoice xmlns="urn:oasis:names:specification:ubl:schema:xsd:Invoice-2" xmlns:cac="urn:oasis:names:specification:ubl:schema:xsd:CommonAggregateComponents-2" xmlns:cbc="urn:oasis:names:specification:ubl:schema:xsd:CommonBasicComponents-2" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
   <cbc:UBLVersionID>2.1</cbc:UBLVersionID>
   <cbc:CustomizationID>TR1.2</cbc:CustomizationID>
-  <cbc:ProfileID>EARSIVFATURA</cbc:ProfileID>
+  <cbc:ProfileID>${profileId}</cbc:ProfileID>
   <cbc:ID>${escXml(invoiceNo)}</cbc:ID>
   <cbc:CopyIndicator>false</cbc:CopyIndicator>
   <cbc:UUID>${uuid}</cbc:UUID>
   <cbc:IssueDate>${now.slice(0, 10)}</cbc:IssueDate>
   <cbc:IssueTime>${now.slice(11, 19)}</cbc:IssueTime>
   <cbc:InvoiceTypeCode>SATIS</cbc:InvoiceTypeCode>
-  <cbc:Note>ChinaBazaar e-Arşiv Fatura</cbc:Note>
+  <cbc:Note>ChinaBazaar ${isCorporate ? 'e-Fatura' : 'e-Arşiv Fatura'}</cbc:Note>
   <cbc:DocumentCurrencyCode>TRY</cbc:DocumentCurrencyCode>
   <cbc:LineCountNumeric>${(order.items || []).length}</cbc:LineCountNumeric>
   <cac:AccountingSupplierParty>
@@ -124,8 +133,9 @@ function buildUblInvoice(order, sender) {
   </cac:AccountingSupplierParty>
   <cac:AccountingCustomerParty>
     <cac:Party>
-      <cac:PartyIdentification><cbc:ID schemeID="TCKN">${escXml(customerTax)}</cbc:ID></cac:PartyIdentification>
-      <cac:PartyName><cbc:Name>${escXml(customerName)}</cbc:Name></cac:PartyName>
+      <cac:PartyIdentification><cbc:ID schemeID="${idScheme}">${escXml(customerTax)}</cbc:ID></cac:PartyIdentification>
+      <cac:PartyName><cbc:Name>${escXml(customerName)}</cbc:Name></cac:PartyName>${customerTaxOffice ? `
+      <cac:PartyTaxScheme><cbc:RegistrationName>${escXml(customerName)}</cbc:RegistrationName><cac:TaxScheme><cbc:Name>${escXml(customerTaxOffice)}</cbc:Name></cac:TaxScheme></cac:PartyTaxScheme>` : ''}
       <cac:PostalAddress><cbc:StreetName>${escXml(customerAddr)}</cbc:StreetName><cbc:Country><cbc:IdentificationCode>TR</cbc:IdentificationCode><cbc:Name>Türkiye</cbc:Name></cbc:Country></cac:PostalAddress>
     </cac:Party>
   </cac:AccountingCustomerParty>
@@ -259,7 +269,12 @@ function soapPost(endpoint, soapXml, username, password) {
   });
 }
 
-// e-Arşiv fatura gönder
+// Sipariş kurumsal mı? (e-Fatura) — bireysel ise e-Arşiv
+function isCorporateOrder(order) {
+  return (order && order.invoice_type === 'kurumsal') || Boolean(order && (order.invoice_vkn || order.invoice_company));
+}
+
+// e-Fatura (kurumsal) / e-Arşiv (bireysel) fatura gönder
 async function sendEArchiveInvoice(order) {
   const c = cfg();
   if (!isEnabled()) {
@@ -274,7 +289,7 @@ async function sendEArchiveInvoice(order) {
   <soapenv:Body>
     <inv:sendInvoiceRequestType>
       <senderID>${escXml(c.senderVkn)}</senderID>
-      <receiverID>1111111111</receiverID>
+      <receiverID>${escXml(isCorporateOrder(order) ? (order.invoice_vkn || order.customer_tax_no || order.customer_vkn || '1111111111') : (order.invoice_tckn || order.customer_tckn || order.customer_tax_no || '11111111111'))}</receiverID>
       <docType>XML</docType>
       <fileName>${escXml(fileName)}</fileName>
       <hash>${md5}</hash>
