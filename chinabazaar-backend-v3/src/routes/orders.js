@@ -46,6 +46,11 @@ router.post(
   '/',
   body('address_id').isUUID(),
   body('payment_method').optional().isIn(['card', 'transfer']),
+  body('invoice_type').optional().isIn(['bireysel', 'kurumsal']),
+  body('invoice_tckn').optional().isString().trim().isLength({ min: 0, max: 11 }),
+  body('invoice_vkn').optional().isString().trim().isLength({ min: 0, max: 10 }),
+  body('invoice_company').optional().isString().trim().isLength({ min: 0, max: 200 }),
+  body('invoice_tax_office').optional().isString().trim().isLength({ min: 0, max: 100 }),
   body('items').isArray({ min: 1 }),
   body('items.*.product_id').isUUID(),
   body('items.*.qty').isInt({ min: 1, max: 99 }),
@@ -54,6 +59,12 @@ router.post(
 
     const { address_id, items } = req.body;
     const paymentMethod = req.body.payment_method === 'transfer' ? 'transfer' : 'card';
+    // Fatura bilgileri (checkout'ta müşteri seçer: bireysel -> e-Arşiv, kurumsal -> e-Fatura)
+    const invoiceType = req.body.invoice_type === 'kurumsal' ? 'kurumsal' : 'bireysel';
+    const invoiceTckn = invoiceType === 'bireysel' ? String(req.body.invoice_tckn || '').replace(/\D/g, '').slice(0, 11) || null : null;
+    const invoiceVkn = invoiceType === 'kurumsal' ? String(req.body.invoice_vkn || '').replace(/\D/g, '').slice(0, 10) || null : null;
+    const invoiceCompany = invoiceType === 'kurumsal' ? String(req.body.invoice_company || '').trim().slice(0, 200) || null : null;
+    const invoiceTaxOffice = invoiceType === 'kurumsal' ? String(req.body.invoice_tax_office || '').trim().slice(0, 100) || null : null;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -97,9 +108,9 @@ router.post(
 
       const orderNo = nextOrderNo();
       const { rows: orderRows } = await client.query(
-        `INSERT INTO orders (user_id, order_no, status, subtotal_cents, shipping_cents, total_cents, currency, address_id, address_snapshot, payment_method)
-         VALUES ($1,$2,'pending',$3,$4,$5,'TRY',$6,$7,$8) RETURNING *`,
-        [req.user.id, orderNo, subtotal, shipping, total, address_id, JSON.stringify(addr.rows[0])]
+        `INSERT INTO orders (user_id, order_no, status, subtotal_cents, shipping_cents, total_cents, currency, address_id, address_snapshot, payment_method, invoice_type, invoice_tckn, invoice_vkn, invoice_company, invoice_tax_office)
+         VALUES ($1,$2,'pending',$3,$4,$5,'TRY',$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+        [req.user.id, orderNo, subtotal, shipping, total, address_id, JSON.stringify(addr.rows[0]), paymentMethod, invoiceType, invoiceTckn, invoiceVkn, invoiceCompany, invoiceTaxOffice]
       );
       const order = orderRows[0];
 
@@ -153,7 +164,7 @@ router.get(
   param('id').isUUID(),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
-    const { rows } = await pool.query('SELECT * FROM orders WHERE id = $1', [req.params.id]);
+    const { rows } = await pool.query('SELECT o.*, u.customer_code FROM orders o LEFT JOIN users u ON u.id = o.user_id WHERE o.id = $1', [req.params.id]);
     const order = rows[0];
     if (!order) return res.status(404).json({ error: 'order_not_found' });
 

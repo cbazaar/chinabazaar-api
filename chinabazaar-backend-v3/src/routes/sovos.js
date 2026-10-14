@@ -44,6 +44,12 @@ router.post('/send-invoice', requireAuth, requireAdmin, async (req, res) => {
       customer_email: order.customer_email,
       customer_tax_no: order.customer_tax_no,
       customer_address: order.shipping_address || order.customer_address,
+      // Fatura türü (checkout'ta müşteri seçer): bireysel -> e-Arşiv, kurumsal -> e-Fatura
+      invoice_type: order.invoice_type || 'bireysel',
+      invoice_tckn: order.invoice_tckn || null,
+      invoice_vkn: order.invoice_vkn || null,
+      invoice_company: order.invoice_company || null,
+      invoice_tax_office: order.invoice_tax_office || null,
       items: items.map((it) => ({
         name: it.product_name || it.name,
         qty: it.quantity || 1,
@@ -55,13 +61,20 @@ router.post('/send-invoice', requireAuth, requireAdmin, async (req, res) => {
     };
     const result = await sovos.sendEArchiveInvoice(orderData);
     if (result.ok) {
-      // Fatura kaydını güncelle
+      // Fatura kaydını güncelle (invoices tablosu)
       try {
         await pool.query(
           `UPDATE invoices SET status='sent', sovos_uuid=$2, sovos_invoice_no=$3, sent_at=now() WHERE order_id=$1`,
           [order_id, result.uuid, result.invoiceNumber]
         );
       } catch (_) { /* invoices tablosu yoksa sorun değil */ }
+      // Siparişi de güncelle (frontend'de "Gönderildi" gösterimi için)
+      try {
+        await pool.query(
+          `UPDATE orders SET sovos_uuid=$2, sovos_invoice_no=$3, invoice_sent=true WHERE id=$1`,
+          [order_id, result.uuid, result.invoiceNumber]
+        );
+      } catch (_) { /* orders sovos alanları yoksa sorun değil */ }
       return res.json({ ok: true, uuid: result.uuid, invoiceNumber: result.invoiceNumber, detail: result.detail });
     }
     return res.status(502).json({ ok: false, error: result.error, detail: result.detail || result.message });
