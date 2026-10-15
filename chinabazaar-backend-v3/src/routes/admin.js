@@ -344,25 +344,55 @@ router.get('/chat/:id/customer', asyncHandler(async (req, res) => {
 
 
 // ============ KUPONLAR ============
+async function ensureCouponsTable(q) {
+  await q.query(`CREATE TABLE IF NOT EXISTS coupons (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    code TEXT UNIQUE NOT NULL,
+    discount_type VARCHAR(16) DEFAULT 'percent',
+    discount_value NUMERIC DEFAULT 0,
+    min_order_cents BIGINT DEFAULT 0,
+    max_uses INT DEFAULT 0,
+    used_count INT DEFAULT 0,
+    ends_at TIMESTAMPTZ,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now()
+  )`);
+  await q.query(`ALTER TABLE coupons ADD COLUMN IF NOT EXISTS min_order_cents BIGINT DEFAULT 0`);
+  await q.query(`ALTER TABLE coupons ADD COLUMN IF NOT EXISTS max_uses INT DEFAULT 0`);
+  await q.query(`ALTER TABLE coupons ADD COLUMN IF NOT EXISTS used_count INT DEFAULT 0`);
+  await q.query(`ALTER TABLE coupons ADD COLUMN IF NOT EXISTS ends_at TIMESTAMPTZ`);
+  await q.query(`ALTER TABLE coupons ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE`);
+}
 router.get('/coupons', asyncHandler(async (req, res) => {
+  await ensureCouponsTable(pool);
   const { rows } = await pool.query('SELECT * FROM coupons ORDER BY created_at DESC');
   res.json({ items: rows });
 }));
 router.post('/coupons', asyncHandler(async (req, res) => {
+  await ensureCouponsTable(pool);
   const { code, discount_type, discount_value, min_order_cents, max_uses, ends_at } = req.body;
-  const { rows } = await pool.query(
-    `INSERT INTO coupons (code, discount_type, discount_value, min_order_cents, max_uses, ends_at)
-     VALUES (UPPER($1),$2,$3,$4,$5,$6) RETURNING *`,
-    [code, discount_type||'percent', discount_value||0, min_order_cents||0, max_uses||0, ends_at||null]
-  );
+  let rows;
+  try {
+    ({ rows } = await pool.query(
+      `INSERT INTO coupons (code, discount_type, discount_value, min_order_cents, max_uses, ends_at)
+       VALUES (UPPER($1),$2,$3,$4,$5,$6) RETURNING *`,
+      [code, discount_type||'percent', discount_value||0, min_order_cents||0, max_uses||0, ends_at||null]
+    ));
+  } catch (e) {
+    if (e.code === '23505') return res.status(409).json({ error: 'coupon_code_exists' });
+    throw e;
+  }
   res.json({ item: rows[0] });
 }));
 router.patch('/coupons/:id', asyncHandler(async (req, res) => {
+  await ensureCouponsTable(pool);
   const { is_active } = req.body;
   await pool.query('UPDATE coupons SET is_active=$1 WHERE id=$2', [is_active, req.params.id]);
   res.json({ ok: true });
 }));
 router.delete('/coupons/:id', asyncHandler(async (req, res) => {
+  await ensureCouponsTable(pool);
   await pool.query('DELETE FROM coupons WHERE id=$1', [req.params.id]);
   res.json({ ok: true });
 }));
@@ -400,6 +430,17 @@ router.delete('/banners/:id', asyncHandler(async (req, res) => {
 
 // ============ İADELER ============
 router.get('/returns', asyncHandler(async (req, res) => {
+  // returns tablosunu garantile (022 migration'ı uygulanmamışsa bile sayfa çalışır)
+  await pool.query(`CREATE TABLE IF NOT EXISTS returns (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    order_id UUID REFERENCES orders(id),
+    user_id UUID REFERENCES users(id),
+    reason TEXT,
+    status VARCHAR(24) DEFAULT 'pending',
+    admin_note TEXT,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now()
+  )`);
   const { rows } = await pool.query(
     `SELECT r.*, o.order_no, u.email AS user_email, u.name AS user_name, u.customer_code
      FROM returns r LEFT JOIN orders o ON o.id=r.order_id LEFT JOIN users u ON u.id=r.user_id
@@ -407,10 +448,17 @@ router.get('/returns', asyncHandler(async (req, res) => {
   );
   res.json({ items: rows });
 }));
-router.patch('/returns/:id', asyncHandler(async (req, res) => {
+router.patch('/returns/:id', param('id').isUUID(), body('status').optional().isString(), asyncHandler(async (req, res) => {
+  if (!checkValidation(req, res)) return;
   const { status, admin_note } = req.body;
-  await pool.query('UPDATE returns SET status=$1, admin_note=$2, updated_at=now() WHERE id=$3',
+  if (!['approved', 'rejected', 'completed'].includes(status)) return res.status(400).json({ error: 'invalid_status' });
+  const { rows } = await pool.query('UPDATE returns SET status=$1, admin_note=$2, updated_at=now() WHERE id=$3 RETURNING order_id',
     [status, admin_note||'', req.params.id]);
+  if (!rows.length) return res.status(404).json({ error: 'return_not_found' });
+  // Onaylanan / tamamlanan iade → sipariş durumu "iade edildi" olur
+  if (status === 'approved' || status === 'completed') {
+    await pool.query("UPDATE orders SET status='refunded', updated_at=now() WHERE id=$1", [rows[0].order_id]);
+  }
   res.json({ ok: true });
 }));
 
