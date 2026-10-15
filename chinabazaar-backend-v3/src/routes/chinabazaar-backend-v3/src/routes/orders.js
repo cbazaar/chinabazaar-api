@@ -12,6 +12,40 @@ const pool = require('../db');
 const router = express.Router();
 router.use(requireAuth);
 
+async function ensureCouponsTable(q) {
+  await q.query(`CREATE TABLE IF NOT EXISTS coupons (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    code TEXT UNIQUE NOT NULL,
+    discount_type VARCHAR(16) DEFAULT 'percent',
+    discount_value NUMERIC DEFAULT 0,
+    min_order_cents BIGINT DEFAULT 0,
+    max_uses INT DEFAULT 0,
+    used_count INT DEFAULT 0,
+    ends_at TIMESTAMPTZ,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    updated_at TIMESTAMPTZ DEFAULT now()
+  )`);
+  await q.query(`ALTER TABLE coupons ADD COLUMN IF NOT EXISTS min_order_cents BIGINT DEFAULT 0`);
+  await q.query(`ALTER TABLE coupons ADD COLUMN IF NOT EXISTS max_uses INT DEFAULT 0`);
+  await q.query(`ALTER TABLE coupons ADD COLUMN IF NOT EXISTS used_count INT DEFAULT 0`);
+  await q.query(`ALTER TABLE coupons ADD COLUMN IF NOT EXISTS ends_at TIMESTAMPTZ`);
+  await q.query(`ALTER TABLE coupons ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE`);
+}
+
+// Kupon indirimi (kurus): percent -> sepet yuzdesi, fixed -> TL tutar (discount_value TL).
+// Gecersiz kuponda 0 doner; gecerlilik kontrolleri cagiran tarafta yapilir.
+function couponDiscountCents(coupon, subtotalCents) {
+  if (!coupon || !coupon.is_active) return 0;
+  if (coupon.ends_at && new Date(coupon.ends_at) < new Date()) return 0;
+  if ((coupon.min_order_cents || 0) > subtotalCents) return 0;
+  if ((coupon.max_uses || 0) > 0 && (coupon.used_count || 0) >= coupon.max_uses) return 0;
+  let d = 0;
+  if (coupon.discount_type === 'fixed') d = Math.round(Number(coupon.discount_value || 0) * 100);
+  else d = Math.floor(subtotalCents * Number(coupon.discount_value || 0) / 100);
+  return Math.max(0, Math.min(d, subtotalCents));
+}
+
 function nextOrderNo() {
   // CB-2026-XXXXXX (6 haneli rastgele, benzersizlik DB constraint ile garanti)
   const rand = Math.floor(100000 + Math.random() * 900000);
@@ -41,6 +75,27 @@ router.get(
   })
 );
 
+// POST /api/orders/validate-coupon { code, subtotal_cents } — kupon gecerli mi, indirim ne kadar?
+router.post(
+  '/validate-coupon',
+  body('code').isString().trim().isLength({ min: 1, max: 64 }),
+  body('subtotal_cents').isInt({ min: 0 }),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    await ensureCouponsTable(pool);
+    const code = String(req.body.code).trim().toUpperCase();
+    const subtotalCents = Number(req.body.subtotal_cents);
+    const { rows } = await pool.query('SELECT * FROM coupons WHERE code = $1', [code]);
+    const coupon = rows[0];
+    if (!coupon) return res.status(404).json({ valid: false, error: 'coupon_not_found' });
+    if (!coupon.is_active) return res.status(400).json({ valid: false, error: 'coupon_inactive' });
+    if (coupon.ends_at && new Date(coupon.ends_at) < new Date()) return res.status(400).json({ valid: false, error: 'coupon_expired' });
+    if ((coupon.min_order_cents || 0) > subtotalCents) return res.status(400).json({ valid: false, error: 'coupon_min_order', min_order_cents: coupon.min_order_cents });
+    if ((coupon.max_uses || 0) > 0 && (coupon.used_count || 0) >= coupon.max_uses) return res.status(400).json({ valid: false, error: 'coupon_max_uses' });
+    res.json({ valid: true, code: coupon.code, discount_type: coupon.discount_type, discount_value: Number(coupon.discount_value || 0), discount_cents: couponDiscountCents(coupon, subtotalCents), min_order_cents: coupon.min_order_cents || 0 });
+  })
+);
+
 // POST /api/orders  { address_id, items: [{ product_id, qty }] }
 router.post(
   '/',
@@ -51,6 +106,7 @@ router.post(
   body('invoice_vkn').optional().isString().trim().isLength({ min: 0, max: 10 }),
   body('invoice_company').optional().isString().trim().isLength({ min: 0, max: 200 }),
   body('invoice_tax_office').optional().isString().trim().isLength({ min: 0, max: 100 }),
+  body('coupon_code').optional().isString().trim().isLength({ min: 0, max: 64 }),
   body('items').isArray({ min: 1 }),
   body('items.*.product_id').isUUID(),
   body('items.*.qty').isInt({ min: 1, max: 99 }),
@@ -103,14 +159,33 @@ router.post(
         lines.push({ product: p, qty: it.qty });
       }
 
+      // Kupon: sunucu tarafinda yeniden dogrulanir, indirim uygulanir, kullanim sayaci artar
+      let discountCents = 0;
+      let couponCode = null;
+      if (req.body.coupon_code) {
+        await ensureCouponsTable(client);
+        couponCode = String(req.body.coupon_code).trim().toUpperCase();
+        const { rows: crow } = await client.query('SELECT * FROM coupons WHERE code = $1 FOR UPDATE', [couponCode]);
+        const coupon = crow[0];
+        if (!coupon) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'coupon_not_found' }); }
+        if (!coupon.is_active) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'coupon_inactive' }); }
+        if (coupon.ends_at && new Date(coupon.ends_at) < new Date()) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'coupon_expired' }); }
+        if ((coupon.min_order_cents || 0) > subtotal) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'coupon_min_order' }); }
+        if ((coupon.max_uses || 0) > 0 && (coupon.used_count || 0) >= coupon.max_uses) { await client.query('ROLLBACK'); return res.status(400).json({ error: 'coupon_max_uses' }); }
+        discountCents = couponDiscountCents(coupon, subtotal);
+        await client.query('UPDATE coupons SET used_count = used_count + 1, updated_at = now() WHERE id = $1', [coupon.id]);
+      }
+
       const shipping = cfg.shippingCents;
-      const total = subtotal + shipping;
+      const total = subtotal + shipping - discountCents;
 
       const orderNo = nextOrderNo();
+      await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS coupon_code TEXT`);
+      await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_cents BIGINT DEFAULT 0`);
       const { rows: orderRows } = await client.query(
-        `INSERT INTO orders (user_id, order_no, status, subtotal_cents, shipping_cents, total_cents, currency, address_id, address_snapshot, payment_method, invoice_type, invoice_tckn, invoice_vkn, invoice_company, invoice_tax_office)
-         VALUES ($1,$2,'pending',$3,$4,$5,'TRY',$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
-        [req.user.id, orderNo, subtotal, shipping, total, address_id, JSON.stringify(addr.rows[0]), paymentMethod, invoiceType, invoiceTckn, invoiceVkn, invoiceCompany, invoiceTaxOffice]
+        `INSERT INTO orders (user_id, order_no, status, subtotal_cents, shipping_cents, total_cents, currency, address_id, address_snapshot, payment_method, invoice_type, invoice_tckn, invoice_vkn, invoice_company, invoice_tax_office, coupon_code, discount_cents)
+         VALUES ($1,$2,'pending',$3,$4,$5,'TRY',$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
+        [req.user.id, orderNo, subtotal, shipping, total, address_id, JSON.stringify(addr.rows[0]), paymentMethod, invoiceType, invoiceTckn, invoiceVkn, invoiceCompany, invoiceTaxOffice, couponCode, discountCents]
       );
       const order = orderRows[0];
 
@@ -145,6 +220,8 @@ router.post(
         status: order.status,
         subtotal_cents: order.subtotal_cents,
         shipping_cents: order.shipping_cents,
+        discount_cents: order.discount_cents,
+        coupon_code: order.coupon_code,
         total_cents: order.total_cents,
         currency: order.currency,
       });

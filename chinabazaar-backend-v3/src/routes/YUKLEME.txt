@@ -1,9 +1,9 @@
-ChinaBazaar Backend v445 — Iadeler aktif
+ChinaBazaar Backend v446 — Kuponlar aktif
 =========================================
 GitHub web uzerinden, asagidaki klasore girip iki dosyayi birlikte yukleyin:
   chinabazaar-backend-v3/src/routes/
 Dosyalar:
-  orders.js  -> musteri iade talebi (POST /api/orders/:id/return) + iade durumu (GET /api/orders/:id/return)
-  admin.js   -> GET /api/admin/returns (tablo garantili) + PATCH /api/admin/returns/:id (onay -> siparis refunded)
+  orders.js  -> kupon dogrulama (POST /api/orders/validate-coupon) + siparis olusturmada kupon uygula (coupon_code) + indirim + kullanim sayaci
+  admin.js   -> kuponlar (tablo garantili) + ayni kodda 409 coupon_code_exists
 Klasore girmeden yuklemeyin; dosyalar koke yigilmamali.
 Yuklemeden sonra Railway otomatik deploy eder.
