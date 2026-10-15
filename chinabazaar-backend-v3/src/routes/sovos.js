@@ -1,5 +1,6 @@
 // Sovos e-Arşiv / e-Fatura entegrasyonu (admin)
 // POST /api/admin/sovos/send-invoice { order_id } — sipariş için fatura gönder + PDF üret + müşteriye e-posta ile gönder
+// POST /api/admin/sovos/resend-email { order_id } — faturayı müşteriye e-posta ile tekrar gönder
 // GET  /api/admin/sovos/status — Sovos yapılandırma durumu
 // GET  /api/admin/sovos/invoice-pdf/:order_id — fatura PDF indir (admin veya sipariş sahibi müşteri)
 const express = require('express');
@@ -51,6 +52,42 @@ function buildOrderData(order, items) {
     vat_cents: order.vat_cents,
     created_at: order.created_at,
   };
+}
+
+// Siparişin fatura PDF'ini döner: önce kayıtlı PDF, yoksa sipariş verisinden yeniden üret.
+async function getInvoicePdfBuffer(order) {
+  let pdfBuffer = null;
+  try {
+    await ensureInvoicesTable();
+    const { rows } = await pool.query('SELECT pdf FROM invoices WHERE order_id=$1', [String(order.id)]);
+    if (rows.length && rows[0].pdf) pdfBuffer = rows[0].pdf;
+  } catch (_) { /* invoices tablosu yoksa yeniden üret */ }
+  if (!pdfBuffer) {
+    const { rows: items } = await pool.query('SELECT * FROM order_items WHERE order_id=$1', [order.id]);
+    const orderData = buildOrderData(order, items);
+    pdfBuffer = await generateInvoicePdf(
+      orderData,
+      { invoiceNumber: order.sovos_invoice_no, uuid: order.sovos_uuid },
+      sovos.cfg()
+    );
+  }
+  return pdfBuffer;
+}
+
+async function emailInvoicePdf(order, pdfBuffer) {
+  const { rows: items } = await pool.query('SELECT * FROM order_items WHERE order_id=$1', [order.id]);
+  const orderData = buildOrderData(order, items);
+  const mail = mailer.invoiceEmail(orderData, order.sovos_invoice_no);
+  const fname = 'fatura-' + (order.order_no || order.sovos_invoice_no || order.id) + '.pdf';
+  await mailer.sendMail(order.customer_email, {
+    subject: mail.subject,
+    text: mail.text,
+    html: mail.html,
+    attachments: [{ filename: fname, content: pdfBuffer }],
+  });
+  try {
+    await pool.query(`UPDATE invoices SET emailed_at=now() WHERE order_id=$1`, [String(order.id)]);
+  } catch (_) { /* önemsiz */ }
 }
 
 router.get('/status', requireAuth, requireAdmin, async (_req, res) => {
@@ -127,21 +164,8 @@ router.post('/send-invoice', requireAuth, requireAdmin, async (req, res) => {
         if (!mailer.isEnabled()) {
           emailError = 'email_not_configured';
         } else {
-          const mail = mailer.invoiceEmail(orderData, result.invoiceNumber);
-          const fname = 'fatura-' + (order.order_no || result.invoiceNumber || order_id) + '.pdf';
-          await mailer.sendMail(order.customer_email, {
-            subject: mail.subject,
-            text: mail.text,
-            html: mail.html,
-            attachments: [{ filename: fname, content: pdfBuffer }],
-          });
+          await emailInvoicePdf(order, pdfBuffer);
           emailed = true;
-          try {
-            await pool.query(
-              `UPDATE invoices SET emailed_at=now() WHERE order_id=$1`,
-              [String(order_id)]
-            );
-          } catch (_) { /* önemsiz */ }
         }
       } catch (e) {
         emailError = e.message;
@@ -168,6 +192,32 @@ router.post('/send-invoice', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
+// Faturayı müşteriye e-posta ile tekrar gönder (admin).
+router.post('/resend-email', requireAuth, requireAdmin, async (req, res) => {
+  const { order_id } = req.body || {};
+  if (!order_id) return res.status(400).json({ error: 'order_id_required' });
+  try {
+    const { rows: orders } = await pool.query('SELECT * FROM orders WHERE id=$1', [order_id]);
+    if (!orders.length) return res.status(404).json({ error: 'order_not_found' });
+    const order = orders[0];
+    if (!order.invoice_sent && !order.sovos_uuid) {
+      return res.status(404).json({ error: 'invoice_not_found', message: 'Bu sipariş için henüz fatura gönderilmemiş' });
+    }
+    if (!order.customer_email) {
+      return res.status(400).json({ error: 'no_customer_email', message: 'Siparişte müşteri e-postası yok' });
+    }
+    if (!mailer.isEnabled()) {
+      return res.status(503).json({ error: 'email_not_configured', message: 'E-posta gönderimi yapılandırılmamış (Railway SMTP/Resend)' });
+    }
+    const pdfBuffer = await getInvoicePdfBuffer(order);
+    await emailInvoicePdf(order, pdfBuffer);
+    return res.json({ ok: true, emailed: true, to: order.customer_email });
+  } catch (e) {
+    console.error('[sovos] resend-email hatası:', e.message);
+    return res.status(500).json({ error: 'sovos_error', message: e.message });
+  }
+});
+
 // Fatura PDF indir — admin veya siparişin sahibi müşteri.
 router.get('/invoice-pdf/:order_id', requireAuth, async (req, res) => {
   const orderId = req.params.order_id;
@@ -188,25 +238,7 @@ router.get('/invoice-pdf/:order_id', requireAuth, async (req, res) => {
       return res.status(404).json({ error: 'invoice_not_found', message: 'Bu sipariş için henüz fatura gönderilmemiş' });
     }
 
-    // Önce kayıtlı PDF'i dene
-    let pdfBuffer = null;
-    try {
-      await ensureInvoicesTable();
-      const { rows } = await pool.query('SELECT pdf FROM invoices WHERE order_id=$1', [String(orderId)]);
-      if (rows.length && rows[0].pdf) pdfBuffer = rows[0].pdf;
-    } catch (_) { /* invoices tablosu yoksa yeniden üret */ }
-
-    // Kayıtlı PDF yoksa sipariş verisinden yeniden üret
-    if (!pdfBuffer) {
-      const { rows: items } = await pool.query('SELECT * FROM order_items WHERE order_id=$1', [orderId]);
-      const orderData = buildOrderData(order, items);
-      pdfBuffer = await generateInvoicePdf(
-        orderData,
-        { invoiceNumber: order.sovos_invoice_no, uuid: order.sovos_uuid },
-        sovos.cfg()
-      );
-    }
-
+    const pdfBuffer = await getInvoicePdfBuffer(order);
     const fname = 'fatura-' + (order.order_no || order.sovos_invoice_no || orderId) + '.pdf';
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', 'attachment; filename="' + fname + '"');
