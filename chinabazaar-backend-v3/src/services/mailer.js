@@ -87,4 +87,64 @@ async function sendVerificationCode(to, code) {
   return sendViaResend(to, mail);
 }
 
-module.exports = { isEnabled, sendVerificationCode };
+// --- Genel e-posta gönderimi (fatura vb.) ---
+// attachments: [{ filename, content: Buffer }] — SMTP'ye Buffer, Resend'e base64 gider.
+async function sendMail(to, { subject, text, html: htmlBody, attachments }) {
+  if (!isEnabled()) throw new Error('email_not_configured');
+  const e = cfg.email;
+  if (e.smtpHost && e.smtpUser) {
+    const info = await getTransport().sendMail({
+      from: cfg.email.from,
+      to,
+      subject,
+      text,
+      html: htmlBody,
+      attachments: (attachments || []).map((a) => ({ filename: a.filename, content: a.content })),
+    });
+    return info && info.messageId;
+  }
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${e.resendKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      from: cfg.email.from,
+      to: [to],
+      subject,
+      text,
+      html: htmlBody,
+      attachments: (attachments || []).map((a) => ({
+        filename: a.filename,
+        content: Buffer.isBuffer(a.content) ? a.content.toString('base64') : a.content,
+      })),
+    }),
+    signal: AbortSignal.timeout(15000),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error('resend_failed: ' + (data.message || res.status));
+  return data.id;
+}
+
+function invoiceEmail(order, invoiceNumber) {
+  const subject = `ChinaBazaar faturanız: ${invoiceNumber || order.order_no}`;
+  const text =
+    `Merhaba ${order.customer_name || ''},\n\n` +
+    `Siparişinizin faturası ektedir.\n\n` +
+    `Sipariş No: ${order.order_no}\n` +
+    `Fatura No: ${invoiceNumber || '-'}\n` +
+    `Faturanızı Hesabım > Siparişlerim bölümünden de her zaman indirebilirsiniz.\n\n` +
+    `Teşekkürler,\nChinaBazaar`;
+  const htmlBody =
+    `<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;background:#0d0d12;color:#f5f5f7;padding:32px;border-radius:12px">` +
+    `<div style="font-size:20px;font-weight:700;margin-bottom:8px">ChinaBazaar</div>` +
+    `<p style="color:#b9b9c2">Merhaba ${order.customer_name || ''},</p>` +
+    `<p style="color:#f5f5f7">Siparişinizin faturası ektedir.</p>` +
+    `<p style="color:#b9b9c2;font-size:13px">Sipariş No: ${order.order_no}<br>Fatura No: ${invoiceNumber || '-'}</p>` +
+    `<p style="color:#b9b9c2;font-size:13px">Faturanızı Hesabım &gt; Siparişlerim bölümünden de her zaman indirebilirsiniz.</p>` +
+    `<p style="color:#b9b9c2;font-size:13px">Teşekkürler,<br>ChinaBazaar</p></div>`;
+  return { subject, text, html: htmlBody };
+}
+
+module.exports = { isEnabled, sendVerificationCode, sendMail, invoiceEmail };
