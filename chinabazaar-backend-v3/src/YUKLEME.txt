@@ -1,0 +1,23 @@
+CHINABAZAAR BACKEND v447 — QR odeme (payment_method='qr') kabul ediliyor
+====================================================================
+SORUN:
+Frontend QR siparis olustururken payment_method:'qr' gonderiyor ama
+backend orders.js yalniz ['card','transfer'] kabul ediyordu.
+Sonuc: QR siparis olusumu dogrulamada reddediliyor (400) veya
+'card' olarak kaydediliyordu. Admin panelinde "QR ile Ode" ve
+"Dekontu Gor" hic gorunmuyordu.
+
+DUZELTME (orders.js, 2 satir):
+- Validator: ['card','transfer'] -> ['card','transfer','qr']
+- Kayit: 'qr' degeri aynen saklaniyor (eskiden 'card'a donusuyordu)
+
+YUKLEME (GitHub web):
+1. Bu ZIP'i bilgisayarda acin.
+2. Yalniz orders.js dosyasini alin.
+3. GitHub'da cbazaar/chinabazaar-api reposunda
+   chinabazaar-backend-v3/src/routes/ klasorune girin.
+4. orders.js'i yukleyin (mevcut dosyanin uzerine yazin).
+5. ZIP ve bu YUKLEME.txt dosyasini repoya YUKLEMEYIN.
+6. Railway deploy'unun bitmesini bekleyin.
+
+NOT: admin.js degismedi, yuklenmesine gerek yok.
