@@ -1,0 +1,9 @@
+ChinaBazaar Backend v445 — Iadeler aktif
+=========================================
+GitHub web uzerinden, asagidaki klasore girip iki dosyayi birlikte yukleyin:
+  chinabazaar-backend-v3/src/routes/
+Dosyalar:
+  orders.js  -> musteri iade talebi (POST /api/orders/:id/return) + iade durumu (GET /api/orders/:id/return)
+  admin.js   -> GET /api/admin/returns (tablo garantili) + PATCH /api/admin/returns/:id (onay -> siparis refunded)
+Klasore girmeden yuklemeyin; dosyalar koke yigilmamali.
+Yuklemeden sonra Railway otomatik deploy eder.
