@@ -47,12 +47,40 @@ const RESERVED_SUBSTR = [
   'tasak','taşak','memeli','azgin','azgın','seks','fahise','fahişe','hayatkadini','dalyarak','pic',
 ];
 function normalizeNick(n){ return String(n||'').toLowerCase().replace(/[_.\s-]+/g,''); }
-function isReserved(nick){
+// v557: admin kurallari (nickname_rules) hardcoded listeyi gecer: allow > block > hardcoded
+async function isReserved(nick){
   const n = normalizeNick(nick);
   if(!n) return false;
+  try{
+    const { rows } = await pool.query('SELECT action FROM nickname_rules WHERE nickname = $1', [n]);
+    if(rows.length && rows[0].action === 'allow') return false;
+    if(rows.length && rows[0].action === 'block') return true;
+  }catch(e){ /* tablo yoksa (migration kosmamissa) hardcoded listeye dus */ }
   if(RESERVED_EXACT.has(n)) return true;
   for(const t of RESERVED_SUBSTR){ if(n.includes(t)) return true; }
   return false;
+}
+
+// v557: alinmis/rezerve isim icin bos alternatif oner (orn. ihsanoglu -> ihsanoglu1)
+async function nicknameSuggestions(base){
+  const b = String(base || '').trim();
+  if(!b) return [];
+  const cands = [];
+  const push = (x)=>{ if(x && x.length >= 2 && x.length <= 30 && /^[\p{L}\p{N}_.-]+$/u.test(x) && !cands.includes(x)) cands.push(x); };
+  for(let i=1;i<=5;i++) push(b + i);
+  push(b + '_1'); push(b + '-1');
+  const y = new Date().getFullYear();
+  push(b + y); push(b + '_' + y);
+  const out = [];
+  for(const c of cands){
+    if(out.length >= 3) break;
+    if(await isReserved(c)) continue;
+    try{
+      const { rows } = await pool.query('SELECT id FROM users WHERE LOWER(nickname) = LOWER($1)', [c]);
+      if(!rows.length) out.push(c);
+    }catch(e){ break; }
+  }
+  return out;
 }
 
 // POST /api/auth/register  { email, password, name, phone?, admin_key? }
@@ -304,28 +332,37 @@ router.get(
     if(!nick || nick.length < 2 || nick.length > 30 || !/^[\p{L}\p{N}_.-]+$/u.test(nick)){
       return res.json({ available: false, reason: 'invalid' });
     }
-    if(isReserved(nick)) return res.json({ available: false, reason: 'reserved' });
+    if(await isReserved(nick)) return res.json({ available: false, reason: 'reserved', suggestions: await nicknameSuggestions(nick) });
     const { rows } = await pool.query('SELECT id, nickname FROM users WHERE LOWER(nickname) = LOWER($1)', [nick]);
     if(!rows.length) return res.json({ available: true });
     // Kendi adiysa musait say (gecerli token varsa optionalAuth req.user doldurur)
     if(req.user && String(req.user.id) === String(rows[0].id)) return res.json({ available: true, mine: true });
-    return res.json({ available: false, reason: 'taken' });
+    return res.json({ available: false, reason: 'taken', suggestions: await nicknameSuggestions(nick) });
   })
 );
 
-// PATCH /api/auth/me — { nickname } (kullanıcı adı, yorumlarda görünür)
+// PATCH /api/auth/me — { nickname?, name? } (v554: isim de guncellenebilir; profil formu ismi backend'e yazar)
 router.patch(
   '/me',
   requireAuth,
-  body('nickname').trim().isLength({ min: 2, max: 30 }).matches(/^[\p{L}\p{N}_.-]+$/u),
+  body('nickname').optional().trim().isLength({ min: 2, max: 30 }).matches(/^[\p{L}\p{N}_.-]+$/u),
+  body('name').optional().trim().isLength({ min: 2, max: 100 }),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
-    const nick = req.body.nickname.trim();
-    if(isReserved(nick)) return res.status(400).json({ error: 'nickname_reserved' });
+    const nick = (req.body.nickname || '').trim();
+    const name = (req.body.name || '').trim();
+    if (!nick && !name) return res.status(400).json({ error: 'nothing_to_update' });
+    if (nick && await isReserved(nick)) return res.status(400).json({ error: 'nickname_reserved' });
     try {
+      const sets = ['updated_at = now()'];
+      const vals = [];
+      let i = 1;
+      if (nick) { sets.push('nickname = $' + (i++)); vals.push(nick); }
+      if (name) { sets.push('name = $' + (i++)); vals.push(name); }
+      vals.push(req.user.id);
       const { rows } = await pool.query(
-        'UPDATE users SET nickname = $1, updated_at = now() WHERE id = $2 RETURNING id, email, name, nickname, phone, is_admin',
-        [nick, req.user.id]
+        'UPDATE users SET ' + sets.join(', ') + ' WHERE id = $' + i + ' RETURNING id, email, name, nickname, phone, is_admin',
+        vals
       );
       res.json(publicUser(rows[0]));
     } catch (err) {

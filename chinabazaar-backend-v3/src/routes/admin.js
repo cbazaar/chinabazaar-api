@@ -506,4 +506,47 @@ router.patch('/categories/:id', asyncHandler(async (req, res) => {
   res.json({ ok: true });
 }));
 
+// ---- v557: Kullanici adi kurallari (admin: izin ver / blokla) ----
+// Isimler normalize saklanir (kucuk harf, _ . - ve bosluk yok sayilir) — auth.js ile ayni kural.
+function normalizeNickAdmin(n){ return String(n || '').toLowerCase().replace(/[_.\s-]+/g, ''); }
+
+// GET /api/admin/nickname-rules — tum kurallar
+router.get(
+  '/nickname-rules',
+  asyncHandler(async (_req, res) => {
+    const { rows } = await pool.query('SELECT nickname, action, reason, created_at FROM nickname_rules ORDER BY created_at DESC');
+    res.json({ items: rows });
+  })
+);
+
+// POST /api/admin/nickname-rules — { nickname, action: 'allow'|'block', reason? }
+router.post(
+  '/nickname-rules',
+  body('nickname').trim().isLength({ min: 2, max: 30 }),
+  body('action').isIn(['allow', 'block']),
+  body('reason').optional().isString().isLength({ max: 200 }),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    const nick = normalizeNickAdmin(req.body.nickname);
+    if (!nick) return res.status(400).json({ error: 'invalid_nickname' });
+    const { rows } = await pool.query(
+      `INSERT INTO nickname_rules (nickname, action, reason) VALUES ($1, $2, $3)
+       ON CONFLICT (nickname) DO UPDATE SET action = EXCLUDED.action, reason = EXCLUDED.reason
+       RETURNING nickname, action, reason, created_at`,
+      [nick, req.body.action, req.body.reason || null]
+    );
+    res.status(201).json(rows[0]);
+  })
+);
+
+// DELETE /api/admin/nickname-rules/:nickname — kurali kaldir (varsayilan listeye don)
+router.delete(
+  '/nickname-rules/:nickname',
+  asyncHandler(async (req, res) => {
+    const nick = normalizeNickAdmin(req.params.nickname);
+    await pool.query('DELETE FROM nickname_rules WHERE nickname = $1', [nick]);
+    res.json({ deleted: true });
+  })
+);
+
 module.exports = router;
