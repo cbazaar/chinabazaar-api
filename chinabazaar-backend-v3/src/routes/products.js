@@ -19,6 +19,11 @@ async function ensureMarketplaceColumns() {
   await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS marketplace_images JSONB`);
 }
 
+// v597: Garanti sutunu — migration sirasi beklemeden backend kendisi olusturur (500 onler)
+async function ensureWarrantyColumn() {
+  await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS warranty_months INTEGER`);
+}
+
 // v584: Pazaryeri görsel listesi — en fazla 10, yalnızca http(s) URL
 function cleanMpImages(v) {
   if (!Array.isArray(v)) return null;
@@ -585,6 +590,7 @@ router.post(
     if (!checkValidation(req, res)) return;
     const { name, price, campaign_price, stock, description, tagline, sku, image_url, video_url, category, is_active, currency, color, size, dimensions, box_dimensions, weight, length, connector, power_type, barcode, storage, is_upcoming, brand, marketplaces, marketplace_image, marketplace_images, warranty_months } = req.body;
     await ensureMarketplaceColumns();
+    await ensureWarrantyColumn();
     const categoryId = await resolveCategoryId(category);
     try {
       const { rows } = await pool.query(
@@ -608,7 +614,7 @@ router.post(
       res.status(201).json(toProduct({ ...rows[0], category_slug: null, category_name: null }));
     } catch (err) {
       if (err.code === '23505') return res.status(409).json({ error: 'sku_in_use' });
-      throw err;
+      return res.status(500).json({ error: 'db_error', detail: err.message });
     }
   })
 );
@@ -650,6 +656,7 @@ router.put(
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     await ensureMarketplaceColumns();
+    await ensureWarrantyColumn();
     const map = {
       name: 'name', tagline: 'tagline', description: 'description', sku: 'sku',
       video_url: 'video_url', image_url: 'thumb_url', is_active: 'is_active',
@@ -699,7 +706,7 @@ router.put(
       res.json(toProduct({ ...rows[0], category_slug: null, category_name: null }));
     } catch (err) {
       if (err.code === '23505') return res.status(409).json({ error: 'sku_in_use' });
-      throw err;
+      return res.status(500).json({ error: 'db_error', detail: err.message });
     }
   })
 );
