@@ -155,8 +155,10 @@ router.post(
           await client.query('ROLLBACK');
           return res.status(409).json({ error: 'insufficient_stock', product_id: p.id, available: p.stock });
         }
-        subtotal += p.price_cents * it.qty;
-        lines.push({ product: p, qty: it.qty });
+        // Kampanya fiyati varsa (0 < kampanya < normal fiyat) siparis kampanyali fiyattan kesilir
+        const unitCents = (p.campaign_price_cents != null && p.campaign_price_cents > 0 && p.campaign_price_cents < p.price_cents) ? p.campaign_price_cents : p.price_cents;
+        subtotal += unitCents * it.qty;
+        lines.push({ product: p, qty: it.qty, unit_cents: unitCents });
       }
 
       // Kupon: sunucu tarafinda yeniden dogrulanir, indirim uygulanir, kullanim sayaci artar
@@ -192,7 +194,7 @@ router.post(
       for (const l of lines) {
         await client.query(
           'INSERT INTO order_items (order_id, product_id, name, qty, price_cents, barcode) VALUES ($1,$2,$3,$4,$5,$6)',
-          [order.id, l.product.id, l.product.name, l.qty, l.product.price_cents, l.product.barcode || null]
+          [order.id, l.product.id, l.product.name, l.qty, l.unit_cents, l.product.barcode || null]
         );
         await client.query('UPDATE products SET stock = stock - $1, updated_at = now() WHERE id = $2', [
           l.qty,
@@ -205,7 +207,7 @@ router.post(
       // OTOMATİK FATURA OLUŞTUR
       try {
         const invNo = 'FTR-' + order.order_no;
-        const itemsJson = JSON.stringify(lines.map(l => ({ name: l.product.name, qty: l.qty, price_cents: l.product.price_cents })));
+        const itemsJson = JSON.stringify(lines.map(l => ({ name: l.product.name, qty: l.qty, price_cents: l.unit_cents })));
         const userName = (await pool.query('SELECT name FROM users WHERE id=$1', [req.user.id])).rows[0]?.name || '';
         await pool.query(
           `INSERT INTO invoices (invoice_no, order_id, customer_name, items, subtotal_cents, vat_cents, total_cents, currency, status, invoice_date)
