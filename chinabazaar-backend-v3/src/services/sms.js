@@ -1,15 +1,57 @@
-// SMS servisi (v600) — Netgsm uzerinden SMS gonderimi.
-// Railway Variables: NETGSM_USERCODE, NETGSM_PASSWORD, NETGSM_HEADER (onayli gonderici adi, orn. CHINABAZAAR)
+// SMS servisi (v609) — Netgsm uzerinden SMS gonderimi.
+// Ayarlar once veritabanindaki settings tablosundan okunur (admin panelindeki SMS sekmesinden kaydedilir),
+// yoksa Railway Variables (NETGSM_USERCODE/PASSWORD/HEADER) kullanilir.
 // Kimlikler yoksa { ok:false, error:'sms_not_configured' } doner — sahte "gonderildi" yok.
+// NOT: SMS'te gonderen bir telefon numarasi olmaz; gonderen adi (Baslik, orn. CHINABAZAAR)
+// Netgsm panelinden onaylanir. Firma telefonu mesajlarin sonuna iletisim icin eklenir.
+const pool = require('../db');
+
+const DEFAULT_COMPANY_PHONE = '+90 342 220 81 82';
+const SMS_KEYS = [
+  'sms_netgsm_usercode', 'sms_netgsm_password', 'sms_netgsm_header', 'sms_company_phone',
+  'sms_notify_register', 'sms_notify_forgot', 'sms_notify_order_received', 'sms_notify_order_shipped', 'sms_notify_order_delivered',
+];
+
+function parseToggle(v, def) {
+  if (v === undefined || v === null || v === '') return def;
+  return v === 'true' || v === true;
+}
+
+async function getSmsSettings() {
+  const cfg = {
+    usercode: process.env.NETGSM_USERCODE || '',
+    password: process.env.NETGSM_PASSWORD || '',
+    header: process.env.NETGSM_HEADER || '',
+    companyPhone: DEFAULT_COMPANY_PHONE,
+    notify: { register: true, forgot: true, order_received: true, order_shipped: true, order_delivered: true },
+  };
+  try {
+    const { rows } = await pool.query(
+      'SELECT key, value FROM settings WHERE key = ANY($1)',
+      [SMS_KEYS]
+    );
+    const kv = {};
+    rows.forEach((r) => { kv[r.key] = r.value; });
+    if (kv.sms_netgsm_usercode) cfg.usercode = kv.sms_netgsm_usercode;
+    if (kv.sms_netgsm_password) cfg.password = kv.sms_netgsm_password;
+    if (kv.sms_netgsm_header) cfg.header = kv.sms_netgsm_header;
+    if (kv.sms_company_phone) cfg.companyPhone = kv.sms_company_phone;
+    cfg.notify.register = parseToggle(kv.sms_notify_register, true);
+    cfg.notify.forgot = parseToggle(kv.sms_notify_forgot, true);
+    cfg.notify.order_received = parseToggle(kv.sms_notify_order_received, true);
+    cfg.notify.order_shipped = parseToggle(kv.sms_notify_order_shipped, true);
+    cfg.notify.order_delivered = parseToggle(kv.sms_notify_order_delivered, true);
+  } catch (e) { /* settings tablosu yoksa env ile devam */ }
+  return cfg;
+}
+
 async function sendSms(phone, message) {
-  const usercode = process.env.NETGSM_USERCODE;
-  const password = process.env.NETGSM_PASSWORD;
-  const header = process.env.NETGSM_HEADER;
-  if (!usercode || !password || !header) return { ok: false, error: 'sms_not_configured' };
+  const cfg = await getSmsSettings();
+  if (!cfg.usercode || !cfg.password || !cfg.header) return { ok: false, error: 'sms_not_configured' };
   try {
     const gsmno = String(phone || '').replace(/^\+/, '').replace(/\D/g, '');
     if (gsmno.length < 10) return { ok: false, error: 'invalid_phone' };
-    const params = new URLSearchParams({ usercode, password, gsmno, message, msgheader: header });
+    const params = new URLSearchParams({ usercode: cfg.usercode, password: cfg.password, gsmno, message, msgheader: cfg.header });
     const r = await fetch('https://api.netgsm.com.tr/sms/send/get', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -23,4 +65,4 @@ async function sendSms(phone, message) {
   }
 }
 
-module.exports = { sendSms };
+module.exports = { sendSms, getSmsSettings };
