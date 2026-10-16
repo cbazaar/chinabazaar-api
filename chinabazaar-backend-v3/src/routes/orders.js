@@ -100,13 +100,14 @@ router.post(
 router.post(
   '/',
   body('address_id').isUUID(),
-  body('payment_method').optional().isIn(['card', 'transfer', 'qr']), // v448: QR odeme kabul ediliyor
-  body('invoice_type').optional().isIn(['bireysel', 'kurumsal']),
-  body('invoice_tckn').optional().isString().trim().isLength({ min: 0, max: 11 }),
-  body('invoice_vkn').optional().isString().trim().isLength({ min: 0, max: 10 }),
-  body('invoice_company').optional().isString().trim().isLength({ min: 0, max: 200 }),
-  body('invoice_tax_office').optional().isString().trim().isLength({ min: 0, max: 100 }),
-  body('coupon_code').optional().isString().trim().isLength({ min: 0, max: 64 }),
+  // v569: opsiyonel alanlarda null da "bos" sayilir (on yuz bos fatura alanini null gonderiyordu -> validation_failed)
+  body('payment_method').optional({ nullable: true }).isIn(['card', 'transfer', 'qr']), // v448: QR odeme kabul ediliyor
+  body('invoice_type').optional({ nullable: true }).isIn(['bireysel', 'kurumsal']),
+  body('invoice_tckn').optional({ nullable: true }).isString().trim().isLength({ min: 0, max: 11 }),
+  body('invoice_vkn').optional({ nullable: true }).isString().trim().isLength({ min: 0, max: 10 }),
+  body('invoice_company').optional({ nullable: true }).isString().trim().isLength({ min: 0, max: 200 }),
+  body('invoice_tax_office').optional({ nullable: true }).isString().trim().isLength({ min: 0, max: 100 }),
+  body('coupon_code').optional({ nullable: true }).isString().trim().isLength({ min: 0, max: 64 }),
   body('items').isArray({ min: 1 }),
   body('items.*.product_id').isUUID(),
   body('items.*.qty').isInt({ min: 1, max: 99 }),
