@@ -312,6 +312,273 @@ router.get('/whatsapp/status', requireAuth, requireAdmin, asyncHandler(async (re
   res.json({ ok: true, configured: !!(kv.wa_phone_id && kv.wa_token), enabled: kv.wa_enabled === 'true', verify_set: !!kv.wa_verify, username: kv.wa_username || '', webhook_url: origin + '/api/products/whatsapp/webhook', conversations: rows[0].convs, unread: rows[0].unread });
 }));
 
+// v615 (My Factory v3): fabrika video begeni/yorum + fabrika yonetimi (admin)
+// Tum /factory/* rotalari GET /:id ONCESINE kayitli — /:id bunlari yutmaz.
+async function ensureFactoryTables() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS factory_likes (id SERIAL PRIMARY KEY, user_id INT NOT NULL, video_key TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now(), UNIQUE(user_id, video_key))`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS factory_comments (id SERIAL PRIMARY KEY, user_id INT NOT NULL, video_key TEXT NOT NULL, body TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now())`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS factory_favorites (id SERIAL PRIMARY KEY, user_id INT NOT NULL, video_key TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now(), UNIQUE(user_id, video_key))`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS factory_subscriptions (id SERIAL PRIMARY KEY, user_id INT NOT NULL, status TEXT DEFAULT 'pending', started_at TIMESTAMPTZ, ends_at TIMESTAMPTZ, paytr_merchant_oid TEXT UNIQUE, amount INT, currency TEXT DEFAULT 'USD', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now())`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS factories (id SERIAL PRIMARY KEY, name TEXT NOT NULL, city TEXT DEFAULT '', category TEXT DEFAULT '', description TEXT DEFAULT '', moq INT DEFAULT 0, stock INT DEFAULT 0, capacity TEXT DEFAULT '', certs TEXT DEFAULT '', videos JSONB DEFAULT '[]', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now())`);
+}
+
+const FACTORY_VIDEO_RE = /^\d+-\d+$/;
+
+// Goruntulenecek ad: nickname || name || e-posta on eki (e-posta adresinin tamami ASLA donulmez)
+function factoryDisplayName(u) {
+  if (!u) return 'Misafir';
+  if (u.nickname && String(u.nickname).trim()) return u.nickname;
+  if (u.name && String(u.name).trim()) return u.name;
+  if (u.email) return String(u.email).split('@')[0] || 'Misafir';
+  return 'Misafir';
+}
+
+function toFactoryPublic(r) {
+  let videos = r.videos;
+  if (typeof videos === 'string') { try { videos = JSON.parse(videos); } catch { videos = []; } }
+  if (!Array.isArray(videos)) videos = [];
+  return {
+    id: r.id,
+    name: r.name,
+    city: r.city || '',
+    category: r.category || '',
+    desc: r.description || '',
+    moq: r.moq ?? 0,
+    stock: r.stock ?? 0,
+    capacity: r.capacity || '',
+    certs: r.certs || '',
+    videos,
+  };
+}
+function toFactoryAdmin(r) {
+  return { ...toFactoryPublic(r), created_at: r.created_at, updated_at: r.updated_at };
+}
+
+// videos: [{title?, url, kind}] — gecersiz oge varsa null (handler 400 doner)
+function cleanFactoryVideos(v) {
+  if (v === undefined) return undefined;
+  if (!Array.isArray(v)) return null;
+  const out = [];
+  for (const it of v) {
+    if (!it || typeof it !== 'object' || Array.isArray(it)) return null;
+    if (typeof it.url !== 'string' || !/^https?:\/\//i.test(it.url.trim()) || it.url.trim().length > 2048) return null;
+    if (it.kind !== 'video' && it.kind !== 'canli') return null;
+    out.push({ title: typeof it.title === 'string' ? it.title.trim().slice(0, 200) : '', url: it.url.trim(), kind: it.kind });
+  }
+  return out;
+}
+
+// GET /api/products/factory/likes?video=F-V — begeni sayisi (herkese acik)
+router.get('/factory/likes', asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const video = String(req.query.video || '');
+  if (!video) return res.status(400).json({ error: 'video_required' });
+  if (!FACTORY_VIDEO_RE.test(video)) return res.status(400).json({ error: 'invalid_video' });
+  const { rows } = await pool.query('SELECT COUNT(*)::int AS n FROM factory_likes WHERE video_key=$1', [video]);
+  res.json({ like_count: rows[0].n });
+}));
+
+// POST /api/products/factory/likes {video} — begeni ac/kapa (toggle)
+router.post('/factory/likes', requireAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const video = String((req.body && req.body.video) || '');
+  if (!video) return res.status(400).json({ error: 'video_required' });
+  if (!FACTORY_VIDEO_RE.test(video)) return res.status(400).json({ error: 'invalid_video' });
+  const { rows: ex } = await pool.query('SELECT 1 FROM factory_likes WHERE user_id=$1 AND video_key=$2', [req.user.id, video]);
+  let liked;
+  if (ex.length) {
+    await pool.query('DELETE FROM factory_likes WHERE user_id=$1 AND video_key=$2', [req.user.id, video]);
+    liked = false;
+  } else {
+    await pool.query('INSERT INTO factory_likes (user_id, video_key) VALUES ($1,$2) ON CONFLICT DO NOTHING', [req.user.id, video]);
+    liked = true;
+  }
+  const { rows: c } = await pool.query('SELECT COUNT(*)::int AS n FROM factory_likes WHERE video_key=$1', [video]);
+  res.json({ liked, like_count: c[0].n });
+}));
+
+// GET /api/products/factory/comments?video=F-V — en yeni 50 yorum (herkese acik)
+router.get('/factory/comments', asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const video = String(req.query.video || '');
+  if (!video) return res.status(400).json({ error: 'video_required' });
+  if (!FACTORY_VIDEO_RE.test(video)) return res.status(400).json({ error: 'invalid_video' });
+  const { rows } = await pool.query(
+    `SELECT c.id, c.body, c.created_at, COALESCE(NULLIF(u.nickname,''), NULLIF(u.name,''), split_part(u.email,'@',1), 'Misafir') AS name
+     FROM factory_comments c LEFT JOIN users u ON u.id = c.user_id
+     WHERE c.video_key = $1 ORDER BY c.created_at DESC, c.id DESC LIMIT 50`,
+    [video]
+  );
+  res.json({ comments: rows.map((r) => ({ id: r.id, name: r.name, body: r.body, created_at: r.created_at })) });
+}));
+
+// POST /api/products/factory/comments {video, body} — yorum ekle
+router.post('/factory/comments', requireAuth,
+  body('video').matches(/^\d+-\d+$/),
+  body('body').trim().isLength({ min: 1, max: 1000 }),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    await ensureFactoryTables();
+    const me = await pool.query('SELECT is_blocked FROM users WHERE id = $1', [req.user.id]);
+    if (me.rows[0]?.is_blocked) return res.status(403).json({ error: 'user_blocked' });
+    const video = String(req.body.video);
+    const text = String(req.body.body).trim();
+    const { rows } = await pool.query(
+      `INSERT INTO factory_comments (user_id, video_key, body) VALUES ($1, $2, $3) RETURNING id, body, created_at`,
+      [req.user.id, video, text]
+    );
+    const { rows: urows } = await pool.query('SELECT nickname, name, email FROM users WHERE id = $1', [req.user.id]);
+    res.status(201).json({ comment: { id: rows[0].id, name: factoryDisplayName(urows[0]), body: rows[0].body, created_at: rows[0].created_at } });
+  })
+);
+
+// GET /api/products/factory/favorites/count?video=F-V — favori sayisi (herkese acik)
+router.get('/factory/favorites/count', asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const video = String(req.query.video || '');
+  if (!video) return res.status(400).json({ error: 'video_required' });
+  if (!FACTORY_VIDEO_RE.test(video)) return res.status(400).json({ error: 'invalid_video' });
+  const { rows } = await pool.query('SELECT COUNT(*)::int AS n FROM factory_favorites WHERE video_key=$1', [video]);
+  res.json({ favorite_count: rows[0].n });
+}));
+
+// POST /api/products/factory/favorites {video} — favori ac/kapa (toggle, begeni deseniyle ayni)
+router.post('/factory/favorites', requireAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const video = String((req.body && req.body.video) || '');
+  if (!video) return res.status(400).json({ error: 'video_required' });
+  if (!FACTORY_VIDEO_RE.test(video)) return res.status(400).json({ error: 'invalid_video' });
+  const { rows: ex } = await pool.query('SELECT 1 FROM factory_favorites WHERE user_id=$1 AND video_key=$2', [req.user.id, video]);
+  let favorited;
+  if (ex.length) {
+    await pool.query('DELETE FROM factory_favorites WHERE user_id=$1 AND video_key=$2', [req.user.id, video]);
+    favorited = false;
+  } else {
+    await pool.query('INSERT INTO factory_favorites (user_id, video_key) VALUES ($1,$2) ON CONFLICT DO NOTHING', [req.user.id, video]);
+    favorited = true;
+  }
+  const { rows: c } = await pool.query('SELECT COUNT(*)::int AS n FROM factory_favorites WHERE video_key=$1', [video]);
+  res.json({ favorited, favorite_count: c[0].n });
+}));
+
+// GET /api/products/factory/favorites — giris yapan kullanicinin favori video_key listesi
+router.get('/factory/favorites', requireAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const { rows } = await pool.query('SELECT video_key FROM factory_favorites WHERE user_id=$1 ORDER BY created_at DESC, id DESC', [req.user.id]);
+  res.json({ favorites: rows.map((r) => r.video_key) });
+}));
+
+// GET /api/products/factory/list — tum fabrikalar (herkese acik)
+router.get('/factory/list', asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const { rows } = await pool.query(`SELECT * FROM factories ORDER BY id ASC`);
+  res.json(rows.map(toFactoryPublic));
+}));
+
+// GET /api/products/factory/admin/list — tum fabrikalar + created_at (admin)
+router.get('/factory/admin/list', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const { rows } = await pool.query(`SELECT * FROM factories ORDER BY id ASC`);
+  res.json(rows.map(toFactoryAdmin));
+}));
+
+const factoryValidators = [
+  body('name').optional().trim().isLength({ min: 1, max: 200 }),
+  body('city').optional().trim().isLength({ max: 200 }),
+  body('category').optional().trim().isLength({ max: 200 }),
+  body('description').optional().trim().isLength({ max: 10000 }),
+  body('moq').optional({ nullable: true }).isInt({ min: 0 }),
+  body('stock').optional({ nullable: true }).isInt({ min: 0 }),
+  body('capacity').optional().trim().isLength({ max: 500 }),
+  body('certs').optional().custom((v) => {
+    if (typeof v === 'string') { if (v.length > 2000) throw new Error('invalid_certs'); return true; }
+    if (Array.isArray(v) && v.every((x) => typeof x === 'string')) { if (v.join(', ').length > 2000) throw new Error('invalid_certs'); return true; }
+    throw new Error('invalid_certs');
+  }),
+  body('videos').optional().isArray(),
+];
+
+// POST /api/products/factory/admin — fabrika ekle (admin)
+router.post('/factory/admin', requireAuth, requireAdmin,
+  body('name').trim().isLength({ min: 1, max: 200 }),
+  ...factoryValidators,
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    await ensureFactoryTables();
+    const videos = cleanFactoryVideos(req.body.videos);
+    if (videos === null) return res.status(400).json({ error: 'invalid_videos' });
+    const { rows } = await pool.query(
+      `INSERT INTO factories (name, city, category, description, moq, stock, capacity, certs, videos)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb) RETURNING *`,
+      [
+        String(req.body.name).trim(),
+        typeof req.body.city === 'string' ? req.body.city.trim() : '',
+        typeof req.body.category === 'string' ? req.body.category.trim() : '',
+        typeof req.body.description === 'string' ? req.body.description.trim() : '',
+        req.body.moq == null ? 0 : parseInt(req.body.moq, 10),
+        req.body.stock == null ? 0 : parseInt(req.body.stock, 10),
+        typeof req.body.capacity === 'string' ? req.body.capacity.trim() : '',
+        Array.isArray(req.body.certs) ? req.body.certs.map((x) => String(x).trim()).filter(Boolean).join(', ') : (typeof req.body.certs === 'string' ? req.body.certs.trim() : ''),
+        JSON.stringify(videos === undefined ? [] : videos),
+      ]
+    );
+    res.status(201).json(toFactoryAdmin(rows[0]));
+  })
+);
+
+// PUT /api/products/factory/admin/:id — fabrika guncelle, kismi kabul edilir (admin)
+router.put('/factory/admin/:id', requireAuth, requireAdmin,
+  param('id').isInt({ min: 1 }),
+  ...factoryValidators,
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    await ensureFactoryTables();
+    const id = parseInt(req.params.id, 10);
+    const sets = [];
+    const params = [id];
+    const push = (col, val, cast) => { params.push(val); sets.push(`${col} = $${params.length}${cast || ''}`); };
+    if (req.body.name !== undefined) push('name', String(req.body.name).trim());
+    if (req.body.city !== undefined) push('city', String(req.body.city).trim());
+    if (req.body.category !== undefined) push('category', String(req.body.category).trim());
+    if (req.body.description !== undefined) push('description', String(req.body.description).trim());
+    if (req.body.moq !== undefined) push('moq', req.body.moq == null ? 0 : parseInt(req.body.moq, 10));
+    if (req.body.stock !== undefined) push('stock', req.body.stock == null ? 0 : parseInt(req.body.stock, 10));
+    if (req.body.capacity !== undefined) push('capacity', String(req.body.capacity).trim());
+    if (req.body.certs !== undefined) push('certs', Array.isArray(req.body.certs) ? req.body.certs.map((x) => String(x).trim()).filter(Boolean).join(', ') : String(req.body.certs).trim());
+    if (req.body.videos !== undefined) {
+      const videos = cleanFactoryVideos(req.body.videos);
+      if (videos === null) return res.status(400).json({ error: 'invalid_videos' });
+      push('videos', JSON.stringify(videos), '::jsonb');
+    }
+    if (!sets.length) return res.status(400).json({ error: 'nothing_to_update' });
+    sets.push('updated_at = now()');
+    const { rows } = await pool.query(`UPDATE factories SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params);
+    if (!rows.length) return res.status(404).json({ error: 'factory_not_found' });
+    res.json(toFactoryAdmin(rows[0]));
+  })
+);
+
+// DELETE /api/products/factory/admin/:id — fabrika sil (admin)
+router.delete('/factory/admin/:id', requireAuth, requireAdmin, param('id').isInt({ min: 1 }), asyncHandler(async (req, res) => {
+  if (!checkValidation(req, res)) return;
+  await ensureFactoryTables();
+  const { rows } = await pool.query('DELETE FROM factories WHERE id = $1 RETURNING id', [parseInt(req.params.id, 10)]);
+  if (!rows.length) return res.status(404).json({ error: 'factory_not_found' });
+  res.json({ ok: true });
+}));
+
+// GET /api/products/factory/admin/subscriptions — abonelik listesi (admin; e-posta burada doner, baska yerde donulmez)
+router.get('/factory/admin/subscriptions', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const { rows } = await pool.query(
+    `SELECT fs.id, fs.user_id, COALESCE(NULLIF(u.nickname,''), NULLIF(u.name,''), split_part(u.email,'@',1), '') AS name, u.email AS email, fs.status, fs.started_at, fs.ends_at, fs.amount, fs.currency
+     FROM factory_subscriptions fs LEFT JOIN users u ON u.id = fs.user_id
+     ORDER BY fs.created_at DESC, fs.id DESC`
+  );
+  res.json(rows.map((r) => ({ id: r.id, user_id: r.user_id, name: r.name || '', email: r.email || null, status: r.status, started_at: r.started_at, ends_at: r.ends_at, amount: r.amount, currency: r.currency })));
+}));
+
+
 // GET /api/products/:id
 // GET /api/products/liked — kullanıcının beğendiği ürünler (profil: Beğendiğim Videolar, v570)
 router.get(
