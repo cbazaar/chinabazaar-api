@@ -396,7 +396,8 @@ const GA_SECRET_KEYS = ['ga_api_secret'];
 const SETTINGS_PUBLIC_KEYS = [...WA_PUBLIC_KEYS, ...ACC_PUBLIC_KEYS, ...GA_PUBLIC_KEYS];
 const XML_PUBLIC_KEYS = ['xml_feed_enabled', 'xml_feed_mode'];
 const XML_SECRET_KEYS = ['api_key'];
-const SETTINGS_PUBLIC_KEYS_ALL = [...SETTINGS_PUBLIC_KEYS, ...XML_PUBLIC_KEYS];
+const SEC_PUBLIC_KEYS = ['sec_session_minutes', 'sec_failed_login_limit'];
+const SETTINGS_PUBLIC_KEYS_ALL = [...SETTINGS_PUBLIC_KEYS, ...XML_PUBLIC_KEYS, ...SEC_PUBLIC_KEYS];
 router.get('/settings', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
   await ensureSettingsTable();
   const { rows } = await pool.query('SELECT key, value FROM settings');
@@ -417,7 +418,7 @@ router.get('/settings', requireAuth, requireAdmin, asyncHandler(async (req, res)
 router.put('/settings', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
   await ensureSettingsTable();
   const incoming = req.body && req.body.settings && typeof req.body.settings === 'object' ? req.body.settings : {};
-  const allowed = [...WA_PUBLIC_KEYS, 'wa_token', ...ACC_PUBLIC_KEYS, ...ACC_SECRET_KEYS, ...GA_PUBLIC_KEYS, ...GA_SECRET_KEYS, ...XML_PUBLIC_KEYS, ...XML_SECRET_KEYS];
+  const allowed = [...WA_PUBLIC_KEYS, 'wa_token', ...ACC_PUBLIC_KEYS, ...ACC_SECRET_KEYS, ...GA_PUBLIC_KEYS, ...GA_SECRET_KEYS, ...XML_PUBLIC_KEYS, ...XML_SECRET_KEYS, ...SEC_PUBLIC_KEYS];
   for (const [k, v] of Object.entries(incoming)) {
     if (!allowed.includes(k)) continue;
     if (typeof v !== 'string' && typeof v !== 'boolean') continue;
