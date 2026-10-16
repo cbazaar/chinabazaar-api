@@ -19,35 +19,10 @@ function publicUser(row) {
   return { id: row.id, email: row.email, name: row.name, nickname: row.nickname || null, phone: row.phone, is_admin: !!row.is_admin, customer_code: row.customer_code || null };
 }
 
-// ---- Kullanici adi korumasi: ozel / marka / erotik isimler alinamaz ----
-// Tam eslesme (normalize: kucuk harf + _ . - kaldir) -> marka & ozel isimler
-const RESERVED_EXACT = new Set([
-  // Sistem / ozel
-  'admin','administrator','administrators','system','official','support','help','helpdesk','mod','moderator','moderators',
-  'staff','owner','root','superadmin','superuser','manager','webmaster','info','contact','service','services',
-  'customer','customercare','customerservice','musteri','musterihizmetleri','yonetici','yonetim','adminpanel','panel',
-  // Marka: kendi markalar
-  'chinabazaar','cbazaar','chinabazar','bazaar','cb','cbai','chinabazaarcom','chinabazaartr','cbcom',
-  'gdtm','gdtmgroup','ihsanoglu','ihsanoglugroup','sportface','hai','foodsan','prescott','iiec','nivora','nivorapages','kulturyolu','wolfkingwalk','wkw','wkwtv','sadiyeihsanoglu',
-  // Marka: global
-  'nike','adidas','apple','samsung','xiaomi','huawei','sony','lg','google','amazon','alibaba','aliexpress','temu','shein',
-  'trendyol','hepsiburada','n11','gittigidiyor','puma','reebok','vans','converse','newbalance','underarmour','zara','mango',
-  'lcwaikiki','defacto','koton','mavi','lenovo','hp','dell','asus','acer','msi','logitech','razer','jbl','bose','philips',
-  'bosch','siemens','arcelik','beko','vestel','oppo','vivo','realme','oneplus','nokia','motorola','casio','rolex','swatch',
-  'fossil','lacoste','tommyhilfiger','calvinklein','gucci','louisvuitton','chanel','hermes','prada','versace','armani',
-  'diesel','levis','ralphlauren','tommy','hm','taobao','tmall','jd','jdcom','pinduoduo','douyin','tiktok','wechat','weibo',
-  'paytr','paypal','visa','mastercard','troy','amex','americanexpress','microsoft','meta','facebook','instagram','youtube',
-  'twitter','x','netflix','spotify','disney','cocacola','pepsi','nestle','unilever','loreal','nivea','ikea','decathlon',
-]);
-// Alt dize eslesme (normalize) -> erotik / mstehcen terimler (bilesik isimleri de yakalar)
-const RESERVED_SUBSTR = [
-  'porn','porno','xxx','sexy','erotic','erotik','escort','eskort','fuck','bitch','pussy','dick','boobs','tits','cunt',
-  'whore','slut','nude','hentai','milf','bdsm','fetish','orgasm','masturb',
-  'orospu','yarrak','yarak','amcik','amcık','siktir','sikis','sikiş','sikmek','gotveren','ibne','pezevenk','kaltak',
-  'tasak','taşak','memeli','azgin','azgın','seks','fahise','fahişe','hayatkadini','dalyarak','pic',
-];
+// ---- Kullanici adi korumasi ----
+// v563: Sabit rezerve liste KALDIRILDI — hicbir kullanici adi koddan rezerve degil.
+// Engel yalniz adminin Kullanici Adlari bolumunde ekledigi block kurallariyla olur.
 function normalizeNick(n){ return String(n||'').toLowerCase().replace(/[_.\s-]+/g,''); }
-// v557: admin kurallari (nickname_rules) hardcoded listeyi gecer: allow > block > hardcoded
 async function isReserved(nick){
   const n = normalizeNick(nick);
   if(!n) return false;
@@ -55,9 +30,7 @@ async function isReserved(nick){
     const { rows } = await pool.query('SELECT action FROM nickname_rules WHERE nickname = $1', [n]);
     if(rows.length && rows[0].action === 'allow') return false;
     if(rows.length && rows[0].action === 'block') return true;
-  }catch(e){ /* tablo yoksa (migration kosmamissa) hardcoded listeye dus */ }
-  if(RESERVED_EXACT.has(n)) return true;
-  for(const t of RESERVED_SUBSTR){ if(n.includes(t)) return true; }
+  }catch(e){ /* tablo yoksa rezerve degil */ }
   return false;
 }
 

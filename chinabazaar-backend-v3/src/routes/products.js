@@ -422,7 +422,7 @@ router.get(
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     const { rows } = await pool.query(
-      `SELECT c.id, c.body, c.created_at, COALESCE(u.nickname, u.name, 'Misafir') AS user_name
+      `SELECT c.id, c.body, c.created_at, COALESCE(u.nickname, u.name, 'Misafir') AS user_name, u.nickname AS nickname
        FROM comments c LEFT JOIN users u ON u.id = c.user_id
        WHERE c.product_id = $1 AND c.is_blocked = FALSE
        ORDER BY c.created_at DESC LIMIT 100`,
