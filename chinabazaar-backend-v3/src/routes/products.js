@@ -382,6 +382,96 @@ router.post('/marketplaces/:name/test', requireAuth, requireAdmin, param('name')
   res.json(result);
 }));
 
+// v586: Genel ayarlar (WhatsApp vb.) — sırlar asla yanıtta dönülmez
+async function ensureSettingsTable() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT, updated_at TIMESTAMPTZ DEFAULT now())`);
+}
+const WA_PUBLIC_KEYS = ['wa_phone', 'wa_phone_id', 'wa_verify', 'wa_enabled', 'wa_order_notify', 'wa_shop_button'];
+const ACC_PROGRAMS = ['nebim', 'logo', 'zirve', 'eta', 'akinsoft'];
+const ACC_PUBLIC_KEYS = ACC_PROGRAMS.flatMap((p) => [`acc_${p}_api_url`, `acc_${p}_username`, `acc_${p}_firm`, `acc_${p}_enabled`]);
+const ACC_SECRET_KEYS = ACC_PROGRAMS.map((p) => `acc_${p}_password`);
+router.get('/settings', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  await ensureSettingsTable();
+  const { rows } = await pool.query('SELECT key, value FROM settings');
+  const settings = {};
+  rows.forEach((r) => {
+    if (WA_PUBLIC_KEYS.includes(r.key)) {
+      let v = r.value;
+      if (v === 'true' || v === 'false') v = v === 'true';
+      settings[r.key] = v;
+    }
+  });
+  settings.has_wa_token = rows.some((r) => r.key === 'wa_token' && r.value);
+  ACC_PROGRAMS.forEach((p) => { settings[`has_acc_${p}_password`] = rows.some((r) => r.key === `acc_${p}_password` && r.value); });
+  res.json({ settings });
+}));
+router.put('/settings', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  await ensureSettingsTable();
+  const incoming = req.body && req.body.settings && typeof req.body.settings === 'object' ? req.body.settings : {};
+  const allowed = [...WA_PUBLIC_KEYS, 'wa_token', ...ACC_PUBLIC_KEYS, ...ACC_SECRET_KEYS];
+  for (const [k, v] of Object.entries(incoming)) {
+    if (!allowed.includes(k)) continue;
+    if (typeof v !== 'string' && typeof v !== 'boolean') continue;
+    const val = typeof v === 'boolean' ? (v ? 'true' : 'false') : v.trim();
+    if (val === '') continue;
+    await pool.query(`INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, now()) ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = now()`, [k, val]);
+  }
+  res.json({ ok: true });
+}));
+router.post('/settings/whatsapp/test', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  await ensureSettingsTable();
+  const { rows } = await pool.query(`SELECT key, value FROM settings WHERE key IN ('wa_phone_id', 'wa_token')`);
+  const kv = {};
+  rows.forEach((r) => { kv[r.key] = r.value; });
+  if (!kv.wa_phone_id || !kv.wa_token) return res.json({ ok: false, message: 'Eksik bilgi: Telefon Numarası ID ve Erişim Jetonu gerekli.' });
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 15000);
+    let r;
+    try {
+      r = await fetch(`https://graph.facebook.com/v21.0/${encodeURIComponent(kv.wa_phone_id)}?fields=verified_name,display_phone_number,quality_rating`, { signal: ctrl.signal, headers: { Authorization: `Bearer ${kv.wa_token}` } });
+    } finally { clearTimeout(t); }
+    if (r.status === 200) {
+      const j = await r.json();
+      return res.json({ ok: true, message: `WhatsApp bağlantısı başarılı ✓ — Doğrulanan ad: ${j.verified_name || '—'}, Numara: ${j.display_phone_number || '—'}` });
+    }
+    let detail = '';
+    try { const j = await r.json(); detail = (j.error && j.error.message) || ''; } catch {}
+    return res.json({ ok: false, message: `WhatsApp doğrulama başarısız (HTTP ${r.status})${detail ? ' — ' + detail : ''}` });
+  } catch (e) {
+    return res.json({ ok: false, message: 'Bağlantı hatası: ' + (e && e.message ? e.message : 'bilinmeyen hata') });
+  }
+}));
+
+// v588: Muhasebe programi baglanti testi — sunucuya erisilebilirlik kontrolu (kimlik dogrulama satici API'sine ozeldir)
+router.post('/settings/accounting/test', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  const program = req.body && req.body.program;
+  if (!ACC_PROGRAMS.includes(program)) return res.json({ ok: false, message: 'Bilinmeyen muhasebe programı.' });
+  await ensureSettingsTable();
+  const { rows } = await pool.query(`SELECT key, value FROM settings WHERE key IN ($1, $2, $3)`, [`acc_${program}_api_url`, `acc_${program}_username`, `acc_${program}_password`]);
+  const kv = {};
+  rows.forEach((r) => { kv[r.key] = r.value; });
+  const apiUrl = kv[`acc_${program}_api_url`];
+  if (!apiUrl) return res.json({ ok: false, message: 'Eksik bilgi: API Adresi / Sunucu gerekli.' });
+  if (!/^https?:\/\//i.test(apiUrl)) return res.json({ ok: false, message: 'API adresi http:// veya https:// ile başlamalı (örn. https://api.ornek.com).' });
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 15000);
+    let r;
+    try {
+      const headers = {};
+      if (kv[`acc_${program}_username`] && kv[`acc_${program}_password`]) headers.Authorization = 'Basic ' + Buffer.from(`${kv[`acc_${program}_username`]}:${kv[`acc_${program}_password`]}`).toString('base64');
+      r = await fetch(apiUrl, { method: 'HEAD', signal: ctrl.signal, headers, redirect: 'manual' });
+    } finally { clearTimeout(t); }
+    if (r.status >= 200 && r.status < 300) return res.json({ ok: true, message: `Sunucuya erişildi ✓ (HTTP ${r.status})` });
+    if (r.status === 401 || r.status === 403) return res.json({ ok: false, message: `Sunucuya erişildi, kimlik doğrulanamadı (HTTP ${r.status}) — kullanıcı adı / şifre kontrol edin.` });
+    if (r.status >= 300 && r.status < 500) return res.json({ ok: false, message: `Sunucuya erişildi (HTTP ${r.status}) — API adresini kontrol edin.` });
+    return res.json({ ok: false, message: `Sunucu hata döndürdü (HTTP ${r.status}).` });
+  } catch (e) {
+    return res.json({ ok: false, message: 'Sunucuya erişilemedi: ' + (e && e.message ? e.message : 'bilinmeyen hata') });
+  }
+}));
+
 router.get(
   '/:id',
   param('id').isUUID(),
