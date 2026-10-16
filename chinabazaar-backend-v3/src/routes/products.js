@@ -44,6 +44,9 @@ function toProduct(row) {
     share_count: row.share_count || 0,
     barcode: row.barcode || null,
     storage: row.storage || null,
+    length: row.length || null,
+    connector: row.connector || null,
+    power_type: row.power_type || null,
     brand: row.brand || null,
     is_upcoming: !!row.is_upcoming,
     category: row.category_id
@@ -253,6 +256,9 @@ const productValidators = [
   body('dimensions').optional().trim().isLength({ max: 200 }),
   body('box_dimensions').optional().trim().isLength({ max: 200 }),
   body('weight').optional().trim().isLength({ max: 200 }),
+  body('length').optional().trim().isLength({ max: 200 }),
+  body('connector').optional().trim().isLength({ max: 200 }),
+  body('power_type').optional().trim().isLength({ max: 200 }),
   body('barcode').optional().trim().matches(/^[0-9]{8,14}$/),
 ];
 
@@ -276,18 +282,19 @@ router.post(
   ...productValidators,
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
-    const { name, price, stock, description, tagline, sku, image_url, video_url, category, is_active, currency, color, size, dimensions, box_dimensions, weight, barcode, storage, is_upcoming, brand } = req.body;
+    const { name, price, stock, description, tagline, sku, image_url, video_url, category, is_active, currency, color, size, dimensions, box_dimensions, weight, length, connector, power_type, barcode, storage, is_upcoming, brand } = req.body;
     const categoryId = await resolveCategoryId(category);
     try {
       const { rows } = await pool.query(
-        `INSERT INTO products (sku, name, tagline, description, price_cents, currency, stock, category_id, video_url, thumb_url, is_active, color, size, dimensions, box_dimensions, weight, barcode, storage, is_upcoming, brand)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING *`,
+        `INSERT INTO products (sku, name, tagline, description, price_cents, currency, stock, category_id, video_url, thumb_url, is_active, color, size, dimensions, box_dimensions, weight, length, connector, power_type, barcode, storage, is_upcoming, brand)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23) RETURNING *`,
         [
           sku || null, name, tagline || null, description || null, toCents(price),
           ['TRY','USD','RUB'].includes(currency) ? currency : 'TRY',
           stock ?? 0, categoryId, video_url || null, image_url || null,
           is_active === undefined ? true : is_active,
           color || null, size || null, dimensions || null, box_dimensions || null, weight || null,
+          length || null, connector || null, power_type || null,
           barcode || null, storage || null, is_upcoming === true, brand || null,
         ]
       );
@@ -323,6 +330,9 @@ router.put(
   body('dimensions').optional().trim().isLength({ max: 200 }),
   body('box_dimensions').optional().trim().isLength({ max: 200 }),
   body('weight').optional().trim().isLength({ max: 200 }),
+  body('length').optional().trim().isLength({ max: 200 }),
+  body('connector').optional().trim().isLength({ max: 200 }),
+  body('power_type').optional().trim().isLength({ max: 200 }),
   body('barcode').optional().trim().matches(/^[0-9]{8,14}$/),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
@@ -330,7 +340,7 @@ router.put(
       name: 'name', tagline: 'tagline', description: 'description', sku: 'sku',
       video_url: 'video_url', image_url: 'thumb_url', is_active: 'is_active',
       currency: 'currency', color: 'color', storage: 'storage', is_upcoming: 'is_upcoming', size: 'size', dimensions: 'dimensions',
-      box_dimensions: 'box_dimensions', weight: 'weight', barcode: 'barcode', brand: 'brand',
+      box_dimensions: 'box_dimensions', weight: 'weight', length: 'length', connector: 'connector', power_type: 'power_type', barcode: 'barcode', brand: 'brand',
     };
     const sets = [];
     const params = [req.params.id];

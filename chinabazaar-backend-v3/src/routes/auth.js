@@ -6,7 +6,8 @@ const asyncHandler = require('../middleware/asyncHandler');
 const { checkValidation } = require('../middleware/validate');
 const { loginLimiter, registerLimiter } = require('../middleware/rateLimit');
 const codeLimiter = require('express-rate-limit')({ windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: { error: 'too_many_requests' } });
-const { signToken, requireAuth } = require('../middleware/auth');
+const nicknameCheckLimiter = require('express-rate-limit')({ windowMs: 60 * 1000, max: 60, standardHeaders: true, legacyHeaders: false, message: { error: 'too_many_requests' } });
+const { signToken, requireAuth, optionalAuth } = require('../middleware/auth');
 const cfg = require('../config');
 const pool = require('../db');
 const mailer = require('../services/mailer');
@@ -16,6 +17,42 @@ const router = express.Router();
 
 function publicUser(row) {
   return { id: row.id, email: row.email, name: row.name, nickname: row.nickname || null, phone: row.phone, is_admin: !!row.is_admin, customer_code: row.customer_code || null };
+}
+
+// ---- Kullanici adi korumasi: ozel / marka / erotik isimler alinamaz ----
+// Tam eslesme (normalize: kucuk harf + _ . - kaldir) -> marka & ozel isimler
+const RESERVED_EXACT = new Set([
+  // Sistem / ozel
+  'admin','administrator','administrators','system','official','support','help','helpdesk','mod','moderator','moderators',
+  'staff','owner','root','superadmin','superuser','manager','webmaster','info','contact','service','services',
+  'customer','customercare','customerservice','musteri','musterihizmetleri','yonetici','yonetim','adminpanel','panel',
+  // Marka: kendi markalar
+  'chinabazaar','cbazaar','chinabazar','bazaar','cb','cbai','chinabazaarcom','chinabazaartr','cbcom',
+  'gdtm','gdtmgroup','ihsanoglu','ihsanoglugroup','sportface','hai','foodsan','prescott','iiec','nivora','nivorapages','kulturyolu','wolfkingwalk','wkw','wkwtv','sadiyeihsanoglu',
+  // Marka: global
+  'nike','adidas','apple','samsung','xiaomi','huawei','sony','lg','google','amazon','alibaba','aliexpress','temu','shein',
+  'trendyol','hepsiburada','n11','gittigidiyor','puma','reebok','vans','converse','newbalance','underarmour','zara','mango',
+  'lcwaikiki','defacto','koton','mavi','lenovo','hp','dell','asus','acer','msi','logitech','razer','jbl','bose','philips',
+  'bosch','siemens','arcelik','beko','vestel','oppo','vivo','realme','oneplus','nokia','motorola','casio','rolex','swatch',
+  'fossil','lacoste','tommyhilfiger','calvinklein','gucci','louisvuitton','chanel','hermes','prada','versace','armani',
+  'diesel','levis','ralphlauren','tommy','hm','taobao','tmall','jd','jdcom','pinduoduo','douyin','tiktok','wechat','weibo',
+  'paytr','paypal','visa','mastercard','troy','amex','americanexpress','microsoft','meta','facebook','instagram','youtube',
+  'twitter','x','netflix','spotify','disney','cocacola','pepsi','nestle','unilever','loreal','nivea','ikea','decathlon',
+]);
+// Alt dize eslesme (normalize) -> erotik / mstehcen terimler (bilesik isimleri de yakalar)
+const RESERVED_SUBSTR = [
+  'porn','porno','xxx','sexy','erotic','erotik','escort','eskort','fuck','bitch','pussy','dick','boobs','tits','cunt',
+  'whore','slut','nude','hentai','milf','bdsm','fetish','orgasm','masturb',
+  'orospu','yarrak','yarak','amcik','amcık','siktir','sikis','sikiş','sikmek','gotveren','ibne','pezevenk','kaltak',
+  'tasak','taşak','memeli','azgin','azgın','seks','fahise','fahişe','hayatkadini','dalyarak','pic',
+];
+function normalizeNick(n){ return String(n||'').toLowerCase().replace(/[_.\s-]+/g,''); }
+function isReserved(nick){
+  const n = normalizeNick(nick);
+  if(!n) return false;
+  if(RESERVED_EXACT.has(n)) return true;
+  for(const t of RESERVED_SUBSTR){ if(n.includes(t)) return true; }
+  return false;
 }
 
 // POST /api/auth/register  { email, password, name, phone?, admin_key? }
@@ -257,6 +294,25 @@ router.get(
 );
 
 
+// GET /api/auth/nickname-available?nickname=xxx — herkese acik uygunluk kontrolu
+router.get(
+  '/nickname-available',
+  nicknameCheckLimiter,
+  optionalAuth,
+  asyncHandler(async (req, res) => {
+    const nick = String(req.query.nickname || '').trim();
+    if(!nick || nick.length < 2 || nick.length > 30 || !/^[\p{L}\p{N}_.-]+$/u.test(nick)){
+      return res.json({ available: false, reason: 'invalid' });
+    }
+    if(isReserved(nick)) return res.json({ available: false, reason: 'reserved' });
+    const { rows } = await pool.query('SELECT id, nickname FROM users WHERE LOWER(nickname) = LOWER($1)', [nick]);
+    if(!rows.length) return res.json({ available: true });
+    // Kendi adiysa musait say (gecerli token varsa optionalAuth req.user doldurur)
+    if(req.user && String(req.user.id) === String(rows[0].id)) return res.json({ available: true, mine: true });
+    return res.json({ available: false, reason: 'taken' });
+  })
+);
+
 // PATCH /api/auth/me — { nickname } (kullanıcı adı, yorumlarda görünür)
 router.patch(
   '/me',
@@ -265,6 +321,7 @@ router.patch(
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     const nick = req.body.nickname.trim();
+    if(isReserved(nick)) return res.status(400).json({ error: 'nickname_reserved' });
     try {
       const { rows } = await pool.query(
         'UPDATE users SET nickname = $1, updated_at = now() WHERE id = $2 RETURNING id, email, name, nickname, phone, is_admin',
