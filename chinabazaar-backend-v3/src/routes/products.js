@@ -48,6 +48,7 @@ function toProduct(row) {
     description: row.description,
     price_cents: row.price_cents,
     campaign_price_cents: row.campaign_price_cents ?? null,
+    warranty_months: row.warranty_months ?? null,
     campaign_price: row.campaign_price_cents != null ? row.campaign_price_cents / 100 : null,
     campaign_price_display: row.campaign_price_cents != null ? formatPrice(row.campaign_price_cents, row.currency) : null,
     price_display: formatPrice(row.price_cents, row.currency),
@@ -535,6 +536,7 @@ const productValidators = [
   body('name').trim().isLength({ min: 2, max: 200 }),
   body('price').isFloat({ min: 0, max: 10000000 }).withMessage('price_must_be_non_negative'),
   body('campaign_price').optional({ nullable: true }).isFloat({ min: 0, max: 10000000 }),
+  body('warranty_months').optional({ nullable: true }).isInt({ min: 0, max: 120 }),
   body('stock').optional().isInt({ min: 0, max: 1000000 }),
   body('description').optional().trim().isLength({ max: 10000 }),
   body('tagline').optional().trim().isLength({ max: 200 }),
@@ -581,13 +583,13 @@ router.post(
   ...productValidators,
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
-    const { name, price, campaign_price, stock, description, tagline, sku, image_url, video_url, category, is_active, currency, color, size, dimensions, box_dimensions, weight, length, connector, power_type, barcode, storage, is_upcoming, brand, marketplaces, marketplace_image, marketplace_images } = req.body;
+    const { name, price, campaign_price, stock, description, tagline, sku, image_url, video_url, category, is_active, currency, color, size, dimensions, box_dimensions, weight, length, connector, power_type, barcode, storage, is_upcoming, brand, marketplaces, marketplace_image, marketplace_images, warranty_months } = req.body;
     await ensureMarketplaceColumns();
     const categoryId = await resolveCategoryId(category);
     try {
       const { rows } = await pool.query(
-        `INSERT INTO products (sku, name, tagline, description, price_cents, currency, stock, category_id, video_url, thumb_url, is_active, color, size, dimensions, box_dimensions, weight, length, connector, power_type, barcode, storage, is_upcoming, brand, campaign_price_cents, marketplaces, marketplace_image, marketplace_images)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27::jsonb) RETURNING *`,
+        `INSERT INTO products (sku, name, tagline, description, price_cents, currency, stock, category_id, video_url, thumb_url, is_active, color, size, dimensions, box_dimensions, weight, length, connector, power_type, barcode, storage, is_upcoming, brand, campaign_price_cents, marketplaces, marketplace_image, marketplace_images, warranty_months)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27::jsonb,$28) RETURNING *`,
         [
           sku || null, name, tagline || null, description || null, toCents(price),
           ['TRY','USD','RUB'].includes(currency) ? currency : 'TRY',
@@ -600,6 +602,7 @@ router.post(
           (typeof marketplaces === 'string' && marketplaces.trim()) ? marketplaces.trim() : 'chinabazaar',
           (typeof marketplace_image === 'string' && marketplace_image.trim()) ? marketplace_image.trim() : null,
           cleanMpImages(marketplace_images),
+          warranty_months != null ? parseInt(warranty_months, 10) : null,
         ]
       );
       res.status(201).json(toProduct({ ...rows[0], category_slug: null, category_name: null }));
@@ -619,6 +622,7 @@ router.put(
   body('name').optional().trim().isLength({ min: 2, max: 200 }),
   body('price').optional().isFloat({ min: 0, max: 10000000 }),
   body('campaign_price').optional({ nullable: true }).isFloat({ min: 0, max: 10000000 }),
+  body('warranty_months').optional({ nullable: true }).isInt({ min: 0, max: 120 }),
   body('stock').optional().isInt({ min: 0, max: 1000000 }),
   body('description').optional().trim().isLength({ max: 10000 }),
   body('tagline').optional().trim().isLength({ max: 200 }),
@@ -670,6 +674,11 @@ router.put(
     if (req.body.campaign_price !== undefined) {
       params.push(req.body.campaign_price === null ? null : toCents(req.body.campaign_price));
       sets.push(`campaign_price_cents = $${params.length}`);
+    }
+    // Garanti: sayi = ayarla, null = kaldir, undefined = degistirme
+    if (req.body.warranty_months !== undefined) {
+      params.push(req.body.warranty_months === null ? null : parseInt(req.body.warranty_months, 10));
+      sets.push(`warranty_months = $${params.length}`);
     }
     if (req.body.stock !== undefined) {
       params.push(req.body.stock);
