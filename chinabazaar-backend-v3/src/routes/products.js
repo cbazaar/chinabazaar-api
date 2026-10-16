@@ -11,6 +11,12 @@ const pool = require('../db');
 
 const router = express.Router();
 
+// v582: Pazaryerleri kolonlari (orders.js ensure deseniyle ayni)
+async function ensureMarketplaceColumns() {
+  await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS marketplaces TEXT DEFAULT 'chinabazaar'`);
+  await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS marketplace_image TEXT`);
+}
+
 function formatPrice(cents, currency) {
   const cur = ['TRY', 'USD', 'RUB'].includes(currency) ? currency : 'TRY';
   try {
@@ -58,6 +64,8 @@ function toProduct(row) {
     video_url: row.video_url,
     video_mp4_url: streamMp4(row.video_url),
     thumb_url: row.thumb_url || streamThumb(row.video_url),
+    marketplaces: row.marketplaces || 'chinabazaar',
+    marketplace_image: row.marketplace_image || null,
   };
 }
 
@@ -300,6 +308,8 @@ const productValidators = [
   body('tagline').optional().trim().isLength({ max: 200 }),
   body('sku').optional().trim().isLength({ max: 60 }),
   body('image_url').optional({ values: 'falsy' }).isURL({ max_length: 2048 }),
+  body('marketplaces').optional().trim().isLength({ max: 200 }),
+  body('marketplace_image').optional({ values: 'falsy' }).isURL({ max_length: 2048 }),
   body('video_url').optional({ values: 'falsy' }).isURL({ max_length: 2048 }),
   body('category').optional({ values: 'falsy' }).trim().isLength({ max: 100 }),
   body('is_active').optional().isBoolean(),
@@ -337,12 +347,13 @@ router.post(
   ...productValidators,
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
-    const { name, price, campaign_price, stock, description, tagline, sku, image_url, video_url, category, is_active, currency, color, size, dimensions, box_dimensions, weight, length, connector, power_type, barcode, storage, is_upcoming, brand } = req.body;
+    const { name, price, campaign_price, stock, description, tagline, sku, image_url, video_url, category, is_active, currency, color, size, dimensions, box_dimensions, weight, length, connector, power_type, barcode, storage, is_upcoming, brand, marketplaces, marketplace_image } = req.body;
+    await ensureMarketplaceColumns();
     const categoryId = await resolveCategoryId(category);
     try {
       const { rows } = await pool.query(
-        `INSERT INTO products (sku, name, tagline, description, price_cents, currency, stock, category_id, video_url, thumb_url, is_active, color, size, dimensions, box_dimensions, weight, length, connector, power_type, barcode, storage, is_upcoming, brand, campaign_price_cents)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) RETURNING *`,
+        `INSERT INTO products (sku, name, tagline, description, price_cents, currency, stock, category_id, video_url, thumb_url, is_active, color, size, dimensions, box_dimensions, weight, length, connector, power_type, barcode, storage, is_upcoming, brand, campaign_price_cents, marketplaces, marketplace_image)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26) RETURNING *`,
         [
           sku || null, name, tagline || null, description || null, toCents(price),
           ['TRY','USD','RUB'].includes(currency) ? currency : 'TRY',
@@ -352,6 +363,8 @@ router.post(
           length || null, connector || null, power_type || null,
           barcode || null, storage || null, is_upcoming === true, brand || null,
           campaign_price != null ? toCents(campaign_price) : null,
+          (typeof marketplaces === 'string' && marketplaces.trim()) ? marketplaces.trim() : 'chinabazaar',
+          (typeof marketplace_image === 'string' && marketplace_image.trim()) ? marketplace_image.trim() : null,
         ]
       );
       res.status(201).json(toProduct({ ...rows[0], category_slug: null, category_name: null }));
@@ -376,6 +389,8 @@ router.put(
   body('tagline').optional().trim().isLength({ max: 200 }),
   body('sku').optional().trim().isLength({ max: 60 }),
   body('image_url').optional({ values: 'falsy' }).isURL({ max_length: 2048 }),
+  body('marketplaces').optional().trim().isLength({ max: 200 }),
+  body('marketplace_image').optional({ values: 'falsy' }).isURL({ max_length: 2048 }),
   body('video_url').optional({ values: 'falsy' }).isURL({ max_length: 2048 }),
   body('category').optional({ values: 'falsy' }).trim().isLength({ max: 100 }),
   body('is_active').optional().isBoolean(),
@@ -393,11 +408,13 @@ router.put(
   body('barcode').optional().trim().matches(/^[0-9]{8,14}$/),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
+    await ensureMarketplaceColumns();
     const map = {
       name: 'name', tagline: 'tagline', description: 'description', sku: 'sku',
       video_url: 'video_url', image_url: 'thumb_url', is_active: 'is_active',
       currency: 'currency', color: 'color', storage: 'storage', is_upcoming: 'is_upcoming', size: 'size', dimensions: 'dimensions',
       box_dimensions: 'box_dimensions', weight: 'weight', length: 'length', connector: 'connector', power_type: 'power_type', barcode: 'barcode', brand: 'brand',
+      marketplaces: 'marketplaces', marketplace_image: 'marketplace_image',
     };
     const sets = [];
     const params = [req.params.id];
