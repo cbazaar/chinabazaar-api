@@ -198,6 +198,120 @@ router.post(
   })
 );
 
+// v613: WhatsApp Cloud API — webhook + admin mesajlasma paneli (yalniz admin gorur, magaza ana sayfasinda yok)
+async function ensureWhatsappTables() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS whatsapp_conversations (id SERIAL PRIMARY KEY, wa_id TEXT UNIQUE NOT NULL, display_name TEXT DEFAULT '', unread_count INT DEFAULT 0, last_message_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now())`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS whatsapp_messages (id SERIAL PRIMARY KEY, conversation_id INT NOT NULL REFERENCES whatsapp_conversations(id) ON DELETE CASCADE, wa_message_id TEXT UNIQUE, direction TEXT NOT NULL, body TEXT DEFAULT '', msg_type TEXT DEFAULT 'text', status TEXT DEFAULT '', created_at TIMESTAMPTZ DEFAULT now())`);
+}
+async function waSettings() {
+  const { rows } = await pool.query(`SELECT key, value FROM settings WHERE key IN ('wa_phone_id', 'wa_token', 'wa_verify', 'wa_enabled', 'wa_username')`);
+  const kv = {};
+  rows.forEach((r) => { kv[r.key] = r.value; });
+  return kv;
+}
+// GET /api/products/whatsapp/webhook — Meta dogrulama (herkese acik, jeton sart)
+router.get('/whatsapp/webhook', asyncHandler(async (req, res) => {
+  await ensureSettingsTable();
+  const kv = await waSettings();
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && kv.wa_verify && token === kv.wa_verify) return res.status(200).send(challenge);
+  return res.sendStatus(403);
+}));
+// POST /api/products/whatsapp/webhook — Meta gelen mesaj + durum bildirimi (herkese acik, her zaman 200)
+router.post('/whatsapp/webhook', asyncHandler(async (req, res) => {
+  try {
+    await ensureWhatsappTables();
+    const entries = (req.body && req.body.entry) || [];
+    for (const entry of entries) {
+      for (const change of (entry.changes || [])) {
+        const value = change.value || {};
+        for (const st of (value.statuses || [])) {
+          if (st.id) await pool.query(`UPDATE whatsapp_messages SET status=$1 WHERE wa_message_id=$2`, [String(st.status || ''), String(st.id)]);
+        }
+        const contacts = {};
+        for (const c of (value.contacts || [])) contacts[c.wa_id] = (c.profile && c.profile.name) || '';
+        for (const m of (value.messages || [])) {
+          if (!m.from || !m.id) continue;
+          const type = String(m.type || 'text');
+          let body = '';
+          if (type === 'text') body = (m.text && m.text.body) || '';
+          else body = '[' + type + ']';
+          body = body.slice(0, 4000);
+          let conv = await pool.query(`SELECT id FROM whatsapp_conversations WHERE wa_id=$1`, [String(m.from)]);
+          let convId;
+          if (conv.rows.length) {
+            convId = conv.rows[0].id;
+            await pool.query(`UPDATE whatsapp_conversations SET display_name=COALESCE(NULLIF($1,''),display_name), updated_at=now() WHERE id=$2`, [contacts[m.from] || '', convId]);
+          } else {
+            const ins = await pool.query(`INSERT INTO whatsapp_conversations (wa_id, display_name, unread_count, last_message_at) VALUES ($1,$2,0,now()) RETURNING id`, [String(m.from), contacts[m.from] || '']);
+            convId = ins.rows[0].id;
+          }
+          const ins = await pool.query(`INSERT INTO whatsapp_messages (conversation_id, wa_message_id, direction, body, msg_type, status) VALUES ($1,$2,'in',$3,$4,'received') ON CONFLICT DO NOTHING RETURNING id`, [convId, String(m.id), body, type]);
+          if (ins.rows.length) await pool.query(`UPDATE whatsapp_conversations SET unread_count=unread_count+1, last_message_at=now(), updated_at=now() WHERE id=$1`, [convId]);
+        }
+      }
+    }
+  } catch (e) { console.error('[whatsapp webhook]', e.message); }
+  res.sendStatus(200);
+}));
+// GET /api/products/whatsapp/conversations — admin konusma listesi
+router.get('/whatsapp/conversations', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  await ensureWhatsappTables();
+  const { rows } = await pool.query(`SELECT c.*, (SELECT body FROM whatsapp_messages m WHERE m.conversation_id=c.id ORDER BY m.id DESC LIMIT 1) AS last_body FROM whatsapp_conversations c ORDER BY c.last_message_at DESC NULLS LAST LIMIT 100`);
+  const total = await pool.query(`SELECT COALESCE(SUM(unread_count),0)::int AS unread FROM whatsapp_conversations`);
+  res.json({ ok: true, items: rows, unread_total: total.rows[0].unread });
+}));
+// GET /api/products/whatsapp/conversations/:id/messages — admin mesajlari okur (okundu sayilir)
+router.get('/whatsapp/conversations/:id/messages', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  await ensureWhatsappTables();
+  const id = parseInt(req.params.id, 10);
+  if (!id) return res.status(400).json({ ok: false, error: 'bad_id' });
+  const { rows } = await pool.query(`SELECT * FROM whatsapp_messages WHERE conversation_id=$1 ORDER BY id ASC LIMIT 500`, [id]);
+  await pool.query(`UPDATE whatsapp_conversations SET unread_count=0 WHERE id=$1`, [id]);
+  res.json({ ok: true, messages: rows });
+}));
+// POST /api/products/whatsapp/conversations/:id/send — admin cevap gonderir (Graph API)
+router.post('/whatsapp/conversations/:id/send', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  await ensureWhatsappTables();
+  const id = parseInt(req.params.id, 10);
+  if (!id) return res.status(400).json({ ok: false, error: 'bad_id' });
+  const text = String((req.body && req.body.text) || '').trim().slice(0, 4000);
+  if (!text) return res.json({ ok: false, error: 'empty' });
+  const kv = await waSettings();
+  if (!kv.wa_phone_id || !kv.wa_token) return res.json({ ok: false, error: 'not_configured', message: 'WhatsApp bilgileri eksik: Telefon Numarası ID ve Erişim Jetonu gerekli.' });
+  const conv = await pool.query(`SELECT * FROM whatsapp_conversations WHERE id=$1`, [id]);
+  if (!conv.rows.length) return res.status(404).json({ ok: false, error: 'not_found' });
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 15000);
+    let r;
+    try {
+      r = await fetch(`https://graph.facebook.com/v21.0/${encodeURIComponent(kv.wa_phone_id)}/messages`, { method: 'POST', signal: ctrl.signal, headers: { Authorization: `Bearer ${kv.wa_token}`, 'Content-Type': 'application/json' }, body: JSON.stringify({ messaging_product: 'whatsapp', to: conv.rows[0].wa_id, type: 'text', text: { body: text } }) });
+    } finally { clearTimeout(t); }
+    const j = await r.json().catch(() => ({}));
+    if (r.status === 200 && j.messages && j.messages[0] && j.messages[0].id) {
+      await pool.query(`INSERT INTO whatsapp_messages (conversation_id, wa_message_id, direction, body, msg_type, status) VALUES ($1,$2,'out',$3,'text','sent')`, [id, String(j.messages[0].id), text]);
+      await pool.query(`UPDATE whatsapp_conversations SET last_message_at=now(), updated_at=now() WHERE id=$1`, [id]);
+      return res.json({ ok: true });
+    }
+    const code = j.error && j.error.code;
+    const msg = (j.error && j.error.message) || '';
+    if (code === 131047) return res.json({ ok: false, error: 'window_closed', message: 'Müşteri son 24 saattir yazmadı — WhatsApp, cevap için önce müşterinin yazmasını ister. Müşterinin yazmasını bekleyin veya şablon mesajı kullanın.' });
+    return res.json({ ok: false, error: 'send_failed', message: 'Gönderilemedi (HTTP ' + r.status + ')' + (msg ? ' — ' + msg : '') });
+  } catch (e) { return res.json({ ok: false, error: 'send_failed', message: 'Bağlantı hatası: ' + (e && e.message ? e.message : 'bilinmeyen hata') }); }
+}));
+// GET /api/products/whatsapp/status — admin panel durum + webhook adresi
+router.get('/whatsapp/status', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  await ensureSettingsTable();
+  await ensureWhatsappTables();
+  const kv = await waSettings();
+  const { rows } = await pool.query(`SELECT COUNT(*)::int AS convs, COALESCE(SUM(unread_count),0)::int AS unread FROM whatsapp_conversations`);
+  const origin = `${req.protocol}://${req.get('host')}`;
+  res.json({ ok: true, configured: !!(kv.wa_phone_id && kv.wa_token), enabled: kv.wa_enabled === 'true', verify_set: !!kv.wa_verify, username: kv.wa_username || '', webhook_url: origin + '/api/products/whatsapp/webhook', conversations: rows[0].convs, unread: rows[0].unread });
+}));
+
 // GET /api/products/:id
 // GET /api/products/liked — kullanıcının beğendiği ürünler (profil: Beğendiğim Videolar, v570)
 router.get(
@@ -393,7 +507,7 @@ router.post('/marketplaces/:name/test', requireAuth, requireAdmin, param('name')
 async function ensureSettingsTable() {
   await pool.query(`CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT, updated_at TIMESTAMPTZ DEFAULT now())`);
 }
-const WA_PUBLIC_KEYS = ['wa_phone', 'wa_phone_id', 'wa_verify', 'wa_enabled', 'wa_order_notify', 'wa_shop_button'];
+const WA_PUBLIC_KEYS = ['wa_phone', 'wa_username', 'wa_phone_id', 'wa_verify', 'wa_enabled', 'wa_order_notify', 'wa_shop_button'];
 const ACC_PROGRAMS = ['nebim', 'logo', 'zirve', 'eta', 'akinsoft'];
 const ACC_PUBLIC_KEYS_BASE = ACC_PROGRAMS.flatMap((p) => [`acc_${p}_api_url`, `acc_${p}_username`, `acc_${p}_firm`, `acc_${p}_enabled`]);
 const NEBIM_EXTRA_KEYS = ['acc_nebim_user_group', 'acc_nebim_office', 'acc_nebim_warehouse', 'acc_nebim_series', 'acc_nebim_pos_terminal', 'acc_nebim_customer', 'acc_nebim_payment_code', 'acc_nebim_auto_send'];
