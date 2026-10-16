@@ -506,6 +506,14 @@ router.patch('/categories/:id', asyncHandler(async (req, res) => {
   res.json({ ok: true });
 }));
 
+// v568: kategori sil — ürünü olan kategori silinemez (önce ürünler başka kategoriye taşınmalı)
+router.delete('/categories/:id', asyncHandler(async (req, res) => {
+  const { rows } = await pool.query('SELECT count(*)::int AS n FROM products WHERE category_id=$1', [req.params.id]);
+  if (rows[0].n > 0) return res.status(400).json({ error: 'category_has_products', count: rows[0].n });
+  await pool.query('DELETE FROM categories WHERE id=$1', [req.params.id]);
+  res.json({ ok: true });
+}));
+
 // ---- v557: Kullanici adi kurallari (admin: izin ver / blokla) ----
 // Isimler normalize saklanir (kucuk harf, _ . - ve bosluk yok sayilir) — auth.js ile ayni kural.
 function normalizeNickAdmin(n){ return String(n || '').toLowerCase().replace(/[_.\s-]+/g, ''); }
