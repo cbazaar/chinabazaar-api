@@ -59,7 +59,22 @@ async function sendSms(phone, message) {
     });
     const text = (await r.text()).trim();
     if (text.startsWith('00')) return { ok: true, jobId: text.split(' ')[1] || null };
-    return { ok: false, error: 'sms_send_failed', detail: text.slice(0, 100) };
+    // Netgsm hata kodlari (Netgsm dokumani): kodu anlasilir mesaja cevir, kodu da koru.
+    const NETGSM_ERRORS = {
+      '20': 'Mesaj metni bos veya hatali.',
+      '30': 'Kullanici adi / sifre hatali, veya API erisim izni kapali, veya IP sinirlamasi var. Netgsm panelinde Ayarlar > API islemleri bolumunden API erisim iznini acin ve IP sinirlamasini kaldirin.',
+      '40': 'Mesaj basligi (Gonderen Adi) Netgsm sisteminde kayitli degil.',
+      '41': 'Mesaj basligi (Gonderen Adi) bu kullaniciya ait degil.',
+      '50': 'Gecersiz birim (mesaj basina dusecek kredi).',
+      '51': 'Hatali sorgu formati.',
+      '52': 'Gonderim limiti asildi.',
+      '60': 'Hatali telefon numarasi.',
+      '70': 'Hatali sorgulama.',
+      '100': 'Netgsm sistem hatasi.',
+    };
+    const code = text.slice(0, 2);
+    const mapped = NETGSM_ERRORS[code];
+    return { ok: false, error: 'sms_send_failed', detail: (mapped ? mapped + ' (Netgsm kodu: ' + code + ')' : text.slice(0, 100)) };
   } catch (e) {
     return { ok: false, error: 'sms_send_failed', detail: e.message };
   }
