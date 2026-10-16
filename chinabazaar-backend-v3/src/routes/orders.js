@@ -107,6 +107,10 @@ router.post(
   body('invoice_vkn').optional({ nullable: true }).isString().trim().isLength({ min: 0, max: 10 }),
   body('invoice_company').optional({ nullable: true }).isString().trim().isLength({ min: 0, max: 200 }),
   body('invoice_tax_office').optional({ nullable: true }).isString().trim().isLength({ min: 0, max: 100 }),
+  body('invoice_full_name').optional({ nullable: true }).isString().trim().isLength({ min: 0, max: 200 }),
+  body('invoice_address').optional({ nullable: true }).isString().trim().isLength({ min: 0, max: 500 }),
+  body('invoice_email').optional({ nullable: true }).isString().trim().isLength({ min: 0, max: 200 }),
+  body('invoice_postcode').optional({ nullable: true }).isString().trim().isLength({ min: 0, max: 10 }),
   body('coupon_code').optional({ nullable: true }).isString().trim().isLength({ min: 0, max: 64 }),
   body('items').isArray({ min: 1 }),
   body('items.*.product_id').isUUID(),
@@ -124,6 +128,10 @@ router.post(
     const invoiceVkn = invoiceType === 'kurumsal' ? String(req.body.invoice_vkn || '').replace(/\D/g, '').slice(0, 10) || null : null;
     const invoiceCompany = invoiceType === 'kurumsal' ? String(req.body.invoice_company || '').trim().slice(0, 200) || null : null;
     const invoiceTaxOffice = invoiceType === 'kurumsal' ? String(req.body.invoice_tax_office || '').trim().slice(0, 100) || null : null;
+    const invoiceFullName = invoiceType === 'bireysel' ? String(req.body.invoice_full_name || '').trim().slice(0, 200) || null : null;
+    const invoiceAddress = invoiceType === 'bireysel' ? String(req.body.invoice_address || '').trim().slice(0, 500) || null : null;
+    const invoiceEmail = String(req.body.invoice_email || '').trim().slice(0, 200) || null;
+    const invoicePostcode = String(req.body.invoice_postcode || '').replace(/\D/g, '').slice(0, 10) || null;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -205,13 +213,17 @@ router.post(
 
       const orderNo = nextOrderNo();
       await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS coupon_code TEXT`);
+      await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS invoice_full_name TEXT`);
+      await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS invoice_address TEXT`);
+      await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS invoice_email TEXT`);
+      await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS invoice_postcode TEXT`);
       await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_cents BIGINT DEFAULT 0`);
       await client.query(`ALTER TABLE order_items ADD COLUMN IF NOT EXISTS variant_color TEXT`);
       await client.query(`ALTER TABLE order_items ADD COLUMN IF NOT EXISTS variant_storage TEXT`);
       const { rows: orderRows } = await client.query(
-        `INSERT INTO orders (user_id, order_no, status, subtotal_cents, shipping_cents, total_cents, currency, address_id, address_snapshot, payment_method, invoice_type, invoice_tckn, invoice_vkn, invoice_company, invoice_tax_office, coupon_code, discount_cents)
-         VALUES ($1,$2,'pending',$3,$4,$5,'TRY',$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
-        [req.user.id, orderNo, subtotal, shipping, total, address_id, JSON.stringify(addr.rows[0]), paymentMethod, invoiceType, invoiceTckn, invoiceVkn, invoiceCompany, invoiceTaxOffice, couponCode, discountCents]
+        `INSERT INTO orders (user_id, order_no, status, subtotal_cents, shipping_cents, total_cents, currency, address_id, address_snapshot, payment_method, invoice_type, invoice_tckn, invoice_vkn, invoice_company, invoice_tax_office, invoice_full_name, invoice_address, invoice_email, invoice_postcode, coupon_code, discount_cents)
+         VALUES ($1,$2,'pending',$3,$4,$5,'TRY',$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING *`,
+        [req.user.id, orderNo, subtotal, shipping, total, address_id, JSON.stringify(addr.rows[0]), paymentMethod, invoiceType, invoiceTckn, invoiceVkn, invoiceCompany, invoiceTaxOffice, invoiceFullName, invoiceAddress, invoiceEmail, invoicePostcode, couponCode, discountCents]
       );
       const order = orderRows[0];
 
