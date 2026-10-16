@@ -85,6 +85,10 @@ app.use((err, _req, res, _next) => {
   });
 });
 
+// v551: açılışta migrasyonları otomatik uygula (elle migrate çalıştırma gerekmez;
+// hata olursa yalnızca loglanır, sunucu yine açılır).
+try { require('./autoMigrate')().catch((e) => console.error('[migrate] otomatik:', e.message)); } catch (e) { console.error('[migrate] otomatik:', e.message); }
+
 app.listen(cfg.port, () => {
   console.log(`[api] dinleniyor :${cfg.port} (${cfg.nodeEnv})`);
 });
