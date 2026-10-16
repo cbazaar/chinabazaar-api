@@ -97,8 +97,21 @@ router.post(
     let { phone, code } = req.body;
     phone = String(phone).replace(/[\s\-().]/g, '');
     if (!phone.startsWith('+')) phone = '+' + phone;
-    // Demo doğrulama — gerçek SMS sağlayıcısı bağlanınca burası değişecek
-    if (String(code).trim() !== '123456') return res.status(401).json({ error: 'invalid_code' });
+    // v600: Gercek SMS kodu dogrulama (demo kod KALDIRILDI — guvenlik acigiydi)
+    await pool.query(`CREATE TABLE IF NOT EXISTS phone_codes (id SERIAL PRIMARY KEY, phone TEXT NOT NULL, code_hash TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, attempts INT DEFAULT 0, consumed_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT now())`);
+    const { rows: codes } = await pool.query(
+      'SELECT * FROM phone_codes WHERE phone = $1 AND consumed_at IS NULL AND expires_at > now() ORDER BY created_at DESC LIMIT 1',
+      [phone]
+    );
+    const rec = codes[0];
+    if (!rec) return res.status(401).json({ error: 'invalid_code' });
+    if (rec.attempts >= 5) return res.status(401).json({ error: 'too_many_attempts' });
+    const codeOk = await bcrypt.compare(String(code).trim(), rec.code_hash);
+    if (!codeOk) {
+      await pool.query('UPDATE phone_codes SET attempts = attempts + 1 WHERE id = $1', [rec.id]);
+      return res.status(401).json({ error: 'invalid_code' });
+    }
+    await pool.query('UPDATE phone_codes SET consumed_at = now() WHERE id = $1', [rec.id]);
     let { rows } = await pool.query('SELECT id, email, name, nickname, phone, is_admin, customer_code FROM users WHERE phone=$1', [phone]);
     let user;
     if (rows.length) {
@@ -345,4 +358,123 @@ router.patch(
   })
 );
 
+
+// ---- Telefon SMS kodu (v600) ----
+// POST /api/auth/phone-send-code { phone } — 6 haneli kod uretir, SMS ile gonderir
+router.post(
+  '/phone-send-code',
+  codeLimiter,
+  body('phone').matches(/^\+?[0-9][0-9\s\-().]{6,19}$/),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    let phone = String(req.body.phone || '').replace(/[\s\-().]/g, '');
+    if (!phone.startsWith('+')) phone = '+' + phone;
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const codeHash = await bcrypt.hash(code, 10);
+    await pool.query(`CREATE TABLE IF NOT EXISTS phone_codes (id SERIAL PRIMARY KEY, phone TEXT NOT NULL, code_hash TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, attempts INT DEFAULT 0, consumed_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT now())`);
+    await pool.query('UPDATE phone_codes SET consumed_at = now() WHERE phone = $1 AND consumed_at IS NULL', [phone]);
+    await pool.query('INSERT INTO phone_codes (phone, code_hash, expires_at) VALUES ($1, $2, now() + interval \'5 minutes\')', [phone, codeHash]);
+    const sms = require('../services/sms');
+    const sent = await sms.sendSms(phone, 'ChinaBazaar dogrulama kodunuz: ' + code + ' (5 dakika gecerli)');
+    if (!sent.ok) return res.status(503).json({ error: 'sms_not_configured' });
+    res.json({ ok: true });
+  })
+);
+
+// ---- Sosyal giris (v600): Google / Facebook / Apple ----
+// Kimlikler Railway Variables'dan: GOOGLE_CLIENT_ID, FACEBOOK_APP_ID, FACEBOOK_APP_SECRET, APPLE_CLIENT_ID
+router.get('/social/config', (req, res) => {
+  res.json({
+    googleClientId: process.env.GOOGLE_CLIENT_ID || null,
+    facebookAppId: process.env.FACEBOOK_APP_ID || null,
+    appleClientId: process.env.APPLE_CLIENT_ID || null,
+  });
+});
+
+async function verifyGoogleIdToken(idToken) {
+  const cid = process.env.GOOGLE_CLIENT_ID;
+  if (!cid || !idToken) return null;
+  try {
+    const r = await fetch('https://www.googleapis.com/oauth2/v3/tokeninfo?id_token=' + encodeURIComponent(idToken));
+    if (!r.ok) return null;
+    const j = await r.json();
+    if (j.aud !== cid) return null;
+    if (j.email_verified !== 'true' && j.email_verified !== true) return null;
+    if (Number(j.exp) * 1000 < Date.now()) return null;
+    if (!j.email) return null;
+    return { email: j.email, name: j.name || j.email };
+  } catch (e) { return null; }
+}
+
+async function verifyFacebookToken(accessToken) {
+  const appId = process.env.FACEBOOK_APP_ID;
+  const secret = process.env.FACEBOOK_APP_SECRET;
+  if (!appId || !secret || !accessToken) return null;
+  try {
+    const dbg = await fetch('https://graph.facebook.com/debug_token?input_token=' + encodeURIComponent(accessToken) + '&access_token=' + encodeURIComponent(appId + '|' + secret));
+    const dj = await dbg.json().catch(() => null);
+    if (!dj || !dj.data || !dj.data.is_valid || dj.data.app_id !== appId) return null;
+    const me = await fetch('https://graph.facebook.com/me?fields=id,name,email&access_token=' + encodeURIComponent(accessToken));
+    const mj = await me.json().catch(() => null);
+    if (!mj || !mj.email) return null;
+    return { email: mj.email, name: mj.name || mj.email };
+  } catch (e) { return null; }
+}
+
+async function verifyAppleIdToken(idToken) {
+  const clientId = process.env.APPLE_CLIENT_ID;
+  if (!clientId || !idToken) return null;
+  try {
+    const parts = String(idToken).split('.');
+    if (parts.length !== 3) return null;
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+    if (payload.iss !== 'https://appleid.apple.com') return null;
+    if (payload.aud !== clientId) return null;
+    if (Number(payload.exp) * 1000 < Date.now()) return null;
+    if (!payload.email) return null;
+    const header = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+    const keys = await fetch('https://appleid.apple.com/auth/keys').then((r) => r.json());
+    const key = (keys.keys || []).find((k) => k.kid === header.kid);
+    if (!key) return null;
+    const pub = crypto.createPublicKey({ key: { kty: 'RSA', n: key.n, e: key.e }, format: 'jwk' });
+    const ok = crypto.verify('RSA-SHA256', Buffer.from(parts[0] + '.' + parts[1]), pub, Buffer.from(parts[2], 'base64url'));
+    if (!ok) return null;
+    return { email: payload.email, name: payload.email };
+  } catch (e) { return null; }
+}
+
+async function findOrCreateSocialUser(email, name) {
+  const lower = String(email).toLowerCase();
+  const { rows } = await pool.query('SELECT * FROM users WHERE email = $1', [lower]);
+  if (rows.length) {
+    if (rows[0].is_blocked) return { blocked: true };
+    return { user: publicUser(rows[0]) };
+  }
+  const hash = await bcrypt.hash(crypto.randomBytes(16).toString('hex'), 12);
+  const ins = await pool.query(
+    'INSERT INTO users (email, password_hash, name, email_verified) VALUES ($1, $2, $3, TRUE) RETURNING id, email, name, nickname, phone, is_admin, customer_code',
+    [lower, hash, String(name || lower).slice(0, 200)]
+  );
+  return { user: publicUser(ins.rows[0]) };
+}
+
+// POST /api/auth/social/:provider { idToken | accessToken }
+router.post(
+  '/social/:provider',
+  loginLimiter,
+  asyncHandler(async (req, res) => {
+    const provider = req.params.provider;
+    let profile = null;
+    if (provider === 'google') profile = await verifyGoogleIdToken(req.body.idToken);
+    else if (provider === 'facebook') profile = await verifyFacebookToken(req.body.accessToken);
+    else if (provider === 'apple') profile = await verifyAppleIdToken(req.body.idToken);
+    else return res.status(400).json({ error: 'unknown_provider' });
+    if (!profile || !profile.email) return res.status(401).json({ error: 'social_verify_failed' });
+    const r = await findOrCreateSocialUser(profile.email, profile.name);
+    if (r.blocked) return res.status(403).json({ error: 'user_blocked' });
+    res.json({ user: r.user, token: signToken(r.user) });
+  })
+);
+
 module.exports = router;
+
