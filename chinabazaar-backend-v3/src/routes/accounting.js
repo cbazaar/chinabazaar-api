@@ -106,4 +106,21 @@ router.post('/invoices', asyncHandler(async (req, res) => {
   res.status(201).json(rows[0]);
 }));
 
+// ---- Nebim V3 Integrator (v610) ----
+// POST /api/accounting/nebim/send-invoice { order_id } — siparis faturasini Nebim'e gonder (yalniz admin)
+router.post('/nebim/send-invoice', asyncHandler(async (req, res) => {
+  const orderId = req.body && req.body.order_id;
+  if (!orderId) return res.status(400).json({ error: 'order_id_required' });
+  const nebim = require('../services/nebim');
+  const r = await nebim.sendOrderInvoice(orderId);
+  res.json(r);
+}));
+
+// GET /api/accounting/nebim/sync — son Nebim gonderim kayitlari (yalniz admin)
+router.get('/nebim/sync', asyncHandler(async (req, res) => {
+  await pool.query(`CREATE TABLE IF NOT EXISTS nebim_sync (id SERIAL PRIMARY KEY, order_id UUID, model_type INT, status TEXT, nebim_doc_no TEXT, detail TEXT, created_at TIMESTAMPTZ DEFAULT now())`);
+  const { rows } = await pool.query('SELECT * FROM nebim_sync ORDER BY created_at DESC LIMIT 100');
+  res.json({ items: rows });
+}));
+
 module.exports = router;

@@ -208,6 +208,14 @@ router.patch(
       );
       await client.query('COMMIT');
       res.json({ paid: true, order_no: rows[0].order_no });
+      // v610: Nebim otomatik fatura gonderimi (ayar aciksa, asla odeme onayini bozmaz)
+      try {
+        const { rows: nb } = await pool.query("SELECT value FROM settings WHERE key = 'acc_nebim_auto_send'");
+        if (nb[0] && nb[0].value === 'true') {
+          const nebim = require('../services/nebim');
+          nebim.sendOrderInvoice(rows[0].id).catch(() => {});
+        }
+      } catch (e) { /* Nebim gonderimi odeme onayini bozmaz */ }
     } catch (e) {
       await client.query('ROLLBACK');
       throw e;
