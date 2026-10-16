@@ -284,6 +284,91 @@ router.all('/enable-mp4', requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
+// v583: Pazaryeri bağlantıları (admin) — sırlar asla yanıtta dönülmez
+const MP_NAMES = ['trendyol', 'hepsiburada', 'amazon'];
+async function ensureMarketplaceSettings() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS marketplace_settings (name TEXT PRIMARY KEY, creds JSONB NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'bagli_degil', last_test_at TIMESTAMPTZ, last_error TEXT, updated_at TIMESTAMPTZ DEFAULT now())`);
+}
+function mpPublicRow(r) {
+  return { name: r.name, status: r.status || 'bagli_degil', has_creds: !!(r.creds && Object.keys(r.creds).length), last_test_at: r.last_test_at || null, last_error: r.last_error || null };
+}
+// Gerçek API ile bağlantı testi — kimlik doğrulaması pazaryerinin kendi sunucusunda yapılır
+async function testMarketplaceConnection(name, creds) {
+  const withTimeout = async (fn) => {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 15000);
+    try { return await fn(ctrl.signal); } finally { clearTimeout(t); }
+  };
+  try {
+    if (name === 'trendyol') {
+      const { supplierId, apiKey, apiSecret } = creds || {};
+      if (!supplierId || !apiKey || !apiSecret) return { ok: false, message: 'Eksik bilgi: Satıcı ID, API Key ve API Secret gerekli.' };
+      const r = await withTimeout((sig) => fetch(`https://api.trendyol.com/sapigw/suppliers/${encodeURIComponent(supplierId)}/v2/products?page=0&size=1`, {
+        signal: sig,
+        headers: { Authorization: 'Basic ' + Buffer.from(`${apiKey}:${apiSecret}`).toString('base64'), 'User-Agent': `${supplierId} - SelfIntegration`, Accept: 'application/json' },
+      }));
+      if (r.status === 200) return { ok: true, message: 'Trendyol bağlantısı başarılı ✓' };
+      if (r.status === 401 || r.status === 403) return { ok: false, message: 'Trendyol kimlik doğrulama başarısız (401/403) — API Key / Secret / Satıcı ID kontrol edin.' };
+      return { ok: false, message: `Trendyol yanıtı: HTTP ${r.status}` };
+    }
+    if (name === 'amazon') {
+      const { clientId, clientSecret, refreshToken } = creds || {};
+      if (!clientId || !clientSecret || !refreshToken) return { ok: false, message: 'Eksik bilgi: Client ID, Client Secret ve Refresh Token gerekli.' };
+      const body = new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken, client_id: clientId, client_secret: clientSecret });
+      const r = await withTimeout((sig) => fetch('https://api.amazon.com/auth/o2/token', {
+        method: 'POST', signal: sig, headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body,
+      }));
+      if (r.status === 200) return { ok: true, message: 'Amazon SP-API bağlantısı başarılı ✓' };
+      let detail = '';
+      try { const j = await r.json(); detail = j.error_description || j.error || ''; } catch {}
+      return { ok: false, message: `Amazon kimlik doğrulama başarısız (HTTP ${r.status})${detail ? ' — ' + detail : ''}` };
+    }
+    if (name === 'hepsiburada') {
+      const { merchantId, username, password } = creds || {};
+      if (!merchantId || !username || !password) return { ok: false, message: 'Eksik bilgi: Satıcı ID, Kullanıcı Adı ve Şifre gerekli.' };
+      const r = await withTimeout((sig) => fetch(`https://oms-external.hepsiburada.com/v1/listings?merchantid=${encodeURIComponent(merchantId)}&limit=1`, {
+        signal: sig,
+        headers: { Authorization: 'Basic ' + Buffer.from(`${username}:${password}`).toString('base64'), Accept: 'application/json' },
+      }));
+      if (r.status === 200) return { ok: true, message: 'Hepsiburada bağlantısı başarılı ✓' };
+      if (r.status === 401 || r.status === 403) return { ok: false, message: 'Hepsiburada kimlik doğrulama başarısız (401/403) — kullanıcı adı / şifre / satıcı ID kontrol edin.' };
+      return { ok: false, message: `Hepsiburada yanıtı: HTTP ${r.status}` };
+    }
+    return { ok: false, message: 'Bilinmeyen pazaryeri.' };
+  } catch (e) {
+    return { ok: false, message: 'Bağlantı hatası: ' + (e && e.message ? e.message : 'bilinmeyen hata') };
+  }
+}
+router.get('/marketplaces', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  await ensureMarketplaceSettings();
+  const { rows } = await pool.query('SELECT * FROM marketplace_settings ORDER BY name');
+  const byName = {};
+  rows.forEach((r) => { byName[r.name] = mpPublicRow(r); });
+  res.json({ marketplaces: MP_NAMES.map((n) => byName[n] || { name: n, status: 'bagli_degil', has_creds: false, last_test_at: null, last_error: null }) });
+}));
+router.put('/marketplaces/:name', requireAuth, requireAdmin, param('name').isIn(MP_NAMES), asyncHandler(async (req, res) => {
+  if (!checkValidation(req, res)) return;
+  await ensureMarketplaceSettings();
+  const incoming = req.body && req.body.creds && typeof req.body.creds === 'object' ? req.body.creds : {};
+  const clean = {};
+  for (const [k, v] of Object.entries(incoming)) { if (typeof v === 'string' && v.trim()) clean[k] = v.trim(); }
+  const { rows: ex } = await pool.query('SELECT creds FROM marketplace_settings WHERE name = $1', [req.params.name]);
+  const merged = { ...((ex[0] && ex[0].creds) || {}), ...clean };
+  await pool.query(`INSERT INTO marketplace_settings (name, creds, status, updated_at) VALUES ($1, $2::jsonb, 'kaydedildi', now())
+    ON CONFLICT (name) DO UPDATE SET creds = $2::jsonb, status = 'kaydedildi', updated_at = now()`, [req.params.name, JSON.stringify(merged)]);
+  res.json({ ok: true, name: req.params.name, status: 'kaydedildi', has_creds: Object.keys(merged).length > 0 });
+}));
+router.post('/marketplaces/:name/test', requireAuth, requireAdmin, param('name').isIn(MP_NAMES), asyncHandler(async (req, res) => {
+  if (!checkValidation(req, res)) return;
+  await ensureMarketplaceSettings();
+  const { rows } = await pool.query('SELECT creds FROM marketplace_settings WHERE name = $1', [req.params.name]);
+  const creds = (rows[0] && rows[0].creds) || {};
+  const result = await testMarketplaceConnection(req.params.name, creds);
+  await pool.query('UPDATE marketplace_settings SET status = $2, last_test_at = now(), last_error = $3, updated_at = now() WHERE name = $1',
+    [req.params.name, result.ok ? 'bagli' : 'hata', result.ok ? null : (result.message || 'test_failed')]);
+  res.json(result);
+}));
+
 router.get(
   '/:id',
   param('id').isUUID(),
