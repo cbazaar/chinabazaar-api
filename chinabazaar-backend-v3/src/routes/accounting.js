@@ -119,7 +119,7 @@ router.post('/nebim/send-invoice', asyncHandler(async (req, res) => {
 // GET /api/accounting/nebim/sync — son Nebim gonderim kayitlari (yalniz admin)
 router.get('/nebim/sync', asyncHandler(async (req, res) => {
   await pool.query(`CREATE TABLE IF NOT EXISTS nebim_sync (id SERIAL PRIMARY KEY, order_id UUID, model_type INT, status TEXT, nebim_doc_no TEXT, detail TEXT, created_at TIMESTAMPTZ DEFAULT now())`);
-  const { rows } = await pool.query('SELECT * FROM nebim_sync ORDER BY created_at DESC LIMIT 100');
+  const { rows } = await pool.query('SELECT ns.*, o.order_no FROM nebim_sync ns LEFT JOIN orders o ON o.id = ns.order_id ORDER BY ns.created_at DESC LIMIT 100');
   res.json({ items: rows });
 }));
 
