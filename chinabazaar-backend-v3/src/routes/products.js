@@ -8,6 +8,7 @@ const { checkValidation } = require('../middleware/validate');
 const { requireAuth, optionalAuth } = require('../middleware/auth');
 const { requireAdmin } = require('../middleware/admin');
 const pool = require('../db');
+const crypto = require('crypto');
 
 const router = express.Router();
 
@@ -393,12 +394,15 @@ const ACC_SECRET_KEYS = ACC_PROGRAMS.map((p) => `acc_${p}_password`);
 const GA_PUBLIC_KEYS = ['ga_measurement_id', 'ga_enabled'];
 const GA_SECRET_KEYS = ['ga_api_secret'];
 const SETTINGS_PUBLIC_KEYS = [...WA_PUBLIC_KEYS, ...ACC_PUBLIC_KEYS, ...GA_PUBLIC_KEYS];
+const XML_PUBLIC_KEYS = ['xml_feed_enabled', 'xml_feed_mode'];
+const XML_SECRET_KEYS = ['api_key'];
+const SETTINGS_PUBLIC_KEYS_ALL = [...SETTINGS_PUBLIC_KEYS, ...XML_PUBLIC_KEYS];
 router.get('/settings', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
   await ensureSettingsTable();
   const { rows } = await pool.query('SELECT key, value FROM settings');
   const settings = {};
   rows.forEach((r) => {
-    if (SETTINGS_PUBLIC_KEYS.includes(r.key)) {
+    if (SETTINGS_PUBLIC_KEYS_ALL.includes(r.key)) {
       let v = r.value;
       if (v === 'true' || v === 'false') v = v === 'true';
       settings[r.key] = v;
@@ -407,12 +411,13 @@ router.get('/settings', requireAuth, requireAdmin, asyncHandler(async (req, res)
   settings.has_wa_token = rows.some((r) => r.key === 'wa_token' && r.value);
   ACC_PROGRAMS.forEach((p) => { settings[`has_acc_${p}_password`] = rows.some((r) => r.key === `acc_${p}_password` && r.value); });
   settings.has_ga_api_secret = rows.some((r) => r.key === 'ga_api_secret' && r.value);
+  settings.has_api_key = rows.some((r) => r.key === 'api_key' && r.value);
   res.json({ settings });
 }));
 router.put('/settings', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
   await ensureSettingsTable();
   const incoming = req.body && req.body.settings && typeof req.body.settings === 'object' ? req.body.settings : {};
-  const allowed = [...WA_PUBLIC_KEYS, 'wa_token', ...ACC_PUBLIC_KEYS, ...ACC_SECRET_KEYS, ...GA_PUBLIC_KEYS, ...GA_SECRET_KEYS];
+  const allowed = [...WA_PUBLIC_KEYS, 'wa_token', ...ACC_PUBLIC_KEYS, ...ACC_SECRET_KEYS, ...GA_PUBLIC_KEYS, ...GA_SECRET_KEYS, ...XML_PUBLIC_KEYS, ...XML_SECRET_KEYS];
   for (const [k, v] of Object.entries(incoming)) {
     if (!allowed.includes(k)) continue;
     if (typeof v !== 'string' && typeof v !== 'boolean') continue;
@@ -486,6 +491,28 @@ router.get('/settings/public', asyncHandler(async (req, res) => {
     if (r.key === 'ga_measurement_id') settings.ga_measurement_id = r.value || '';
   });
   res.json({ settings });
+}));
+
+// v591: XML urun akisi + API anahtari uretme
+function escapeXml(s) { return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;'); }
+router.get('/feed.xml', asyncHandler(async (req, res) => {
+  await ensureSettingsTable();
+  const { rows: srows } = await pool.query(`SELECT key, value FROM settings WHERE key IN ('xml_feed_enabled', 'xml_feed_mode', 'api_key')`);
+  const kv = {};
+  srows.forEach((r) => { kv[r.key] = r.value; });
+  if (kv.xml_feed_enabled !== 'true') return res.status(404).type('application/xml').send('<?xml version="1.0" encoding="UTF-8"?>\n<error>feed_disabled</error>');
+  if (kv.xml_feed_mode === 'key' && (!kv.api_key || req.query.api_key !== kv.api_key)) {
+    return res.status(403).type('application/xml').send('<?xml version="1.0" encoding="UTF-8"?>\n<error>api_key_required</error>');
+  }
+  const { rows } = await pool.query(`SELECT p.id, p.sku, p.name, p.price_cents, p.currency, p.stock, p.thumb_url, p.description, c.name AS category_name FROM products p LEFT JOIN categories c ON c.id = p.category_id WHERE p.is_active = TRUE ORDER BY p.name LIMIT 5000`);
+  const items = rows.map((p) => `  <product>\n    <id>${escapeXml(p.id)}</id>\n    <sku>${escapeXml(p.sku)}</sku>\n    <name>${escapeXml(p.name)}</name>\n    <price>${(p.price_cents / 100).toFixed(2)}</price>\n    <currency>${escapeXml(p.currency || 'TRY')}</currency>\n    <stock>${p.stock ?? 0}</stock>\n    <image>${escapeXml(p.thumb_url || '')}</image>\n    <link>https://chinabazaar.com/</link>\n    <category>${escapeXml(p.category_name || '')}</category>\n    <description>${escapeXml((p.description || '').slice(0, 1000))}</description>\n  </product>`).join('\n');
+  res.type('application/xml').send(`<?xml version="1.0" encoding="UTF-8"?>\n<products>\n${items}\n</products>`);
+}));
+router.post('/settings/api-key/generate', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  await ensureSettingsTable();
+  const key = 'cbz_live_' + crypto.randomBytes(24).toString('hex');
+  await pool.query(`INSERT INTO settings (key, value, updated_at) VALUES ('api_key', $1, now()) ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = now()`, [key]);
+  res.json({ ok: true, api_key: key });
 }));
 
 router.get(
