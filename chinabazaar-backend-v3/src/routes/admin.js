@@ -480,6 +480,30 @@ router.post('/stock/:id/adjust', asyncHandler(async (req, res) => {
   res.json({ ok: true });
 }));
 
+// v608: kategori adi -> otomatik ikon anahtari (kategori eklenince ikon otomatik atanir)
+function autoCategoryIcon(name){
+  const n = String(name || '').toLowerCase();
+  const has = (...words) => words.some(w => n.includes(w));
+  if (has('hırdavat', 'hirdavat', 'hardware', 'alet', 'tornavida', 'matkap')) return 'wrench';
+  if (has('moda', 'giyim', 'tekstil', 'elbise', 'ayakkabı', 'ayakkabi', 'fashion')) return 'shirt';
+  if (has('ev ', 'ev&', 'yaşam', 'yasam', 'dekor', 'mobilya', 'mutfak', 'home')) return 'home';
+  if (has('güzellik', 'guzellik', 'bakım', 'bakim', 'kozmetik', 'beauty', 'cilt')) return 'sparkle';
+  if (has('spor', 'outdoor', 'kamp', 'balık', 'balik', 'av ', 'fitness', 'sport')) return 'dumbbell';
+  if (has('oyuncak', 'hobi', 'toy', 'lego', 'oyun hamuru')) return 'blocks';
+  if (has('oyun', 'game', 'konsol', 'playstation', 'xbox')) return 'game';
+  if (has('elektronik', 'teknoloji', 'electronic', 'chip')) return 'chip';
+  if (has('telefon', 'phone', 'kılıf', 'kilif', 'şarj', 'sarj')) return 'phone';
+  if (has('bilgisayar', 'computer', 'laptop', 'klavye', 'mouse')) return 'computer';
+  if (has('hediye', 'gift', 'hediyelik')) return 'gift';
+  if (has('otomotiv', 'otomobil', 'araba', 'car', 'motosiklet')) return 'car';
+  if (has('bahçe', 'bahce', 'garden', 'bitki', 'çiçek', 'cicek')) return 'leaf';
+  if (has('sağlık', 'saglik', 'health', 'medikal', 'eczane')) return 'heart';
+  if (has('kitap', 'kırtasiye', 'kirtasiye', 'book', 'defter', 'kalem')) return 'book';
+  if (has('saat', 'takı', 'taki', 'aksesuar', 'watch', 'jewel')) return 'watch';
+  if (has('bebek', 'baby', 'çocuk', 'cocuk', 'kid')) return 'plush';
+  return 'tag';
+}
+
 // ============ KATEGORİLER ============
 router.get('/categories', asyncHandler(async (req, res) => {
   const { rows } = await pool.query(
@@ -490,11 +514,23 @@ router.get('/categories', asyncHandler(async (req, res) => {
 }));
 router.post('/categories', asyncHandler(async (req, res) => {
   const { name, slug, icon, sort_order } = req.body;
-  const { rows } = await pool.query(
-    'INSERT INTO categories (name, slug, icon, sort_order) VALUES ($1,$2,$3,$4) RETURNING *',
-    [name, slug||name.toLowerCase().replace(/[^a-z0-9]+/g,'-'), icon||'', sort_order||0]
-  );
-  res.json({ item: rows[0] });
+  if (!name || !String(name).trim()) return res.status(400).json({ error: 'name_required' });
+  const finalSlug = (slug && String(slug).trim()) || String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-');
+  // v608: eski veritabanlarinda icon/sort_order sutunu yoksa INSERT patliyordu (internal_error) — once sutunlari garantile
+  await pool.query("ALTER TABLE categories ADD COLUMN IF NOT EXISTS icon TEXT DEFAULT ''");
+  await pool.query('ALTER TABLE categories ADD COLUMN IF NOT EXISTS sort_order INT DEFAULT 0');
+  // v608: ikon verilmediyse kategori adindan otomatik ata (or. Hirdavat -> wrench)
+  const finalIcon = (icon && String(icon).trim()) || autoCategoryIcon(name);
+  try {
+    const { rows } = await pool.query(
+      'INSERT INTO categories (name, slug, icon, sort_order) VALUES ($1,$2,$3,$4) RETURNING *',
+      [String(name).trim(), finalSlug, finalIcon, Number(sort_order) || 0]
+    );
+    res.json({ item: rows[0] });
+  } catch (e) {
+    if (e && e.code === '23505') return res.status(409).json({ error: 'slug_exists', slug: finalSlug });
+    throw e;
+  }
 }));
 router.patch('/categories/:id', asyncHandler(async (req, res) => {
   const { name, is_active, sort_order } = req.body;

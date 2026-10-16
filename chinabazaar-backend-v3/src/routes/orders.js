@@ -265,6 +265,8 @@ router.post(
       });
     } catch (err) {
       await client.query('ROLLBACK');
+      // v609: siparis alindi SMS'i (asla ana akisi bozmaz)
+      notifyOrderSms(order.id, 'received').catch(() => {});
       if (err.code === '23505') return res.status(409).json({ error: 'order_no_conflict_retry' });
       throw err;
     } finally {
@@ -349,6 +351,27 @@ router.delete(
   })
 );
 
+// v609: siparis SMS bildirimleri (Netgsm) — asla ana akisi bozmaz, hata yutulur.
+// Turler: received (siparis alindi), shipped (kargoya verildi / yolda), delivered (teslim edildi).
+async function notifyOrderSms(orderId, kind) {
+  try {
+    const sms = require('../services/sms');
+    const cfg = await sms.getSmsSettings();
+    const toggle = kind === 'received' ? cfg.notify.order_received : kind === 'shipped' ? cfg.notify.order_shipped : cfg.notify.order_delivered;
+    if (toggle === false) return;
+    const { rows } = await pool.query('SELECT o.order_no, u.phone FROM orders o LEFT JOIN users u ON u.id = o.user_id WHERE o.id = $1', [orderId]);
+    const row = rows[0];
+    if (!row || !row.phone) return;
+    const no = row.order_no || '';
+    const tel = String(cfg.companyPhone || '').replace(/^\+90/, '0');
+    let msg = '';
+    if (kind === 'received') msg = 'ChinaBazaar: Siparisiniz alindi. No: ' + no + '. ' + tel;
+    else if (kind === 'shipped') msg = 'ChinaBazaar: Siparisiniz kargoya verildi, yolda. No: ' + no + '. ' + tel;
+    else msg = 'ChinaBazaar: Siparisiniz teslim edildi. No: ' + no + '. Bizi tercih ettiginiz icin tesekkurler. ' + tel;
+    await sms.sendSms(row.phone, msg);
+  } catch (e) { /* SMS hatasi siparisi bozmaz */ }
+}
+
 // PATCH /api/orders/:id/tracking — kargo bilgisi güncelleme (yalnız admin)
 router.patch(
   '/:id/tracking',
@@ -362,6 +385,8 @@ router.patch(
     if (cargo_company === undefined && tracking_number === undefined) {
       return res.status(400).json({ error: 'nothing_to_update' });
     }
+    const { rows: oldRows } = await pool.query('SELECT status FROM orders WHERE id = $1', [req.params.id]);
+    const oldStatus = oldRows[0] ? oldRows[0].status : null;
     const { rows } = await pool.query(
       `UPDATE orders
        SET cargo_company = COALESCE($2, cargo_company),
@@ -373,6 +398,9 @@ router.patch(
       [req.params.id, cargo_company ?? null, tracking_number ?? null]
     );
     if (!rows.length) return res.status(404).json({ error: 'order_not_found' });
+    if (!rows.length) return res.status(404).json({ error: 'order_not_found' });
+    // v609: takip no eklenince durum shipped olduysa SMS
+    if ((oldStatus === 'packing' || oldStatus === 'ready') && rows[0].status === 'shipped') notifyOrderSms(rows[0].id, 'shipped').catch(() => {});
     res.json(rows[0]);
   })
 );
@@ -390,12 +418,20 @@ router.patch(
     .withMessage('invalid_status'),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
+    const { rows: oldRows } = await pool.query('SELECT status FROM orders WHERE id = $1', [req.params.id]);
+    const oldStatus = oldRows[0] ? oldRows[0].status : null;
     const { rows } = await pool.query(
       `UPDATE orders SET status = $2, updated_at = now() WHERE id = $1
        RETURNING id, order_no, status, cargo_company, tracking_number, updated_at`,
       [req.params.id, req.body.status]
     );
     if (!rows.length) return res.status(404).json({ error: 'order_not_found' });
+    if (!rows.length) return res.status(404).json({ error: 'order_not_found' });
+    // v609: durum degistiyse siparis SMS'i (shipped / delivered)
+    if (oldStatus && oldStatus !== rows[0].status) {
+      if (rows[0].status === 'shipped') notifyOrderSms(rows[0].id, 'shipped').catch(() => {});
+      else if (rows[0].status === 'delivered') notifyOrderSms(rows[0].id, 'delivered').catch(() => {});
+    }
     res.json(rows[0]);
   })
 );

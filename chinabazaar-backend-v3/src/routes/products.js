@@ -399,11 +399,13 @@ const ACC_PUBLIC_KEYS = ACC_PROGRAMS.flatMap((p) => [`acc_${p}_api_url`, `acc_${
 const ACC_SECRET_KEYS = ACC_PROGRAMS.map((p) => `acc_${p}_password`);
 const GA_PUBLIC_KEYS = ['ga_measurement_id', 'ga_enabled'];
 const GA_SECRET_KEYS = ['ga_api_secret'];
+const SMS_PUBLIC_KEYS = ['sms_netgsm_header', 'sms_company_phone', 'sms_notify_register', 'sms_notify_forgot', 'sms_notify_order_received', 'sms_notify_order_shipped', 'sms_notify_order_delivered'];
+const SMS_SECRET_KEYS = ['sms_netgsm_usercode', 'sms_netgsm_password'];
 const SETTINGS_PUBLIC_KEYS = [...WA_PUBLIC_KEYS, ...ACC_PUBLIC_KEYS, ...GA_PUBLIC_KEYS];
 const XML_PUBLIC_KEYS = ['xml_feed_enabled', 'xml_feed_mode'];
 const XML_SECRET_KEYS = ['api_key'];
 const SEC_PUBLIC_KEYS = ['sec_session_minutes', 'sec_failed_login_limit'];
-const SETTINGS_PUBLIC_KEYS_ALL = [...SETTINGS_PUBLIC_KEYS, ...XML_PUBLIC_KEYS, ...SEC_PUBLIC_KEYS];
+const SETTINGS_PUBLIC_KEYS_ALL = [...SETTINGS_PUBLIC_KEYS, ...XML_PUBLIC_KEYS, ...SEC_PUBLIC_KEYS, ...SMS_PUBLIC_KEYS];
 router.get('/settings', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
   await ensureSettingsTable();
   const { rows } = await pool.query('SELECT key, value FROM settings');
@@ -418,13 +420,15 @@ router.get('/settings', requireAuth, requireAdmin, asyncHandler(async (req, res)
   settings.has_wa_token = rows.some((r) => r.key === 'wa_token' && r.value);
   ACC_PROGRAMS.forEach((p) => { settings[`has_acc_${p}_password`] = rows.some((r) => r.key === `acc_${p}_password` && r.value); });
   settings.has_ga_api_secret = rows.some((r) => r.key === 'ga_api_secret' && r.value);
+  settings.has_sms_netgsm_usercode = rows.some((r) => r.key === 'sms_netgsm_usercode' && r.value);
+  settings.has_sms_netgsm_password = rows.some((r) => r.key === 'sms_netgsm_password' && r.value);
   settings.has_api_key = rows.some((r) => r.key === 'api_key' && r.value);
   res.json({ settings });
 }));
 router.put('/settings', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
   await ensureSettingsTable();
   const incoming = req.body && req.body.settings && typeof req.body.settings === 'object' ? req.body.settings : {};
-  const allowed = [...WA_PUBLIC_KEYS, 'wa_token', ...ACC_PUBLIC_KEYS, ...ACC_SECRET_KEYS, ...GA_PUBLIC_KEYS, ...GA_SECRET_KEYS, ...XML_PUBLIC_KEYS, ...XML_SECRET_KEYS, ...SEC_PUBLIC_KEYS];
+  const allowed = [...WA_PUBLIC_KEYS, 'wa_token', ...ACC_PUBLIC_KEYS, ...ACC_SECRET_KEYS, ...GA_PUBLIC_KEYS, ...GA_SECRET_KEYS, ...XML_PUBLIC_KEYS, ...XML_SECRET_KEYS, ...SEC_PUBLIC_KEYS, ...SMS_PUBLIC_KEYS, ...SMS_SECRET_KEYS];
   for (const [k, v] of Object.entries(incoming)) {
     if (!allowed.includes(k)) continue;
     if (typeof v !== 'string' && typeof v !== 'boolean') continue;
@@ -460,6 +464,18 @@ router.post('/settings/whatsapp/test', requireAuth, requireAdmin, asyncHandler(a
 }));
 
 // v588: Muhasebe programi baglanti testi — sunucuya erisilebilirlik kontrolu (kimlik dogrulama satici API'sine ozeldir)
+// POST /api/products/settings/sms/test — test SMS gonder (yalniz admin, v609)
+router.post('/settings/sms/test', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  await ensureSettingsTable();
+  const phone = String((req.body && req.body.phone) || '').trim();
+  if (!phone) return res.json({ ok: false, message: 'Telefon numarasi gerekli.' });
+  const { sendSms } = require('../services/sms');
+  const sent = await sendSms(phone, 'ChinaBazaar test mesaji: SMS baglantiniz calisiyor.');
+  if (sent.ok) return res.json({ ok: true, message: 'Test SMS gonderildi.' });
+  if (sent.error === 'sms_not_configured') return res.json({ ok: false, message: 'Netgsm bilgileri eksik. Once Kullanici Kodu, Sifre ve Gonderen Adi girip kaydedin.' });
+  return res.json({ ok: false, message: 'SMS gonderilemedi: ' + (sent.detail || sent.error) });
+}));
+
 router.post('/settings/accounting/test', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
   const program = req.body && req.body.program;
   if (!ACC_PROGRAMS.includes(program)) return res.json({ ok: false, message: 'Bilinmeyen muhasebe programı.' });
@@ -521,6 +537,22 @@ router.post('/settings/api-key/generate', requireAuth, requireAdmin, asyncHandle
   await pool.query(`INSERT INTO settings (key, value, updated_at) VALUES ('api_key', $1, now()) ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = now()`, [key]);
   res.json({ ok: true, api_key: key });
 }));
+
+// GET /api/products/categories — herkese acik kategori listesi (magaza kategori sayfasi icin, v608)
+// Yeni eklenen kategoriler (or. Hirdavat) API'den gelir; magaza bunlari otomatik ikonla gosterir.
+router.get(
+  '/categories',
+  asyncHandler(async (req, res) => {
+    await pool.query("ALTER TABLE categories ADD COLUMN IF NOT EXISTS icon TEXT DEFAULT ''");
+    await pool.query('ALTER TABLE categories ADD COLUMN IF NOT EXISTS sort_order INT DEFAULT 0');
+    const { rows } = await pool.query(
+      `SELECT c.id, c.name, c.slug, COALESCE(c.icon,'') AS icon, COALESCE(c.sort_order,0) AS sort_order,
+              (SELECT count(*)::int FROM products p WHERE p.category_id = c.id AND p.is_active = TRUE) AS product_count
+       FROM categories c ORDER BY c.sort_order, c.name`
+    );
+    res.json({ items: rows });
+  })
+);
 
 router.get(
   '/:id',

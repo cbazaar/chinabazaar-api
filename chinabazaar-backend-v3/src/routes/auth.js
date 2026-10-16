@@ -381,6 +381,64 @@ router.post(
   })
 );
 
+// POST /api/auth/forgot-password-sms { phone } — sifre sifirlama kodu SMS ile gonderir (v609)
+router.post(
+  '/forgot-password-sms',
+  codeLimiter,
+  body('phone').matches(/^\+?[0-9][0-9\s\-().]{6,19}$/),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    let phone = String(req.body.phone || '').replace(/[\s\-().]/g, '');
+    if (!phone.startsWith('+')) phone = '+' + phone;
+    const { rows } = await pool.query('SELECT id FROM users WHERE phone = $1', [phone]);
+    if (!rows.length) return res.status(404).json({ error: 'phone_not_found' });
+    const sms = require('../services/sms');
+    const cfg = await sms.getSmsSettings();
+    if (cfg.notify.forgot === false) return res.status(503).json({ error: 'sms_disabled' });
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const codeHash = await bcrypt.hash(code, 10);
+    await pool.query(`CREATE TABLE IF NOT EXISTS phone_codes (id SERIAL PRIMARY KEY, phone TEXT NOT NULL, code_hash TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, attempts INT DEFAULT 0, consumed_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT now())`);
+    await pool.query('UPDATE phone_codes SET consumed_at = now() WHERE phone = $1 AND consumed_at IS NULL', [phone]);
+    await pool.query('INSERT INTO phone_codes (phone, code_hash, expires_at) VALUES ($1, $2, now() + interval \'5 minutes\')', [phone, codeHash]);
+    const sent = await sms.sendSms(phone, 'ChinaBazaar sifre sifirlama kodunuz: ' + code + ' (5 dakika gecerli)');
+    if (!sent.ok) return res.status(503).json({ error: 'sms_not_configured' });
+    res.json({ ok: true });
+  })
+);
+
+// POST /api/auth/reset-password-sms { phone, code, new_password } — kodu dogrular, sifreyi degistirir (v609)
+router.post(
+  '/reset-password-sms',
+  loginLimiter,
+  body('phone').matches(/^\+?[0-9][0-9\s\-().]{6,19}$/),
+  body('code').isLength({ min: 4, max: 10 }),
+  body('new_password').isString().isLength({ min: 6, max: 100 }),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    let { phone, code, new_password } = req.body;
+    phone = String(phone).replace(/[\s\-().]/g, '');
+    if (!phone.startsWith('+')) phone = '+' + phone;
+    await pool.query(`CREATE TABLE IF NOT EXISTS phone_codes (id SERIAL PRIMARY KEY, phone TEXT NOT NULL, code_hash TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, attempts INT DEFAULT 0, consumed_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT now())`);
+    const { rows: codes } = await pool.query(
+      'SELECT * FROM phone_codes WHERE phone = $1 AND consumed_at IS NULL AND expires_at > now() ORDER BY created_at DESC LIMIT 1',
+      [phone]
+    );
+    const rec = codes[0];
+    if (!rec) return res.status(401).json({ error: 'invalid_code' });
+    if (rec.attempts >= 5) return res.status(401).json({ error: 'too_many_attempts' });
+    const codeOk = await bcrypt.compare(String(code).trim(), rec.code_hash);
+    if (!codeOk) {
+      await pool.query('UPDATE phone_codes SET attempts = attempts + 1 WHERE id = $1', [rec.id]);
+      return res.status(401).json({ error: 'invalid_code' });
+    }
+    await pool.query('UPDATE phone_codes SET consumed_at = now() WHERE id = $1', [rec.id]);
+    const hash = await bcrypt.hash(String(new_password), 12);
+    const { rows } = await pool.query('UPDATE users SET password_hash = $2 WHERE phone = $1 RETURNING id', [phone, hash]);
+    if (!rows.length) return res.status(404).json({ error: 'phone_not_found' });
+    res.json({ ok: true });
+  })
+);
+
 // ---- Sosyal giris (v600): Google / Facebook / Apple ----
 // Kimlikler Railway Variables'dan: GOOGLE_CLIENT_ID, FACEBOOK_APP_ID, FACEBOOK_APP_SECRET, APPLE_CLIENT_ID
 router.get('/social/config', (req, res) => {
