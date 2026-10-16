@@ -432,24 +432,20 @@ router.get(
   })
 );
 
-// POST /api/products/:id/comments — yorum ekle (girişli + misafir, v551: kayıtsız yorum)
+// POST /api/products/:id/comments — yorum ekle (kayıt gerekli, v552)
 router.post(
   '/:id/comments',
-  optionalAuth,
+  requireAuth,
   param('id').isUUID(),
   body('body').trim().isLength({ min: 1, max: 1000 }),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
-    let userId = null;
-    if (req.user) {
-      const me = await pool.query('SELECT is_blocked FROM users WHERE id = $1', [req.user.id]);
-      if (me.rows[0]?.is_blocked) return res.status(403).json({ error: 'user_blocked' });
-      userId = req.user.id;
-    }
+    const me = await pool.query('SELECT is_blocked FROM users WHERE id = $1', [req.user.id]);
+    if (me.rows[0]?.is_blocked) return res.status(403).json({ error: 'user_blocked' });
     const { rows } = await pool.query(
       `INSERT INTO comments (product_id, user_id, body) VALUES ($1, $2, $3)
        RETURNING id, body, created_at`,
-      [req.params.id, userId, req.body.body.trim()]
+      [req.params.id, req.user.id, req.body.body.trim()]
     );
     res.status(201).json(rows[0]);
   })
