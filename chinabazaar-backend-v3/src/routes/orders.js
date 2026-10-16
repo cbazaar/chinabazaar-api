@@ -199,7 +199,8 @@ router.post(
         await client.query('UPDATE coupons SET used_count = used_count + 1, updated_at = now() WHERE id = $1', [coupon.id]);
       }
 
-      const shipping = cfg.shippingCents;
+      // v573: 400 TL uzeri (kupon sonrasi urun toplami) kargo bedava
+      const shipping = (subtotal - discountCents >= 40000) ? 0 : cfg.shippingCents;
       const total = subtotal + shipping - discountCents;
 
       const orderNo = nextOrderNo();
