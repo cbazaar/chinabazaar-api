@@ -171,6 +171,57 @@ router.post(
 );
 
 // GET /api/products/:id
+// GET /api/products/liked — kullanıcının beğendiği ürünler (profil: Beğendiğim Videolar, v570)
+router.get(
+  '/liked',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const { rows } = await pool.query(
+      `SELECT p.id, p.name, p.price_cents, p.currency, p.thumb_url, p.stock, p.sold_count
+       FROM product_likes l JOIN products p ON p.id = l.product_id
+       WHERE l.user_id = $1 AND p.is_active = TRUE ORDER BY l.created_at DESC`,
+      [req.user.id]
+    );
+    res.json({ items: rows });
+  })
+);
+
+// GET /api/products/commented — kullanıcının yorum yaptığı ürünler (profil, v570)
+router.get(
+  '/commented',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const { rows } = await pool.query(
+      `SELECT p.id, p.name, p.price_cents, p.currency, p.thumb_url, p.stock, p.sold_count,
+              COUNT(c.id)::int AS comment_count,
+              (SELECT c2.body FROM comments c2 WHERE c2.user_id = $1 AND c2.product_id = p.id ORDER BY c2.created_at DESC LIMIT 1) AS last_comment
+       FROM comments c JOIN products p ON p.id = c.product_id
+       WHERE c.user_id = $1 AND p.is_active = TRUE AND c.is_blocked = FALSE
+       GROUP BY p.id, p.name, p.price_cents, p.currency, p.thumb_url, p.stock, p.sold_count
+       ORDER BY MAX(c.created_at) DESC`,
+      [req.user.id]
+    );
+    res.json({ items: rows });
+  })
+);
+
+// GET /api/products/shared — kullanıcının paylaştığı ürünler (profil, v570)
+router.get(
+  '/shared',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const { rows } = await pool.query(
+      `SELECT p.id, p.name, p.price_cents, p.currency, p.thumb_url, p.stock, p.sold_count
+       FROM product_shares s JOIN products p ON p.id = s.product_id
+       WHERE s.user_id = $1 AND p.is_active = TRUE
+       GROUP BY p.id, p.name, p.price_cents, p.currency, p.thumb_url, p.stock, p.sold_count
+       ORDER BY MAX(s.created_at) DESC`,
+      [req.user.id]
+    );
+    res.json({ items: rows });
+  })
+);
+
 // GET /api/products/video/:uid — video proxy (videodelivery.net engelini aşar)
 router.get('/video/:uid', async (req, res) => {
   try {

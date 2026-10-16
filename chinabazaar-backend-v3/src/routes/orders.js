@@ -271,6 +271,49 @@ router.get(
   })
 );
 
+// DELETE /api/orders/:id — bekleyen siparişi sil (yalnız sipariş sahibi veya admin; v570)
+// Ödenmiş / kargoya verilmiş sipariş silinemez (iade akışı kullanılır).
+// Silme: stok geri yazılır, kupon sayacı azaltılır, otomatik fatura + kalemler + ödemeler silinir.
+router.delete(
+  '/:id',
+  param('id').isUUID(),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query('SELECT * FROM orders WHERE id = $1', [req.params.id]);
+      const order = rows[0];
+      if (!order) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'order_not_found' }); }
+      const { rows: me } = await client.query('SELECT is_admin FROM users WHERE id = $1', [req.user.id]);
+      if (order.user_id !== req.user.id && !me[0]?.is_admin) {
+        await client.query('ROLLBACK'); return res.status(403).json({ error: 'forbidden' });
+      }
+      if (order.status !== 'pending') {
+        await client.query('ROLLBACK'); return res.status(400).json({ error: 'order_not_deletable', status: order.status });
+      }
+      const { rows: items } = await client.query('SELECT product_id, qty FROM order_items WHERE order_id = $1', [order.id]);
+      for (const it of items) {
+        await client.query('UPDATE products SET stock = stock + $1, updated_at = now() WHERE id = $2', [it.qty, it.product_id]);
+      }
+      if (order.coupon_code) {
+        await client.query('UPDATE coupons SET used_count = GREATEST(used_count - 1, 0) WHERE code = $1', [order.coupon_code]);
+      }
+      await client.query('DELETE FROM invoices WHERE order_id = $1', [order.id]);
+      await client.query('DELETE FROM payments WHERE order_id = $1', [order.id]);
+      await client.query('DELETE FROM order_items WHERE order_id = $1', [order.id]);
+      await client.query('DELETE FROM orders WHERE id = $1', [order.id]);
+      await client.query('COMMIT');
+      res.json({ deleted: true, id: order.id, order_no: order.order_no });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  })
+);
+
 // PATCH /api/orders/:id/tracking — kargo bilgisi güncelleme (yalnız admin)
 router.patch(
   '/:id/tracking',
