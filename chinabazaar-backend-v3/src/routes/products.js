@@ -390,12 +390,15 @@ const WA_PUBLIC_KEYS = ['wa_phone', 'wa_phone_id', 'wa_verify', 'wa_enabled', 'w
 const ACC_PROGRAMS = ['nebim', 'logo', 'zirve', 'eta', 'akinsoft'];
 const ACC_PUBLIC_KEYS = ACC_PROGRAMS.flatMap((p) => [`acc_${p}_api_url`, `acc_${p}_username`, `acc_${p}_firm`, `acc_${p}_enabled`]);
 const ACC_SECRET_KEYS = ACC_PROGRAMS.map((p) => `acc_${p}_password`);
+const GA_PUBLIC_KEYS = ['ga_measurement_id', 'ga_enabled'];
+const GA_SECRET_KEYS = ['ga_api_secret'];
+const SETTINGS_PUBLIC_KEYS = [...WA_PUBLIC_KEYS, ...ACC_PUBLIC_KEYS, ...GA_PUBLIC_KEYS];
 router.get('/settings', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
   await ensureSettingsTable();
   const { rows } = await pool.query('SELECT key, value FROM settings');
   const settings = {};
   rows.forEach((r) => {
-    if (WA_PUBLIC_KEYS.includes(r.key)) {
+    if (SETTINGS_PUBLIC_KEYS.includes(r.key)) {
       let v = r.value;
       if (v === 'true' || v === 'false') v = v === 'true';
       settings[r.key] = v;
@@ -403,12 +406,13 @@ router.get('/settings', requireAuth, requireAdmin, asyncHandler(async (req, res)
   });
   settings.has_wa_token = rows.some((r) => r.key === 'wa_token' && r.value);
   ACC_PROGRAMS.forEach((p) => { settings[`has_acc_${p}_password`] = rows.some((r) => r.key === `acc_${p}_password` && r.value); });
+  settings.has_ga_api_secret = rows.some((r) => r.key === 'ga_api_secret' && r.value);
   res.json({ settings });
 }));
 router.put('/settings', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
   await ensureSettingsTable();
   const incoming = req.body && req.body.settings && typeof req.body.settings === 'object' ? req.body.settings : {};
-  const allowed = [...WA_PUBLIC_KEYS, 'wa_token', ...ACC_PUBLIC_KEYS, ...ACC_SECRET_KEYS];
+  const allowed = [...WA_PUBLIC_KEYS, 'wa_token', ...ACC_PUBLIC_KEYS, ...ACC_SECRET_KEYS, ...GA_PUBLIC_KEYS, ...GA_SECRET_KEYS];
   for (const [k, v] of Object.entries(incoming)) {
     if (!allowed.includes(k)) continue;
     if (typeof v !== 'string' && typeof v !== 'boolean') continue;
@@ -470,6 +474,18 @@ router.post('/settings/accounting/test', requireAuth, requireAdmin, asyncHandler
   } catch (e) {
     return res.json({ ok: false, message: 'Sunucuya erişilemedi: ' + (e && e.message ? e.message : 'bilinmeyen hata') });
   }
+}));
+
+// v589: Herkese açık GA ayarı — yalnızca etkinlik + Ölçüm Kimliği (sır içermez)
+router.get('/settings/public', asyncHandler(async (req, res) => {
+  await ensureSettingsTable();
+  const { rows } = await pool.query(`SELECT key, value FROM settings WHERE key IN ('ga_enabled', 'ga_measurement_id')`);
+  const settings = { ga_enabled: false, ga_measurement_id: '' };
+  rows.forEach((r) => {
+    if (r.key === 'ga_enabled') settings.ga_enabled = r.value === 'true';
+    if (r.key === 'ga_measurement_id') settings.ga_measurement_id = r.value || '';
+  });
+  res.json({ settings });
 }));
 
 router.get(
