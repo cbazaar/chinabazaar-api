@@ -422,8 +422,8 @@ router.get(
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     const { rows } = await pool.query(
-      `SELECT c.id, c.body, c.created_at, COALESCE(u.nickname, u.name) AS user_name
-       FROM comments c JOIN users u ON u.id = c.user_id
+      `SELECT c.id, c.body, c.created_at, COALESCE(u.nickname, u.name, 'Misafir') AS user_name
+       FROM comments c LEFT JOIN users u ON u.id = c.user_id
        WHERE c.product_id = $1 AND c.is_blocked = FALSE
        ORDER BY c.created_at DESC LIMIT 100`,
       [req.params.id]
@@ -432,20 +432,24 @@ router.get(
   })
 );
 
-// POST /api/products/:id/comments — yorum ekle (giriş gerekli)
+// POST /api/products/:id/comments — yorum ekle (girişli + misafir, v551: kayıtsız yorum)
 router.post(
   '/:id/comments',
-  requireAuth,
+  optionalAuth,
   param('id').isUUID(),
   body('body').trim().isLength({ min: 1, max: 1000 }),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
-    const me = await pool.query('SELECT is_blocked FROM users WHERE id = $1', [req.user.id]);
-    if (me.rows[0]?.is_blocked) return res.status(403).json({ error: 'user_blocked' });
+    let userId = null;
+    if (req.user) {
+      const me = await pool.query('SELECT is_blocked FROM users WHERE id = $1', [req.user.id]);
+      if (me.rows[0]?.is_blocked) return res.status(403).json({ error: 'user_blocked' });
+      userId = req.user.id;
+    }
     const { rows } = await pool.query(
       `INSERT INTO comments (product_id, user_id, body) VALUES ($1, $2, $3)
        RETURNING id, body, created_at`,
-      [req.params.id, req.user.id, req.body.body.trim()]
+      [req.params.id, userId, req.body.body.trim()]
     );
     res.status(201).json(rows[0]);
   })
