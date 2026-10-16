@@ -111,6 +111,8 @@ router.post(
   body('items').isArray({ min: 1 }),
   body('items.*.product_id').isUUID(),
   body('items.*.qty').isInt({ min: 1, max: 99 }),
+  body('items.*.variant_color').optional({ nullable: true }).isString().trim().isLength({ min: 0, max: 100 }),
+  body('items.*.variant_storage').optional({ nullable: true }).isString().trim().isLength({ min: 0, max: 100 }),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
 
@@ -157,9 +159,27 @@ router.post(
           return res.status(409).json({ error: 'insufficient_stock', product_id: p.id, available: p.stock });
         }
         // Kampanya fiyati varsa (0 < kampanya < normal fiyat) siparis kampanyali fiyattan kesilir
-        const unitCents = (p.campaign_price_cents != null && p.campaign_price_cents > 0 && p.campaign_price_cents < p.price_cents) ? p.campaign_price_cents : p.price_cents;
+        let unitCents = (p.campaign_price_cents != null && p.campaign_price_cents > 0 && p.campaign_price_cents < p.price_cents) ? p.campaign_price_cents : p.price_cents;
+        // v572: Varyant — renk/depolama secimi; depolama fiyat farki urunun storage listesinden SUNUCU tarafinda hesaplanir (on yuz fiyati guvenilmez)
+        let variantColor = String(it.variant_color || '').trim().slice(0, 100) || null;
+        let variantStorage = String(it.variant_storage || '').trim().slice(0, 100) || null;
+        if (variantColor) {
+          const colors = String(p.color || '').split(',').map((s) => s.trim()).filter(Boolean);
+          if (colors.length && !colors.includes(variantColor)) variantColor = null; // bilinmeyen renk: yoksay
+        }
+        if (variantStorage) {
+          const opts = String(p.storage || '').split(',').map((s) => {
+            const parts = String(s).trim().split(':');
+            const label = (parts[0] || '').trim();
+            const delta = parts.length > 1 ? parseFloat(String(parts[1]).replace(',', '.')) : 0;
+            return { label, delta: Number.isFinite(delta) && delta > 0 ? delta : 0 };
+          }).filter((o) => o.label);
+          const hit = opts.find((o) => o.label === variantStorage);
+          if (hit) unitCents += Math.round(hit.delta * 100);
+          else variantStorage = null; // bilinmeyen depolama: yoksay
+        }
         subtotal += unitCents * it.qty;
-        lines.push({ product: p, qty: it.qty, unit_cents: unitCents });
+        lines.push({ product: p, qty: it.qty, unit_cents: unitCents, variant_color: variantColor, variant_storage: variantStorage });
       }
 
       // Kupon: sunucu tarafinda yeniden dogrulanir, indirim uygulanir, kullanim sayaci artar
@@ -185,6 +205,8 @@ router.post(
       const orderNo = nextOrderNo();
       await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS coupon_code TEXT`);
       await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_cents BIGINT DEFAULT 0`);
+      await client.query(`ALTER TABLE order_items ADD COLUMN IF NOT EXISTS variant_color TEXT`);
+      await client.query(`ALTER TABLE order_items ADD COLUMN IF NOT EXISTS variant_storage TEXT`);
       const { rows: orderRows } = await client.query(
         `INSERT INTO orders (user_id, order_no, status, subtotal_cents, shipping_cents, total_cents, currency, address_id, address_snapshot, payment_method, invoice_type, invoice_tckn, invoice_vkn, invoice_company, invoice_tax_office, coupon_code, discount_cents)
          VALUES ($1,$2,'pending',$3,$4,$5,'TRY',$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
@@ -194,8 +216,8 @@ router.post(
 
       for (const l of lines) {
         await client.query(
-          'INSERT INTO order_items (order_id, product_id, name, qty, price_cents, barcode) VALUES ($1,$2,$3,$4,$5,$6)',
-          [order.id, l.product.id, l.product.name, l.qty, l.unit_cents, l.product.barcode || null]
+          'INSERT INTO order_items (order_id, product_id, name, qty, price_cents, barcode, variant_color, variant_storage) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+          [order.id, l.product.id, l.product.name, l.qty, l.unit_cents, l.product.barcode || null, l.variant_color || null, l.variant_storage || null]
         );
         await client.query('UPDATE products SET stock = stock - $1, updated_at = now() WHERE id = $2', [
           l.qty,
@@ -208,7 +230,7 @@ router.post(
       // OTOMATİK FATURA OLUŞTUR
       try {
         const invNo = 'FTR-' + order.order_no;
-        const itemsJson = JSON.stringify(lines.map(l => ({ name: l.product.name, qty: l.qty, price_cents: l.unit_cents })));
+        const itemsJson = JSON.stringify(lines.map(l => ({ name: l.product.name, qty: l.qty, price_cents: l.unit_cents, variant_color: l.variant_color || null, variant_storage: l.variant_storage || null })));
         const userName = (await pool.query('SELECT name FROM users WHERE id=$1', [req.user.id])).rows[0]?.name || '';
         await pool.query(
           `INSERT INTO invoices (invoice_no, order_id, customer_name, items, subtotal_cents, vat_cents, total_cents, currency, status, invoice_date)
@@ -253,7 +275,7 @@ router.get(
       return res.status(403).json({ error: 'forbidden' });
     }
 
-    const { rows: items } = await pool.query('SELECT product_id, name, qty, price_cents, barcode FROM order_items WHERE order_id = $1', [order.id]);
+    const { rows: items } = await pool.query('SELECT product_id, name, qty, price_cents, barcode, variant_color, variant_storage FROM order_items WHERE order_id = $1', [order.id]);
     const { rows: payments } = await pool.query(
       'SELECT provider, status, payment_id, amount_cents, currency, created_at FROM payments WHERE order_id = $1 ORDER BY created_at DESC',
       [order.id]
