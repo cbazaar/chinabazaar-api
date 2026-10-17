@@ -7,6 +7,9 @@ const { checkValidation } = require('../middleware/validate');
 const { requireAuth } = require('../middleware/auth');
 const { requireAdmin } = require('../middleware/admin');
 const pool = require('../db');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
 
 const router = express.Router();
 router.use(requireAuth, requireAdmin);
@@ -598,6 +601,46 @@ router.delete(
     const nick = normalizeNickAdmin(req.params.nickname);
     await pool.query('DELETE FROM nickname_rules WHERE nickname = $1', [nick]);
     res.json({ deleted: true });
+  })
+);
+
+// v630: Fabrika video yukleme (admin) — ham govde (express.raw), yeni bagimlilik yok.
+// POST /api/admin/upload-video?ext=mp4 — Content-Type: video/mp4 | video/webm
+// Yalnizca mp4/webm, en fazla 200 MB. Dosya src/uploads/factory/ altina rastgele adla
+// kaydedilir, herkese acik URL doner. Bu router requireAuth + requireAdmin korumalidir.
+// NOT: Railway diski gecicidir — yeniden deployda silinir; kalici video icin
+// shop ZIP'inin videos/ klasorune eklenmelidir.
+// Donen URL'in calismasi icin index.js'de /uploads static sunumu gerekir.
+const FACTORY_UPLOAD_DIR = path.join(__dirname, '..', 'uploads', 'factory');
+const FACTORY_UPLOAD_MAX = 200 * 1024 * 1024; // 200 MB
+const FACTORY_UPLOAD_EXTS = ['mp4', 'webm'];
+
+function factoryUploadMagicOk(buf, ext) {
+  if (!Buffer.isBuffer(buf) || buf.length < 12) return false;
+  if (ext === 'webm') return buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3;
+  // mp4: ilk kutu 'ftyp' (bayt 4-8)
+  return buf.toString('ascii', 4, 8) === 'ftyp';
+}
+
+router.post(
+  '/upload-video',
+  express.raw({ type: ['video/mp4', 'video/webm', 'application/octet-stream'], limit: '201mb' }),
+  asyncHandler(async (req, res) => {
+    const ext = String(req.query.ext || '').toLowerCase();
+    if (!FACTORY_UPLOAD_EXTS.includes(ext)) return res.status(400).json({ error: 'invalid_ext' });
+    const ct = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+    if (ct !== 'video/mp4' && ct !== 'video/webm' && ct !== 'application/octet-stream') {
+      return res.status(415).json({ error: 'invalid_content_type' });
+    }
+    if (!Buffer.isBuffer(req.body)) return res.status(415).json({ error: 'invalid_content_type' });
+    if (!req.body.length) return res.status(400).json({ error: 'empty_file' });
+    if (req.body.length > FACTORY_UPLOAD_MAX) return res.status(413).json({ error: 'file_too_large' });
+    if (!factoryUploadMagicOk(req.body, ext)) return res.status(415).json({ error: 'invalid_file' });
+    await fs.promises.mkdir(FACTORY_UPLOAD_DIR, { recursive: true });
+    const name = 'factory-' + Date.now() + '-' + crypto.randomBytes(8).toString('hex') + '.' + ext;
+    await fs.promises.writeFile(path.join(FACTORY_UPLOAD_DIR, name), req.body);
+    const base = req.protocol + '://' + req.get('host');
+    res.status(201).json({ ok: true, url: base + '/uploads/factory/' + name, size: req.body.length });
   })
 );
 
