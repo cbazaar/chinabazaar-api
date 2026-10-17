@@ -1057,7 +1057,7 @@ const ACC_PUBLIC_KEYS = [...ACC_PUBLIC_KEYS_BASE, ...NEBIM_EXTRA_KEYS];
 const ACC_SECRET_KEYS = ACC_PROGRAMS.map((p) => `acc_${p}_password`);
 const GA_PUBLIC_KEYS = ['ga_measurement_id', 'ga_enabled'];
 const GA_SECRET_KEYS = ['ga_api_secret'];
-const SOCIAL_PUBLIC_KEYS = ['tiktok_url'];
+const SOCIAL_PUBLIC_KEYS = ['youtube_url', 'facebook_url', 'instagram_url', 'x_url', 'tiktok_url'];
 const SMS_PUBLIC_KEYS = ['sms_netgsm_header', 'sms_company_phone', 'sms_notify_register', 'sms_notify_forgot', 'sms_notify_order_received', 'sms_notify_order_shipped', 'sms_notify_order_delivered'];
 const SMS_SECRET_KEYS = ['sms_netgsm_usercode', 'sms_netgsm_password'];
 const SETTINGS_PUBLIC_KEYS = [...WA_PUBLIC_KEYS, ...ACC_PUBLIC_KEYS, ...GA_PUBLIC_KEYS];
@@ -1167,11 +1167,15 @@ router.post('/settings/accounting/test', requireAuth, requireAdmin, asyncHandler
 // v589: Herkese açık GA ayarı — yalnızca etkinlik + Ölçüm Kimliği (sır içermez)
 router.get('/settings/public', asyncHandler(async (req, res) => {
   await ensureSettingsTable();
-  const { rows } = await pool.query(`SELECT key, value FROM settings WHERE key IN ('ga_enabled', 'ga_measurement_id', 'tiktok_url')`);
-  const settings = { ga_enabled: false, ga_measurement_id: '', tiktok_url: '' };
+  const { rows } = await pool.query(`SELECT key, value FROM settings WHERE key IN ('ga_enabled', 'ga_measurement_id', 'youtube_url', 'facebook_url', 'instagram_url', 'x_url', 'tiktok_url')`);
+  const settings = { ga_enabled: false, ga_measurement_id: '', youtube_url: '', facebook_url: '', instagram_url: '', x_url: '', tiktok_url: '' };
   rows.forEach((r) => {
     if (r.key === 'ga_enabled') settings.ga_enabled = r.value === 'true';
     if (r.key === 'ga_measurement_id') settings.ga_measurement_id = r.value || '';
+    if (r.key === 'youtube_url') settings.youtube_url = r.value || '';
+    if (r.key === 'facebook_url') settings.facebook_url = r.value || '';
+    if (r.key === 'instagram_url') settings.instagram_url = r.value || '';
+    if (r.key === 'x_url') settings.x_url = r.value || '';
     if (r.key === 'tiktok_url') settings.tiktok_url = r.value || '';
   });
   res.json({ settings });
