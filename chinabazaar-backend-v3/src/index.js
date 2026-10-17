@@ -1,5 +1,6 @@
 // ChinaBazaar API — giriş noktası (güvenlik sertleştirmeli)
 const express = require('express');
+const path = require('path');
 const helmet = require('helmet');
 const cors = require('cors');
 const cfg = require('./config');
@@ -45,6 +46,11 @@ app.use(
 );
 
 app.use(express.json({ limit: '256kb' }));
+
+// v630: admin uzerinden yuklenen fabrika videolari — herkese acik sunum
+// (/api/admin/upload-video'nun dondugu /uploads/factory/<ad> URL'leri burada calisir).
+// NOT: Railway diski gecicidir — yeniden deployda yuklenen videolar silinir.
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
 // Railway healthcheck — minimal bilgi (sürüm/iç detay sızdırmaz)
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
