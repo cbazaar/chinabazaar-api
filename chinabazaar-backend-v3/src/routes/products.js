@@ -318,6 +318,7 @@ async function ensureFactoryTables() {
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_likes (id SERIAL PRIMARY KEY, user_id INT NOT NULL, video_key TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now(), UNIQUE(user_id, video_key))`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_comments (id SERIAL PRIMARY KEY, user_id INT NOT NULL, video_key TEXT NOT NULL, body TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now())`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_favorites (id SERIAL PRIMARY KEY, user_id INT NOT NULL, video_key TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now(), UNIQUE(user_id, video_key))`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS factory_video_views (video TEXT PRIMARY KEY, views INT NOT NULL DEFAULT 0)`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_subscriptions (id SERIAL PRIMARY KEY, user_id INT NOT NULL, status TEXT DEFAULT 'pending', started_at TIMESTAMPTZ, ends_at TIMESTAMPTZ, paytr_merchant_oid TEXT UNIQUE, amount INT, currency TEXT DEFAULT 'USD', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now())`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factories (id SERIAL PRIMARY KEY, name TEXT NOT NULL, city TEXT DEFAULT '', category TEXT DEFAULT '', description TEXT DEFAULT '', moq INT DEFAULT 0, stock INT DEFAULT 0, capacity TEXT DEFAULT '', certs TEXT DEFAULT '', videos JSONB DEFAULT '[]', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now())`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS hashtags TEXT DEFAULT ''`);
@@ -481,6 +482,32 @@ router.post('/factory/likes', requireAuth, asyncHandler(async (req, res) => {
   }
   const { rows: c } = await pool.query('SELECT COUNT(*)::int AS n FROM factory_likes WHERE video_key=$1', [video]);
   res.json({ liked, like_count: c[0].n });
+}));
+
+// GET /api/products/factory/video-views?ids=F-V,F2-V2 — izlenme sayilari (herkese acik, bilinmeyen video -> 0)
+router.get('/factory/video-views', asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const ids = String(req.query.ids || '').split(',').map((s) => s.trim()).filter((s) => FACTORY_VIDEO_RE.test(s)).slice(0, 200);
+  const out = {};
+  for (const id of ids) out[id] = 0;
+  if (ids.length) {
+    const { rows } = await pool.query('SELECT video, views FROM factory_video_views WHERE video = ANY($1)', [ids]);
+    for (const r of rows) out[r.video] = r.views;
+  }
+  res.json({ views: out });
+}));
+
+// POST /api/products/factory/video-view {video} — izlenme +1 (herkese acik, kimlik yok)
+router.post('/factory/video-view', asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const video = String((req.body && req.body.video) || '');
+  if (!video) return res.status(400).json({ error: 'video_required' });
+  if (!FACTORY_VIDEO_RE.test(video)) return res.status(400).json({ error: 'invalid_video' });
+  const { rows } = await pool.query(
+    `INSERT INTO factory_video_views (video, views) VALUES ($1, 1) ON CONFLICT (video) DO UPDATE SET views = factory_video_views.views + 1 RETURNING views`,
+    [video]
+  );
+  res.json({ video, views: rows[0].views });
 }));
 
 // GET /api/products/factory/comments?video=F-V — en yeni 50 yorum (herkese acik)
