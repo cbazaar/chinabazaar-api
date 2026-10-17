@@ -1057,13 +1057,14 @@ const ACC_PUBLIC_KEYS = [...ACC_PUBLIC_KEYS_BASE, ...NEBIM_EXTRA_KEYS];
 const ACC_SECRET_KEYS = ACC_PROGRAMS.map((p) => `acc_${p}_password`);
 const GA_PUBLIC_KEYS = ['ga_measurement_id', 'ga_enabled'];
 const GA_SECRET_KEYS = ['ga_api_secret'];
+const SOCIAL_PUBLIC_KEYS = ['tiktok_url'];
 const SMS_PUBLIC_KEYS = ['sms_netgsm_header', 'sms_company_phone', 'sms_notify_register', 'sms_notify_forgot', 'sms_notify_order_received', 'sms_notify_order_shipped', 'sms_notify_order_delivered'];
 const SMS_SECRET_KEYS = ['sms_netgsm_usercode', 'sms_netgsm_password'];
 const SETTINGS_PUBLIC_KEYS = [...WA_PUBLIC_KEYS, ...ACC_PUBLIC_KEYS, ...GA_PUBLIC_KEYS];
 const XML_PUBLIC_KEYS = ['xml_feed_enabled', 'xml_feed_mode'];
 const XML_SECRET_KEYS = ['api_key'];
 const SEC_PUBLIC_KEYS = ['sec_session_minutes', 'sec_failed_login_limit'];
-const SETTINGS_PUBLIC_KEYS_ALL = [...SETTINGS_PUBLIC_KEYS, ...XML_PUBLIC_KEYS, ...SEC_PUBLIC_KEYS, ...SMS_PUBLIC_KEYS];
+const SETTINGS_PUBLIC_KEYS_ALL = [...SETTINGS_PUBLIC_KEYS, ...XML_PUBLIC_KEYS, ...SEC_PUBLIC_KEYS, ...SMS_PUBLIC_KEYS, ...SOCIAL_PUBLIC_KEYS];
 router.get('/settings', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
   await ensureSettingsTable();
   const { rows } = await pool.query('SELECT key, value FROM settings');
@@ -1086,7 +1087,7 @@ router.get('/settings', requireAuth, requireAdmin, asyncHandler(async (req, res)
 router.put('/settings', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
   await ensureSettingsTable();
   const incoming = req.body && req.body.settings && typeof req.body.settings === 'object' ? req.body.settings : {};
-  const allowed = [...WA_PUBLIC_KEYS, 'wa_token', ...ACC_PUBLIC_KEYS, ...ACC_SECRET_KEYS, ...GA_PUBLIC_KEYS, ...GA_SECRET_KEYS, ...XML_PUBLIC_KEYS, ...XML_SECRET_KEYS, ...SEC_PUBLIC_KEYS, ...SMS_PUBLIC_KEYS, ...SMS_SECRET_KEYS];
+  const allowed = [...WA_PUBLIC_KEYS, 'wa_token', ...ACC_PUBLIC_KEYS, ...ACC_SECRET_KEYS, ...GA_PUBLIC_KEYS, ...GA_SECRET_KEYS, ...XML_PUBLIC_KEYS, ...XML_SECRET_KEYS, ...SEC_PUBLIC_KEYS, ...SMS_PUBLIC_KEYS, ...SMS_SECRET_KEYS, ...SOCIAL_PUBLIC_KEYS];
   for (const [k, v] of Object.entries(incoming)) {
     if (!allowed.includes(k)) continue;
     if (typeof v !== 'string' && typeof v !== 'boolean') continue;
@@ -1166,11 +1167,12 @@ router.post('/settings/accounting/test', requireAuth, requireAdmin, asyncHandler
 // v589: Herkese açık GA ayarı — yalnızca etkinlik + Ölçüm Kimliği (sır içermez)
 router.get('/settings/public', asyncHandler(async (req, res) => {
   await ensureSettingsTable();
-  const { rows } = await pool.query(`SELECT key, value FROM settings WHERE key IN ('ga_enabled', 'ga_measurement_id')`);
-  const settings = { ga_enabled: false, ga_measurement_id: '' };
+  const { rows } = await pool.query(`SELECT key, value FROM settings WHERE key IN ('ga_enabled', 'ga_measurement_id', 'tiktok_url')`);
+  const settings = { ga_enabled: false, ga_measurement_id: '', tiktok_url: '' };
   rows.forEach((r) => {
     if (r.key === 'ga_enabled') settings.ga_enabled = r.value === 'true';
     if (r.key === 'ga_measurement_id') settings.ga_measurement_id = r.value || '';
+    if (r.key === 'tiktok_url') settings.tiktok_url = r.value || '';
   });
   res.json({ settings });
 }));
