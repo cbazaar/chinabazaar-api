@@ -9,6 +9,8 @@ const { requireAuth, optionalAuth } = require('../middleware/auth');
 const { requireAdmin } = require('../middleware/admin');
 const pool = require('../db');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 
 const router = express.Router();
 
@@ -329,6 +331,7 @@ async function ensureFactoryTables() {
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS whatsapp TEXT DEFAULT ''`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS socials JSONB DEFAULT '{}'`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS tags TEXT DEFAULT ''`);
+  await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE`);
 }
 
 const FACTORY_VIDEO_RE = /^\d+-\d+$/;
@@ -368,7 +371,7 @@ function toFactoryPublic(r) {
   };
 }
 function toFactoryAdmin(r) {
-  return { ...toFactoryPublic(r), created_at: r.created_at, updated_at: r.updated_at };
+  return { ...toFactoryPublic(r), is_active: r.is_active !== false, created_at: r.created_at, updated_at: r.updated_at };
 }
 
 // v5: fabrika sosyal aglari — {youtube, facebook, tiktok, instagram}; yalniz http(s) URL kabul edilir
@@ -581,10 +584,10 @@ router.get('/factory/favorites', requireAuth, asyncHandler(async (req, res) => {
   res.json({ favorites: rows.map((r) => r.video_key) });
 }));
 
-// GET /api/products/factory/list — tum fabrikalar (herkese acik)
+// GET /api/products/factory/list — tum fabrikalar (herkese acik; kapali fabrikalar gorunmez)
 router.get('/factory/list', asyncHandler(async (req, res) => {
   await ensureFactoryTables();
-  const { rows } = await pool.query(`SELECT * FROM factories ORDER BY id ASC`);
+  const { rows } = await pool.query(`SELECT * FROM factories WHERE is_active IS NOT FALSE ORDER BY id ASC`);
   res.json(rows.map(toFactoryPublic));
 }));
 
@@ -776,6 +779,16 @@ router.delete('/factory/admin/:id', requireAuth, requireAdmin, param('id').isInt
   res.json({ ok: true });
 }));
 
+// PATCH /api/products/factory/admin/:id/active — fabrika ac/kapa (admin; Admin v635 Fabrika Listesi Kapat/Ac)
+router.patch('/factory/admin/:id/active', requireAuth, requireAdmin, param('id').isInt({ min: 1 }), asyncHandler(async (req, res) => {
+  if (!checkValidation(req, res)) return;
+  if (typeof req.body?.is_active !== 'boolean') return res.status(400).json({ error: 'invalid_is_active' });
+  await ensureFactoryTables();
+  const { rows } = await pool.query('UPDATE factories SET is_active = $2, updated_at = now() WHERE id = $1 RETURNING *', [parseInt(req.params.id, 10), req.body.is_active]);
+  if (!rows.length) return res.status(404).json({ error: 'factory_not_found' });
+  res.json(toFactoryAdmin(rows[0]));
+}));
+
 // GET /api/products/factory/admin/subscriptions — abonelik listesi (admin; e-posta burada doner, baska yerde donulmez)
 router.get('/factory/admin/subscriptions', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
   await ensureFactoryTables();
@@ -792,18 +805,42 @@ router.get('/factory/admin/subscriptions', requireAuth, requireAdmin, asyncHandl
 // Tum /factory/* rotalari GET /:id ONCESINE kayitli — /:id bunlari yutmaz.
 // E-posta adresleri hicbir yanitta donulmez (isim/nickname yeterli).
 async function ensureFactoryMessagesTable() {
-  await pool.query(`CREATE TABLE IF NOT EXISTS factory_messages (id SERIAL PRIMARY KEY, user_id INT NOT NULL, body TEXT NOT NULL, sender TEXT NOT NULL DEFAULT 'user', created_at TIMESTAMPTZ DEFAULT now())`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS factory_messages (id SERIAL PRIMARY KEY, user_id INT NOT NULL, body TEXT NOT NULL DEFAULT '', sender TEXT NOT NULL DEFAULT 'user', created_at TIMESTAMPTZ DEFAULT now())`);
+  // Canli DB'deki tablo eski surumle olusmus olabilir — CREATE TABLE IF NOT EXISTS
+  // eksik sutunu eklemez; SELECT m.body ... bu yuzden 500 (internal_error) atiyordu.
+  // Tum sutunlar ADD COLUMN IF NOT EXISTS ile guvenceye alinir (products marketplace/warranty deseni).
+  await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS body TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS sender TEXT NOT NULL DEFAULT 'user'`);
+  await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS attachment_url TEXT`);
+  await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'text'`);
 }
 
-// POST /api/products/factory/messages {body} — kullanici mesaj gonderir (sender='user')
+// Mesaj eki (resim) dogrulama: http(s) URL veya /uploads/ yolu kabul edilir.
+function factoryMsgAttachmentOk(url) {
+  return /^https?:\/\//i.test(url) || /^\/uploads\//i.test(url);
+}
+
+// POST /api/products/factory/messages {body?, attachment_url?, kind?} — kullanici mesaj gonderir (sender='user')
+// Yazi veya resim: resimde body bos olabilir; en az biri dolu olmali.
 router.post('/factory/messages', requireAuth,
-  body('body').trim().isLength({ min: 1, max: 1000 }),
+  body('body').optional().trim().isLength({ max: 1000 }),
+  body('attachment_url').optional().isString().isLength({ max: 2048 }),
+  body('kind').optional().isIn(['text', 'image']),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     await ensureFactoryMessagesTable();
+    const text = (req.body.body || '').trim();
+    const attachmentUrl = typeof req.body.attachment_url === 'string' ? req.body.attachment_url.trim() : '';
+    let kind = req.body.kind === 'image' ? 'image' : 'text';
+    if (attachmentUrl) {
+      if (!factoryMsgAttachmentOk(attachmentUrl)) return res.status(400).json({ error: 'invalid_attachment_url' });
+      kind = 'image';
+    } else if (!text) {
+      return res.status(400).json({ error: 'empty_message' });
+    }
     const { rows } = await pool.query(
-      `INSERT INTO factory_messages (user_id, body, sender) VALUES ($1, $2, 'user') RETURNING id, user_id, body, sender, created_at`,
-      [req.user.id, req.body.body.trim()]
+      `INSERT INTO factory_messages (user_id, body, sender, attachment_url, kind) VALUES ($1, $2, 'user', $3, $4) RETURNING id, user_id, body, sender, attachment_url, kind, created_at`,
+      [req.user.id, text, attachmentUrl || null, kind]
     );
     res.status(201).json({ message: rows[0] });
   })
@@ -813,7 +850,7 @@ router.post('/factory/messages', requireAuth,
 router.get('/factory/messages', requireAuth, asyncHandler(async (req, res) => {
   await ensureFactoryMessagesTable();
   const { rows } = await pool.query(
-    `SELECT id, user_id, body, sender, created_at FROM factory_messages WHERE user_id=$1 ORDER BY created_at ASC, id ASC`,
+    `SELECT id, user_id, body, sender, attachment_url, kind, created_at FROM factory_messages WHERE user_id=$1 ORDER BY created_at ASC, id ASC`,
     [req.user.id]
   );
   res.json({ messages: rows });
@@ -823,7 +860,7 @@ router.get('/factory/messages', requireAuth, asyncHandler(async (req, res) => {
 router.get('/factory/admin/messages', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
   await ensureFactoryMessagesTable();
   const { rows } = await pool.query(
-    `SELECT m.id, m.user_id, m.body, m.sender, m.created_at,
+    `SELECT m.id, m.user_id, m.body, m.sender, m.attachment_url, m.kind, m.created_at,
             COALESCE(NULLIF(u.nickname,''), NULLIF(u.name,''), split_part(u.email,'@',1), 'Misafir') AS name
      FROM factory_messages m LEFT JOIN users u ON u.id = m.user_id
      ORDER BY m.user_id ASC, m.created_at ASC, m.id ASC`
@@ -831,26 +868,135 @@ router.get('/factory/admin/messages', requireAuth, requireAdmin, asyncHandler(as
   const byUser = new Map();
   for (const r of rows) {
     if (!byUser.has(r.user_id)) byUser.set(r.user_id, { user_id: r.user_id, name: r.name || 'Misafir', messages: [] });
-    byUser.get(r.user_id).messages.push({ id: r.id, body: r.body, sender: r.sender, created_at: r.created_at });
+    byUser.get(r.user_id).messages.push({ id: r.id, body: r.body, sender: r.sender, attachment_url: r.attachment_url || null, kind: r.kind || 'text', created_at: r.created_at });
   }
   res.json({ conversations: [...byUser.values()] });
 }));
 
-// POST /api/products/factory/admin/messages/:id/reply {body} — admin cevap gonderir (sender='admin'); :id = user_id
+// POST /api/products/factory/admin/messages/:id/reply {body?, attachment_url?, kind?} — admin cevap gonderir (sender='admin'); :id = user_id
 router.post('/factory/admin/messages/:id/reply', requireAuth, requireAdmin,
   param('id').isInt({ min: 1 }),
-  body('body').trim().isLength({ min: 1, max: 1000 }),
+  body('body').optional().trim().isLength({ max: 1000 }),
+  body('attachment_url').optional().isString().isLength({ max: 2048 }),
+  body('kind').optional().isIn(['text', 'image']),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     await ensureFactoryMessagesTable();
     const userId = parseInt(req.params.id, 10);
     const { rows: urows } = await pool.query('SELECT id FROM users WHERE id = $1', [userId]);
     if (!urows.length) return res.status(404).json({ error: 'user_not_found' });
+    const text = (req.body.body || '').trim();
+    const attachmentUrl = typeof req.body.attachment_url === 'string' ? req.body.attachment_url.trim() : '';
+    let kind = req.body.kind === 'image' ? 'image' : 'text';
+    if (attachmentUrl) {
+      if (!factoryMsgAttachmentOk(attachmentUrl)) return res.status(400).json({ error: 'invalid_attachment_url' });
+      kind = 'image';
+    } else if (!text) {
+      return res.status(400).json({ error: 'empty_message' });
+    }
     const { rows } = await pool.query(
-      `INSERT INTO factory_messages (user_id, body, sender) VALUES ($1, $2, 'admin') RETURNING id, user_id, body, sender, created_at`,
-      [userId, req.body.body.trim()]
+      `INSERT INTO factory_messages (user_id, body, sender, attachment_url, kind) VALUES ($1, $2, 'admin', $3, $4) RETURNING id, user_id, body, sender, attachment_url, kind, created_at`,
+      [userId, text, attachmentUrl || null, kind]
     );
     res.status(201).json({ message: rows[0] });
+  })
+);
+
+// POST /api/products/factory/chat-upload — CBAI sohbetine resim yukle (giris yapmis kullanici)
+// On yuz FormData ile gonderir (alan: `file`); ham resim govdesi de kabul edilir.
+// Multer pakette yok — multipart siniri (boundary) elle cozumlenir, yeni bagimlilik yok.
+// Yalnizca jpg/png/webp/gif, en fazla 10MB, sihirli bayt kontrolu, rastgele ad.
+// Dosya src/uploads/factory-chat/ altina kaydedilir, herkese acik URL doner.
+// Donen URL'in calismasi icin index.js'de /uploads static sunumu gerekir (v630'da eklendi).
+const CHAT_UPLOAD_DIR = path.join(__dirname, '..', 'uploads', 'factory-chat');
+const CHAT_UPLOAD_MAX = 10 * 1024 * 1024; // 10 MB
+const CHAT_UPLOAD_MIME = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif' };
+
+function chatUploadMagicOk(buf, mime) {
+  if (!Buffer.isBuffer(buf) || buf.length < 4) return false;
+  if (mime === 'image/jpeg') return buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
+  if (mime === 'image/png') return buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47 && buf[4] === 0x0d && buf[5] === 0x0a && buf[6] === 0x1a && buf[7] === 0x0a;
+  if (mime === 'image/gif') return buf.toString('ascii', 0, 6) === 'GIF87a' || buf.toString('ascii', 0, 6) === 'GIF89a';
+  if (mime === 'image/webp') return buf.length >= 12 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP';
+  return false;
+}
+
+// Multipart (FormData) govdeden `file` alanini cikarir — Buffer uzerinde calisir, ikili veri bozulmaz.
+function parseMultipartFile(buf, contentType) {
+  const m = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(contentType || '');
+  const boundary = m && (m[1] || m[2] || '').trim();
+  if (!boundary) return null;
+  const delim = Buffer.from('--' + boundary);
+  let idx = buf.indexOf(delim);
+  if (idx < 0) return null;
+  let pos = idx + delim.length;
+  while (pos < buf.length) {
+    if (buf[pos] === 0x0d && buf[pos + 1] === 0x0a) pos += 2;
+    else if (buf[pos] === 0x0a) pos += 1;
+    if (buf[pos] === 0x2d && buf[pos + 1] === 0x2d) break; // kapanis siniri
+    const headerEnd = buf.indexOf('\r\n\r\n', pos);
+    if (headerEnd < 0) break;
+    const headers = buf.subarray(pos, headerEnd).toString('latin1');
+    const dataStart = headerEnd + 4;
+    const nextDelim = Buffer.from('\r\n--' + boundary);
+    let dataEnd = buf.indexOf(nextDelim, dataStart);
+    if (dataEnd < 0) {
+      dataEnd = buf.indexOf(delim, dataStart);
+      if (dataEnd < 0) break;
+    }
+    const nameMatch = /name="([^"]*)"/i.exec(headers);
+    if (nameMatch && nameMatch[1] === 'file') {
+      const typeMatch = /content-type:\s*([^\r\n;]+)/i.exec(headers);
+      return {
+        data: Buffer.from(buf.subarray(dataStart, dataEnd)),
+        contentType: typeMatch ? typeMatch[1].trim().toLowerCase() : '',
+      };
+    }
+    pos = dataEnd + nextDelim.length;
+  }
+  return null;
+}
+
+// Ham govde cozumleyicisi: boyut asimi global 500'e degil 413'e donsun.
+function rawBodyParser(opts) {
+  const parser = express.raw(opts);
+  return (req, res, next) => {
+    parser(req, res, (err) => {
+      if (err) {
+        if (err.type === 'entity.too.large') return res.status(413).json({ error: 'file_too_large' });
+        return res.status(400).json({ error: 'invalid_body' });
+      }
+      next();
+    });
+  };
+}
+
+router.post(
+  '/factory/chat-upload',
+  requireAuth,
+  rawBodyParser({ type: '*/*', limit: '11mb' }),
+  asyncHandler(async (req, res) => {
+    const ct = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+    let file = null;
+    if (ct === 'multipart/form-data') {
+      if (!Buffer.isBuffer(req.body)) return res.status(400).json({ error: 'invalid_body' });
+      file = parseMultipartFile(req.body, String(req.headers['content-type'] || ''));
+      if (!file) return res.status(400).json({ error: 'empty_file' });
+    } else if (CHAT_UPLOAD_MIME[ct]) {
+      if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: 'empty_file' });
+      file = { data: req.body, contentType: ct };
+    } else {
+      return res.status(415).json({ error: 'invalid_content_type' });
+    }
+    const mime = file.contentType;
+    if (!CHAT_UPLOAD_MIME[mime]) return res.status(415).json({ error: 'invalid_content_type' });
+    if (file.data.length > CHAT_UPLOAD_MAX) return res.status(413).json({ error: 'file_too_large' });
+    if (!chatUploadMagicOk(file.data, mime)) return res.status(415).json({ error: 'invalid_file' });
+    await fs.promises.mkdir(CHAT_UPLOAD_DIR, { recursive: true });
+    const name = 'chat-' + Date.now() + '-' + crypto.randomBytes(8).toString('hex') + '.' + CHAT_UPLOAD_MIME[mime];
+    await fs.promises.writeFile(path.join(CHAT_UPLOAD_DIR, name), file.data);
+    const base = req.protocol + '://' + req.get('host');
+    res.status(201).json({ ok: true, url: base + '/uploads/factory-chat/' + name, size: file.data.length });
   })
 );
 
