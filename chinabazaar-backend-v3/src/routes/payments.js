@@ -111,6 +111,164 @@ async function ensureFactorySubscriptions() {
 // PayTR paneline kaydedilecek callback adresi (sabit: Railway uretim adresi)
 const FACTORY_CALLBACK_URL = 'https://grand-creativity-production-5ef5.up.railway.app/api/payments/factory-subscription/callback';
 
+// v620: Abonelik planlari (monthly / yearly) — SADECE EKLEME.
+// Asagidaki uc rota, mevcut plan-siz rotalarin ONUNE kayitlidir. Express
+// rotalari kayit sirasina gore eslestirdigi icin bu plan-aware surumler
+// calisir; eski handler'lar aynen durur (hicbir satirina dokunulmadi).
+// Eski davranis korunur: plan verilmezse 'monthly' (5 USD / 30 gun) varsayilir.
+const FACTORY_SUBSCRIPTION_PLANS = {
+  monthly: { amount: 500, days: 30, label: 'My Factory 30 Gunluk Erisim' },
+  yearly: { amount: 6000, days: 365, label: 'My Factory 365 Gunluk Erisim' },
+};
+function factoryPlanOf(value) {
+  if (value === 'yearly') return 'yearly';
+  return 'monthly';
+}
+async function ensureFactorySubscriptionPlanColumn() {
+  await ensureFactorySubscriptions();
+  await pool.query(`ALTER TABLE factory_subscriptions ADD COLUMN IF NOT EXISTS plan TEXT DEFAULT 'monthly'`);
+}
+
+// v620 POST /api/payments/factory-subscription/callback (plan-aware; eski callback'in onu)
+// Eski callback ile ayni sozlesme: hash dogrulamasi, idempotent (pending degilse OK,
+// ends_at uzatilmez). Fark: tutar kontrolu aboneligin plan tutariyla yapilir ve
+// basarida ends_at = started_at + plan suresi (monthly 30 gun / yearly 365 gun).
+router.post(
+  '/factory-subscription/callback',
+  express.urlencoded({ extended: false }),
+  asyncHandler(async (req, res) => {
+    const { merchant_oid, status, total_amount, hash } = req.body || {};
+    if (!paytr.verifyCallback({ merchant_oid, status, total_amount, hash })) {
+      return res.status(400).send('INVALID_HASH');
+    }
+    const ok = status === 'success';
+    await ensureFactorySubscriptionPlanColumn();
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query(
+        'SELECT * FROM factory_subscriptions WHERE paytr_merchant_oid = $1 FOR UPDATE',
+        [merchant_oid]
+      );
+      const sub = rows[0];
+      if (!sub) {
+        await client.query('ROLLBACK');
+        return res.status(404).send('NOT_FOUND');
+      }
+      if (sub.status !== 'pending') {
+        await client.query('ROLLBACK');
+        return res.send('OK'); // tekrar bildirimi — ends_at iki kez uzatilmez
+      }
+      if (!ok) {
+        await client.query(`UPDATE factory_subscriptions SET status='failed', updated_at=now() WHERE id=$1`, [sub.id]);
+        await client.query('COMMIT');
+        return res.send('OK');
+      }
+      // Tutar kontrolu: o aboneligin PLANININ tutariyla (yalniz 500 degil)
+      const plan = factoryPlanOf(sub.plan);
+      const expectedAmount = FACTORY_SUBSCRIPTION_PLANS[plan].amount;
+      if (String(total_amount) !== String(expectedAmount)) {
+        await client.query(`UPDATE factory_subscriptions SET status='failed', updated_at=now() WHERE id=$1`, [sub.id]);
+        await client.query('COMMIT');
+        return res.send('OK');
+      }
+      await client.query(
+        `UPDATE factory_subscriptions SET status='active', started_at=now(), ends_at=now() + make_interval(days => $1), updated_at=now() WHERE id=$2`,
+        [FACTORY_SUBSCRIPTION_PLANS[plan].days, sub.id]
+      );
+      await client.query('COMMIT');
+      return res.send('OK');
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  })
+);
+
+// v620 POST /api/payments/factory-subscription/create (plan-aware; eski create'in onu)
+// -> { merchant_oid, paytr_token, iframe_url, plan }
+// { plan: 'monthly' | 'yearly' } kabul eder; plan yoksa varsayilan 'monthly'.
+// Bekleyen abonelik AYNI plandaysa ayni merchant_oid doner; farkli planda yeni satir acilir.
+router.post(
+  '/factory-subscription/create',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    await ensureFactorySubscriptionPlanColumn();
+    if (!paytr.isEnabled()) return res.status(503).json({ error: 'paytr_disabled' });
+    const rawPlan = req.body && req.body.plan;
+    if (rawPlan !== undefined && rawPlan !== 'monthly' && rawPlan !== 'yearly') {
+      return res.status(400).json({ error: 'invalid_plan' });
+    }
+    const plan = factoryPlanOf(rawPlan);
+    const planSpec = FACTORY_SUBSCRIPTION_PLANS[plan];
+    const { rows: users } = await pool.query('SELECT id, email, name, phone FROM users WHERE id = $1', [req.user.id]);
+    const user = users[0];
+    if (!user) return res.status(404).json({ error: 'user_not_found' });
+    let merchantOid;
+    const { rows: pend } = await pool.query(
+      `SELECT * FROM factory_subscriptions WHERE user_id = $1 AND status = 'pending' AND COALESCE(plan, 'monthly') = $2 ORDER BY created_at DESC LIMIT 1`,
+      [req.user.id, plan]
+    );
+    if (pend.length) {
+      merchantOid = pend[0].paytr_merchant_oid;
+    } else {
+      merchantOid = 'MF' + req.user.id + '-' + Date.now() + '-' + crypto.randomBytes(4).toString('hex');
+      await pool.query(
+        `INSERT INTO factory_subscriptions (user_id, status, paytr_merchant_oid, amount, currency, plan) VALUES ($1, 'pending', $2, $3, 'USD', $4)`,
+        [req.user.id, merchantOid, planSpec.amount, plan]
+      );
+    }
+    let result;
+    try {
+      result = await paytr.initPayment({
+        merchantOid,
+        userIp: clientIp(req),
+        email: user.email,
+        userName: user.name || '',
+        userAddress: '',
+        userPhone: user.phone || '',
+        totalCents: planSpec.amount,
+        currency: 'USD',
+        items: [{ name: planSpec.label, price_cents: planSpec.amount, qty: 1 }],
+        okUrl: FACTORY_CALLBACK_URL,
+        failUrl: FACTORY_CALLBACK_URL,
+      });
+    } catch (e) {
+      await pool.query(`UPDATE factory_subscriptions SET status='failed', updated_at=now() WHERE paytr_merchant_oid=$1 AND status='pending'`, [merchantOid]);
+      return res.status(502).json({ error: 'paytr_init_failed' });
+    }
+    res.json({ merchant_oid: merchantOid, paytr_token: result.token, iframe_url: result.iframeUrl, plan });
+  })
+);
+
+// v620 GET /api/payments/factory-subscription/status (plan-aware; eski status'un onu)
+// -> { active, ends_at, plan } — plan 'monthly' | 'yearly'; plani olmayan eski satir 'monthly' sayilir.
+// v620 duzeltme: aktif abonelik varsa (aylik VEYA yillik) o doner; yoksa en son abonelik.
+// (En son aboneligi dondurmek, aylik aktifken basarisiz yillik denemesinde yanlis "pasif" gosteriyordu.)
+router.get(
+  '/factory-subscription/status',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    await ensureFactorySubscriptionPlanColumn();
+    let { rows } = await pool.query(
+      `SELECT * FROM factory_subscriptions WHERE user_id = $1 AND status='active' AND ends_at > now() ORDER BY ends_at DESC LIMIT 1`,
+      [req.user.id]
+    );
+    if (!rows.length) {
+      ({ rows } = await pool.query(
+        `SELECT * FROM factory_subscriptions WHERE user_id = $1 ORDER BY created_at DESC, id DESC LIMIT 1`,
+        [req.user.id]
+      ));
+    }
+    const sub = rows[0];
+    if (!sub) return res.json({ active: false, ends_at: null, plan: 'monthly' });
+    const active = sub.status === 'active' && sub.ends_at && new Date(sub.ends_at).getTime() > Date.now();
+    res.json({ active: !!active, ends_at: sub.ends_at || null, plan: factoryPlanOf(sub.plan) });
+  })
+);
+
 // ---- My Factory abonelik geri bildirimi (auth'suz; PayTR sunucusu cagirir, form-encoded) ----
 // Dogrulama: canli /paytr/callback ile ayni paytr.verifyCallback (merchantSalt ile hash).
 // FARK: canli siparis callback'indeki PayTR IP izin listesi burada uygulanmaz —

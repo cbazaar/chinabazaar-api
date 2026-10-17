@@ -320,6 +320,14 @@ async function ensureFactoryTables() {
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_favorites (id SERIAL PRIMARY KEY, user_id INT NOT NULL, video_key TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now(), UNIQUE(user_id, video_key))`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_subscriptions (id SERIAL PRIMARY KEY, user_id INT NOT NULL, status TEXT DEFAULT 'pending', started_at TIMESTAMPTZ, ends_at TIMESTAMPTZ, paytr_merchant_oid TEXT UNIQUE, amount INT, currency TEXT DEFAULT 'USD', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now())`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factories (id SERIAL PRIMARY KEY, name TEXT NOT NULL, city TEXT DEFAULT '', category TEXT DEFAULT '', description TEXT DEFAULT '', moq INT DEFAULT 0, stock INT DEFAULT 0, capacity TEXT DEFAULT '', certs TEXT DEFAULT '', videos JSONB DEFAULT '[]', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now())`);
+  await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS hashtags TEXT DEFAULT ''`);
+  await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS address TEXT DEFAULT ''`);
+  await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS phone TEXT DEFAULT ''`);
+  await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS contact TEXT DEFAULT ''`);
+  await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS wechat TEXT DEFAULT ''`);
+  await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS whatsapp TEXT DEFAULT ''`);
+  await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS socials JSONB DEFAULT '{}'`);
+  await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS tags TEXT DEFAULT ''`);
 }
 
 const FACTORY_VIDEO_RE = /^\d+-\d+$/;
@@ -347,11 +355,89 @@ function toFactoryPublic(r) {
     stock: r.stock ?? 0,
     capacity: r.capacity || '',
     certs: r.certs || '',
+    hashtags: r.hashtags || '',
+    address: r.address || '',
+    phone: r.phone || '',
+    contact: r.contact || '',
+    wechat: r.wechat || '',
+    whatsapp: r.whatsapp || '',
+    socials: parseFactorySocials(r.socials),
+    tags: r.tags || '',
     videos,
   };
 }
 function toFactoryAdmin(r) {
   return { ...toFactoryPublic(r), created_at: r.created_at, updated_at: r.updated_at };
+}
+
+// v5: fabrika sosyal aglari — {youtube, facebook, tiktok, instagram}; yalniz http(s) URL kabul edilir
+function parseFactorySocials(v) {
+  let o = v;
+  if (typeof o === 'string') { try { o = JSON.parse(o); } catch { return { youtube: '', facebook: '', tiktok: '', instagram: '' }; } }
+  if (!o || typeof o !== 'object' || Array.isArray(o)) return { youtube: '', facebook: '', tiktok: '', instagram: '' };
+  const pick = (k) => (typeof o[k] === 'string' ? o[k].trim() : '');
+  return { youtube: pick('youtube'), facebook: pick('facebook'), tiktok: pick('tiktok'), instagram: pick('instagram') };
+}
+
+// v5: duz string alan — undefined => dokunma, gecersiz/uzun => null (handler 400 doner)
+function cleanFactoryText(v, max) {
+  if (v === undefined) return undefined;
+  if (typeof v !== 'string') return null;
+  const t = v.trim();
+  if (t.length > max) return null;
+  return t;
+}
+
+// v5: socials — obje veya JSON string; her URL bos veya http(s) ile baslamali, aksi halde null (400)
+function cleanFactorySocials(v) {
+  if (v === undefined) return undefined;
+  let o = v;
+  if (typeof o === 'string') { try { o = JSON.parse(o); } catch { return null; } }
+  if (!o || typeof o !== 'object' || Array.isArray(o)) return null;
+  const out = {};
+  for (const k of ['youtube', 'facebook', 'tiktok', 'instagram']) {
+    const val = o[k];
+    if (val === undefined || val === null) { out[k] = ''; continue; }
+    if (typeof val !== 'string') return null;
+    const t = val.trim();
+    if (t.length > 2048) return null;
+    if (t !== '' && !/^https?:\/\//i.test(t)) return null;
+    out[k] = t;
+  }
+  return out;
+}
+
+// v5: etiketler — virgullu duz string (hashtag degil, basina # eklenmez), tekrarlar atilir
+function cleanFactoryTags(v) {
+  if (v === undefined) return undefined;
+  const arr = Array.isArray(v) ? v : (typeof v === 'string' ? v.split(',') : null);
+  if (arr === null) return null;
+  const out = [];
+  for (const it of arr) {
+    if (typeof it !== 'string') return null;
+    const t = it.trim();
+    if (!t) continue;
+    if (!out.includes(t)) out.push(t);
+  }
+  if (out.join(', ').length > 2000) return null;
+  return out.join(', ');
+}
+
+// hashtags: dizi veya virgullu string — normalize et (basina # ekle, tekrarlari at), gecersizse null
+function cleanFactoryHashtags(v) {
+  if (v === undefined) return undefined;
+  const arr = Array.isArray(v) ? v : (typeof v === 'string' ? v.split(',') : null);
+  if (arr === null) return null;
+  const out = [];
+  for (const it of arr) {
+    if (typeof it !== 'string') return null;
+    let t = it.trim();
+    if (!t) continue;
+    if (t.charAt(0) !== '#') t = '#' + t;
+    if (!out.includes(t)) out.push(t);
+  }
+  if (out.join(', ').length > 2000) return null;
+  return out.join(', ');
 }
 
 // videos: [{title?, url, kind}] — gecersiz oge varsa null (handler 400 doner)
@@ -495,7 +581,32 @@ const factoryValidators = [
     if (Array.isArray(v) && v.every((x) => typeof x === 'string')) { if (v.join(', ').length > 2000) throw new Error('invalid_certs'); return true; }
     throw new Error('invalid_certs');
   }),
+  body('hashtags').optional().custom((v) => {
+    if (typeof v === 'string') { if (v.length > 2000) throw new Error('invalid_hashtags'); return true; }
+    if (Array.isArray(v) && v.every((x) => typeof x === 'string')) { if (v.join(', ').length > 2000) throw new Error('invalid_hashtags'); return true; }
+    throw new Error('invalid_hashtags');
+  }),
   body('videos').optional().isArray(),
+  body('address').optional().trim().isLength({ max: 500 }),
+  body('phone').optional().trim().isLength({ max: 200 }),
+  body('contact').optional().trim().isLength({ max: 200 }),
+  body('wechat').optional().trim().isLength({ max: 200 }),
+  body('whatsapp').optional().trim().isLength({ max: 200 }),
+  body('tags').optional().custom((v) => {
+    if (typeof v === 'string') { if (v.length > 2000) throw new Error('invalid_tags'); return true; }
+    if (Array.isArray(v) && v.every((x) => typeof x === 'string')) { if (v.join(', ').length > 2000) throw new Error('invalid_tags'); return true; }
+    throw new Error('invalid_tags');
+  }),
+  body('socials').optional().custom((v) => {
+    if (typeof v === 'string') { try { v = JSON.parse(v); } catch { throw new Error('invalid_socials'); } }
+    if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error('invalid_socials');
+    for (const k of ['youtube', 'facebook', 'tiktok', 'instagram']) {
+      const val = v[k];
+      if (val === undefined || val === null || val === '') continue;
+      if (typeof val !== 'string' || val.trim().length > 2048 || !/^https?:\/\//i.test(val.trim())) throw new Error('invalid_socials');
+    }
+    return true;
+  }),
 ];
 
 // POST /api/products/factory/admin — fabrika ekle (admin)
@@ -507,9 +618,25 @@ router.post('/factory/admin', requireAuth, requireAdmin,
     await ensureFactoryTables();
     const videos = cleanFactoryVideos(req.body.videos);
     if (videos === null) return res.status(400).json({ error: 'invalid_videos' });
+    const hashtagsClean = cleanFactoryHashtags(req.body.hashtags);
+    if (hashtagsClean === null) return res.status(400).json({ error: 'invalid_hashtags' });
+    const addressClean = cleanFactoryText(req.body.address, 500);
+    if (addressClean === null) return res.status(400).json({ error: 'invalid_address' });
+    const phoneClean = cleanFactoryText(req.body.phone, 200);
+    if (phoneClean === null) return res.status(400).json({ error: 'invalid_phone' });
+    const contactClean = cleanFactoryText(req.body.contact, 200);
+    if (contactClean === null) return res.status(400).json({ error: 'invalid_contact' });
+    const wechatClean = cleanFactoryText(req.body.wechat, 200);
+    if (wechatClean === null) return res.status(400).json({ error: 'invalid_wechat' });
+    const whatsappClean = cleanFactoryText(req.body.whatsapp, 200);
+    if (whatsappClean === null) return res.status(400).json({ error: 'invalid_whatsapp' });
+    const socialsClean = cleanFactorySocials(req.body.socials);
+    if (socialsClean === null) return res.status(400).json({ error: 'invalid_socials' });
+    const tagsClean = cleanFactoryTags(req.body.tags);
+    if (tagsClean === null) return res.status(400).json({ error: 'invalid_tags' });
     const { rows } = await pool.query(
-      `INSERT INTO factories (name, city, category, description, moq, stock, capacity, certs, videos)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb) RETURNING *`,
+      `INSERT INTO factories (name, city, category, description, moq, stock, capacity, certs, videos, hashtags)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10) RETURNING *`,
       [
         String(req.body.name).trim(),
         typeof req.body.city === 'string' ? req.body.city.trim() : '',
@@ -520,8 +647,23 @@ router.post('/factory/admin', requireAuth, requireAdmin,
         typeof req.body.capacity === 'string' ? req.body.capacity.trim() : '',
         Array.isArray(req.body.certs) ? req.body.certs.map((x) => String(x).trim()).filter(Boolean).join(', ') : (typeof req.body.certs === 'string' ? req.body.certs.trim() : ''),
         JSON.stringify(videos === undefined ? [] : videos),
+        hashtagsClean === undefined ? '' : hashtagsClean,
       ]
     );
+    if (addressClean !== undefined || phoneClean !== undefined || contactClean !== undefined || wechatClean !== undefined || whatsappClean !== undefined || socialsClean !== undefined || tagsClean !== undefined) {
+      const updSets = [];
+      const updParams = [rows[0].id];
+      const updPush = (col, val, cast) => { updParams.push(val); updSets.push(`${col} = $${updParams.length}${cast || ''}`); };
+      if (addressClean !== undefined) updPush('address', addressClean);
+      if (phoneClean !== undefined) updPush('phone', phoneClean);
+      if (contactClean !== undefined) updPush('contact', contactClean);
+      if (wechatClean !== undefined) updPush('wechat', wechatClean);
+      if (whatsappClean !== undefined) updPush('whatsapp', whatsappClean);
+      if (socialsClean !== undefined) updPush('socials', JSON.stringify(socialsClean), '::jsonb');
+      if (tagsClean !== undefined) updPush('tags', tagsClean);
+      const upd = await pool.query(`UPDATE factories SET ${updSets.join(', ')} WHERE id = $1 RETURNING *`, updParams);
+      if (upd.rows.length) rows[0] = upd.rows[0];
+    }
     res.status(201).json(toFactoryAdmin(rows[0]));
   })
 );
@@ -545,6 +687,46 @@ router.put('/factory/admin/:id', requireAuth, requireAdmin,
     if (req.body.stock !== undefined) push('stock', req.body.stock == null ? 0 : parseInt(req.body.stock, 10));
     if (req.body.capacity !== undefined) push('capacity', String(req.body.capacity).trim());
     if (req.body.certs !== undefined) push('certs', Array.isArray(req.body.certs) ? req.body.certs.map((x) => String(x).trim()).filter(Boolean).join(', ') : String(req.body.certs).trim());
+    if (req.body.hashtags !== undefined) {
+      const hashtagsClean = cleanFactoryHashtags(req.body.hashtags);
+      if (hashtagsClean === null) return res.status(400).json({ error: 'invalid_hashtags' });
+      push('hashtags', hashtagsClean);
+    }
+    if (req.body.address !== undefined) {
+      const c = cleanFactoryText(req.body.address, 500);
+      if (c === null) return res.status(400).json({ error: 'invalid_address' });
+      push('address', c);
+    }
+    if (req.body.phone !== undefined) {
+      const c = cleanFactoryText(req.body.phone, 200);
+      if (c === null) return res.status(400).json({ error: 'invalid_phone' });
+      push('phone', c);
+    }
+    if (req.body.contact !== undefined) {
+      const c = cleanFactoryText(req.body.contact, 200);
+      if (c === null) return res.status(400).json({ error: 'invalid_contact' });
+      push('contact', c);
+    }
+    if (req.body.wechat !== undefined) {
+      const c = cleanFactoryText(req.body.wechat, 200);
+      if (c === null) return res.status(400).json({ error: 'invalid_wechat' });
+      push('wechat', c);
+    }
+    if (req.body.whatsapp !== undefined) {
+      const c = cleanFactoryText(req.body.whatsapp, 200);
+      if (c === null) return res.status(400).json({ error: 'invalid_whatsapp' });
+      push('whatsapp', c);
+    }
+    if (req.body.socials !== undefined) {
+      const c = cleanFactorySocials(req.body.socials);
+      if (c === null) return res.status(400).json({ error: 'invalid_socials' });
+      push('socials', JSON.stringify(c), '::jsonb');
+    }
+    if (req.body.tags !== undefined) {
+      const c = cleanFactoryTags(req.body.tags);
+      if (c === null) return res.status(400).json({ error: 'invalid_tags' });
+      push('tags', c);
+    }
     if (req.body.videos !== undefined) {
       const videos = cleanFactoryVideos(req.body.videos);
       if (videos === null) return res.status(400).json({ error: 'invalid_videos' });
@@ -578,6 +760,72 @@ router.get('/factory/admin/subscriptions', requireAuth, requireAdmin, asyncHandl
   res.json(rows.map((r) => ({ id: r.id, user_id: r.user_id, name: r.name || '', email: r.email || null, status: r.status, started_at: r.started_at, ends_at: r.ends_at, amount: r.amount, currency: r.currency })));
 }));
 
+
+// v620: Factory mesajlasma (CBAI — SADECE MyFactory'den gelen konusmalar; magaza CBAI'ndan ayri)
+// Tum /factory/* rotalari GET /:id ONCESINE kayitli — /:id bunlari yutmaz.
+// E-posta adresleri hicbir yanitta donulmez (isim/nickname yeterli).
+async function ensureFactoryMessagesTable() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS factory_messages (id SERIAL PRIMARY KEY, user_id INT NOT NULL, body TEXT NOT NULL, sender TEXT NOT NULL DEFAULT 'user', created_at TIMESTAMPTZ DEFAULT now())`);
+}
+
+// POST /api/products/factory/messages {body} — kullanici mesaj gonderir (sender='user')
+router.post('/factory/messages', requireAuth,
+  body('body').trim().isLength({ min: 1, max: 1000 }),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    await ensureFactoryMessagesTable();
+    const { rows } = await pool.query(
+      `INSERT INTO factory_messages (user_id, body, sender) VALUES ($1, $2, 'user') RETURNING id, user_id, body, sender, created_at`,
+      [req.user.id, req.body.body.trim()]
+    );
+    res.status(201).json({ message: rows[0] });
+  })
+);
+
+// GET /api/products/factory/messages — giris yapan kullanicinin kendi konusmasi (eskiden yeniye)
+router.get('/factory/messages', requireAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryMessagesTable();
+  const { rows } = await pool.query(
+    `SELECT id, user_id, body, sender, created_at FROM factory_messages WHERE user_id=$1 ORDER BY created_at ASC, id ASC`,
+    [req.user.id]
+  );
+  res.json({ messages: rows });
+}));
+
+// GET /api/products/factory/admin/messages — tum konusmalar, kullaniciya gore gruplu (admin)
+router.get('/factory/admin/messages', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  await ensureFactoryMessagesTable();
+  const { rows } = await pool.query(
+    `SELECT m.id, m.user_id, m.body, m.sender, m.created_at,
+            COALESCE(NULLIF(u.nickname,''), NULLIF(u.name,''), split_part(u.email,'@',1), 'Misafir') AS name
+     FROM factory_messages m LEFT JOIN users u ON u.id = m.user_id
+     ORDER BY m.user_id ASC, m.created_at ASC, m.id ASC`
+  );
+  const byUser = new Map();
+  for (const r of rows) {
+    if (!byUser.has(r.user_id)) byUser.set(r.user_id, { user_id: r.user_id, name: r.name || 'Misafir', messages: [] });
+    byUser.get(r.user_id).messages.push({ id: r.id, body: r.body, sender: r.sender, created_at: r.created_at });
+  }
+  res.json({ conversations: [...byUser.values()] });
+}));
+
+// POST /api/products/factory/admin/messages/:id/reply {body} — admin cevap gonderir (sender='admin'); :id = user_id
+router.post('/factory/admin/messages/:id/reply', requireAuth, requireAdmin,
+  param('id').isInt({ min: 1 }),
+  body('body').trim().isLength({ min: 1, max: 1000 }),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    await ensureFactoryMessagesTable();
+    const userId = parseInt(req.params.id, 10);
+    const { rows: urows } = await pool.query('SELECT id FROM users WHERE id = $1', [userId]);
+    if (!urows.length) return res.status(404).json({ error: 'user_not_found' });
+    const { rows } = await pool.query(
+      `INSERT INTO factory_messages (user_id, body, sender) VALUES ($1, $2, 'admin') RETURNING id, user_id, body, sender, created_at`,
+      [userId, req.body.body.trim()]
+    );
+    res.status(201).json({ message: rows[0] });
+  })
+);
 
 // GET /api/products/:id
 // GET /api/products/liked — kullanıcının beğendiği ürünler (profil: Beğendiğim Videolar, v570)
