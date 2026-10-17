@@ -645,11 +645,11 @@ router.post(
 );
 
 // v639: Cloudflare Stream — kalici fabrika videosu (Railway diski gecici oldugu icin).
-// Kimlik bilgileri Railway env'den: CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_STREAM_TOKEN.
+// Kimlik bilgileri Railway env'den: CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_STREAM_TOKEN (eski ad CLOUDFLARE_STREAM_API_TOKEN yedek olarak da kabul edilir).
 // Env eksikse 503 stream_not_configured; jeton ASLA yanita yazilmaz.
 function cfStreamCfg() {
   const accountId = process.env.CLOUDFLARE_ACCOUNT_ID || '';
-  const token = process.env.CLOUDFLARE_STREAM_TOKEN || '';
+  const token = process.env.CLOUDFLARE_STREAM_TOKEN || process.env.CLOUDFLARE_STREAM_API_TOKEN || ''; // eski ad yedekte (ikisi de kabul edilir)
   if (!accountId || !token) return null;
   return { accountId, token };
 }
