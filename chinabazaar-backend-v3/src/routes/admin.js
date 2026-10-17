@@ -644,4 +644,70 @@ router.post(
   })
 );
 
+// v639: Cloudflare Stream — kalici fabrika videosu (Railway diski gecici oldugu icin).
+// Kimlik bilgileri Railway env'den: CLOUDFLARE_ACCOUNT_ID + CLOUDFLARE_STREAM_TOKEN.
+// Env eksikse 503 stream_not_configured; jeton ASLA yanita yazilmaz.
+function cfStreamCfg() {
+  const accountId = process.env.CLOUDFLARE_ACCOUNT_ID || '';
+  const token = process.env.CLOUDFLARE_STREAM_TOKEN || '';
+  if (!accountId || !token) return null;
+  return { accountId, token };
+}
+
+async function cfStreamCall(accountId, token, path, method, body) {
+  const r = await fetch('https://api.cloudflare.com/client/v4/accounts/' + accountId + '/stream' + path, {
+    method,
+    headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  let data = null;
+  try { data = await r.json(); } catch (e) { data = null; }
+  return { ok: r.ok && !!(data && data.success), status: r.status, data };
+}
+
+// POST /api/admin/stream-upload-url — Cloudflare direct_upload: {uploadURL, uid}
+router.post(
+  '/stream-upload-url',
+  asyncHandler(async (_req, res) => {
+    const cfg = cfStreamCfg();
+    if (!cfg) return res.status(503).json({ error: 'stream_not_configured' });
+    let out;
+    try {
+      out = await cfStreamCall(cfg.accountId, cfg.token, '/direct_upload', 'POST', { maxDurationSeconds: 3600 });
+    } catch (e) {
+      console.error('stream-upload-url upstream error:', e.message);
+      return res.status(502).json({ error: 'stream_upstream' });
+    }
+    if (!out.ok || !out.data || !out.data.result || !out.data.result.uploadURL || !out.data.result.uid) {
+      console.error('stream-upload-url upstream status:', out.status, JSON.stringify((out.data && out.data.errors) || null));
+      return res.status(502).json({ error: 'stream_upstream' });
+    }
+    res.json({ uploadURL: out.data.result.uploadURL, uid: out.data.result.uid });
+  })
+);
+
+// POST /api/admin/stream-download-url {uid} — MP4 indirme adresi: {url, status}
+router.post(
+  '/stream-download-url',
+  asyncHandler(async (req, res) => {
+    const uid = String((req.body && req.body.uid) || '').trim();
+    if (!uid) return res.status(400).json({ error: 'invalid_uid' });
+    const cfg = cfStreamCfg();
+    if (!cfg) return res.status(503).json({ error: 'stream_not_configured' });
+    let out;
+    try {
+      out = await cfStreamCall(cfg.accountId, cfg.token, '/' + encodeURIComponent(uid) + '/downloads', 'POST', undefined);
+    } catch (e) {
+      console.error('stream-download-url upstream error:', e.message);
+      return res.status(502).json({ error: 'stream_upstream' });
+    }
+    if (!out.ok || !out.data || !out.data.result) {
+      console.error('stream-download-url upstream status:', out.status, JSON.stringify((out.data && out.data.errors) || null));
+      return res.status(502).json({ error: 'stream_upstream' });
+    }
+    const d = out.data.result.default || null;
+    res.json({ url: d ? d.url || null : null, status: d ? d.status || 'unknown' : 'unknown' });
+  })
+);
+
 module.exports = router;
