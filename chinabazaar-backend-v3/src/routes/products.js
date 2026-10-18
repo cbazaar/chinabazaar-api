@@ -320,9 +320,24 @@ async function ensureFactoryTables() {
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_likes (id SERIAL PRIMARY KEY, user_id INT NOT NULL, video_key TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now(), UNIQUE(user_id, video_key))`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_comments (id SERIAL PRIMARY KEY, user_id INT NOT NULL, video_key TEXT NOT NULL, body TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now())`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_favorites (id SERIAL PRIMARY KEY, user_id INT NOT NULL, video_key TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now(), UNIQUE(user_id, video_key))`);
+  // v115: şema onarımı — tablo eski bir sürümle oluşmuşsa (eksik sütun / eksik UNIQUE) eksikleri tamamla.
+  // CREATE TABLE IF NOT EXISTS eski tabloya dokunmaz; bu ALTER'lar olmadan eski tabloda her sorgu 500 verirdi.
+  await pool.query(`ALTER TABLE factory_likes ADD COLUMN IF NOT EXISTS user_id INT NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE factory_likes ADD COLUMN IF NOT EXISTS video_key TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE factory_comments ADD COLUMN IF NOT EXISTS user_id INT NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE factory_comments ADD COLUMN IF NOT EXISTS video_key TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE factory_comments ADD COLUMN IF NOT EXISTS body TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE factory_favorites ADD COLUMN IF NOT EXISTS user_id INT NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE factory_favorites ADD COLUMN IF NOT EXISTS video_key TEXT NOT NULL DEFAULT ''`);
+  // Tekrarlı (user_id, video_key) satırları UNIQUE index'i kurmayı engeller — önce tekilleştir.
+  await pool.query(`DELETE FROM factory_likes a USING factory_likes b WHERE a.id < b.id AND a.user_id = b.user_id AND a.video_key = b.video_key`);
+  await pool.query(`DELETE FROM factory_favorites a USING factory_favorites b WHERE a.id < b.id AND a.user_id = b.user_id AND a.video_key = b.video_key`);
+  try { await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS factory_likes_user_video_uidx ON factory_likes (user_id, video_key)`); } catch (e) { /* eski şemada index kurulamazsa akış bozulmaz */ }
+  try { await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS factory_favorites_user_video_uidx ON factory_favorites (user_id, video_key)`); } catch (e) { /* eski şemada index kurulamazsa akış bozulmaz */ }
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_video_views (video TEXT PRIMARY KEY, views INT NOT NULL DEFAULT 0)`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS factory_ratings (id SERIAL PRIMARY KEY, factory_id INT NOT NULL REFERENCES factories(id) ON DELETE CASCADE, user_id INT NOT NULL, rating INT NOT NULL CHECK (rating BETWEEN 1 AND 5), created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now(), UNIQUE(factory_id, user_id))`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_subscriptions (id SERIAL PRIMARY KEY, user_id INT NOT NULL, status TEXT DEFAULT 'pending', started_at TIMESTAMPTZ, ends_at TIMESTAMPTZ, paytr_merchant_oid TEXT UNIQUE, amount INT, currency TEXT DEFAULT 'USD', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now())`);
-  await pool.query(`CREATE TABLE IF NOT EXISTS factories (id SERIAL PRIMARY KEY, name TEXT NOT NULL, city TEXT DEFAULT '', category TEXT DEFAULT '', description TEXT DEFAULT '', moq INT DEFAULT 0, stock INT DEFAULT 0, capacity TEXT DEFAULT '', certs TEXT DEFAULT '', videos JSONB DEFAULT '[]', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now())`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS factories (id SERIAL PRIMARY KEY, name TEXT NOT NULL, city TEXT DEFAULT '', category TEXT DEFAULT '', description TEXT DEFAULT '', moq INT DEFAULT 0, stock INT DEFAULT 0, capacity TEXT DEFAULT '', certs TEXT DEFAULT '', features TEXT DEFAULT '', import_countries TEXT DEFAULT '', employees TEXT DEFAULT '', factory_area TEXT DEFAULT '', years TEXT DEFAULT '', main_products TEXT DEFAULT '', videos JSONB DEFAULT '[]', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now())`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS hashtags TEXT DEFAULT ''`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS address TEXT DEFAULT ''`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS phone TEXT DEFAULT ''`);
@@ -332,6 +347,12 @@ async function ensureFactoryTables() {
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS socials JSONB DEFAULT '{}'`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS tags TEXT DEFAULT ''`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE`);
+  await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS features TEXT DEFAULT ''`);
+  await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS import_countries TEXT DEFAULT ''`);
+  await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS employees TEXT DEFAULT ''`);
+  await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS factory_area TEXT DEFAULT ''`);
+  await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS years TEXT DEFAULT ''`);
+  await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS main_products TEXT DEFAULT ''`);
 }
 
 const FACTORY_VIDEO_RE = /^\d+-\d+$/;
@@ -359,6 +380,12 @@ function toFactoryPublic(r) {
     stock: r.stock ?? 0,
     capacity: r.capacity || '',
     certs: r.certs || '',
+    features: r.features || '',
+    import_countries: r.import_countries || '',
+    employees: r.employees || '',
+    factory_area: r.factory_area || '',
+    years: r.years || '',
+    main_products: r.main_products || '',
     hashtags: r.hashtags || '',
     address: r.address || '',
     phone: r.phone || '',
@@ -370,6 +397,35 @@ function toFactoryPublic(r) {
     videos,
   };
 }
+// v55: fabrika puan ortalamalari — tek sorgu, N+1 yok. Yoksa avg=null, count=0.
+async function factoryRatingsMap(ids) {
+  const map = {};
+  const list = (ids || []).filter((x) => Number.isInteger(x));
+  if (!list.length) return map;
+  const { rows } = await pool.query('SELECT factory_id, ROUND(AVG(rating)::numeric, 1)::float AS avg, COUNT(*)::int AS cnt FROM factory_ratings WHERE factory_id = ANY($1) GROUP BY factory_id', [list]);
+  for (const r of rows) map[r.factory_id] = { rating_avg: r.avg === null ? null : Number(r.avg), rating_count: r.cnt };
+  return map;
+}
+
+// v110: fabrika teklif sayilari — yeni (factory_id) + eski (factory ad, normalize) teklifler birlikte sayilir.
+async function factoryQuoteCountsMap(ids) {
+  const map = {};
+  const list = (ids || []).filter((x) => Number.isInteger(x));
+  if (!list.length) return map;
+  await ensureFactoryQuotesTable();
+  for (const id of list) map[id] = 0;
+  // yeni teklifler: factory_id ile
+  const { rows: byId } = await pool.query('SELECT factory_id, COUNT(*)::int AS cnt FROM factory_quotes WHERE factory_id = ANY($1) GROUP BY factory_id', [list]);
+  for (const r of byId) map[r.factory_id] = (map[r.factory_id] || 0) + r.cnt;
+  // eski teklifler: factory TEXT ad ile (trim + lowercase normalize, fabrika adiyla eslestir). factory_id'li olanlar cift sayilmasin diye factory_id IS NULL sarti var.
+  const { rows: facs } = await pool.query('SELECT id, name FROM factories WHERE id = ANY($1)', [list]);
+  const nameToId = {};
+  for (const f of facs) nameToId[String(f.name || '').trim().toLowerCase()] = f.id;
+  const { rows: legacy } = await pool.query(`SELECT LOWER(TRIM(factory)) AS fname, COUNT(*)::int AS cnt FROM factory_quotes WHERE factory_id IS NULL AND factory <> '' GROUP BY LOWER(TRIM(factory))`);
+  for (const r of legacy) { const fid = nameToId[r.fname]; if (fid) map[fid] = (map[fid] || 0) + r.cnt; }
+  return map;
+}
+
 function toFactoryAdmin(r) {
   return { ...toFactoryPublic(r), is_active: r.is_active !== false, created_at: r.created_at, updated_at: r.updated_at };
 }
@@ -466,6 +522,16 @@ router.get('/factory/likes', asyncHandler(async (req, res) => {
   if (!FACTORY_VIDEO_RE.test(video)) return res.status(400).json({ error: 'invalid_video' });
   const { rows } = await pool.query('SELECT COUNT(*)::int AS n FROM factory_likes WHERE video_key=$1', [video]);
   res.json({ like_count: rows[0].n });
+}));
+
+// GET /api/products/factory/likes/mine — giris yapan kullanicinin begendigi videolar (Profil > Begenilen Videolar)
+router.get('/factory/likes/mine', requireAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const { rows } = await pool.query(
+    'SELECT video_key, created_at FROM factory_likes WHERE user_id=$1 ORDER BY created_at DESC, id DESC',
+    [req.user.id]
+  );
+  res.json({ likes: rows });
 }));
 
 // POST /api/products/factory/likes {video} — begeni ac/kapa (toggle)
@@ -584,18 +650,52 @@ router.get('/factory/favorites', requireAuth, asyncHandler(async (req, res) => {
   res.json({ favorites: rows.map((r) => r.video_key) });
 }));
 
+// POST /api/products/factory/:id/rate — fabrika puanlama (1-5). Giris gerekli, abonelik gerekmez. Ayni kullanici tekrar puan verirse guncellenir.
+router.post('/factory/:id/rate', requireAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const fid = parseInt(req.params.id, 10);
+  if (!Number.isInteger(fid) || fid < 1) return res.status(400).json({ error: 'invalid_factory' });
+  const rating = req.body && req.body.rating;
+  if (!Number.isInteger(rating) || rating < 1 || rating > 5) return res.status(400).json({ error: 'invalid_rating' });
+  const { rows: f } = await pool.query('SELECT id FROM factories WHERE id=$1', [fid]);
+  if (!f.length) return res.status(404).json({ error: 'factory_not_found' });
+  await pool.query('INSERT INTO factory_ratings (factory_id, user_id, rating) VALUES ($1,$2,$3) ON CONFLICT (factory_id, user_id) DO UPDATE SET rating=EXCLUDED.rating, updated_at=now()', [fid, req.user.id, rating]);
+  const { rows: agg } = await pool.query('SELECT ROUND(AVG(rating)::numeric, 1)::float AS avg, COUNT(*)::int AS cnt FROM factory_ratings WHERE factory_id=$1', [fid]);
+  res.json({ ok: true, rating_avg: agg[0].avg === null ? null : Number(agg[0].avg), rating_count: agg[0].cnt, user_rating: rating });
+}));
+
+// GET /api/products/factory/:id/my-rating — giris yapan kullanicinin bu fabrikaya verdigi puan (yoksa null)
+router.get('/factory/:id/my-rating', requireAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const fid = parseInt(req.params.id, 10);
+  if (!Number.isInteger(fid) || fid < 1) return res.status(400).json({ error: 'invalid_factory' });
+  const { rows } = await pool.query('SELECT rating FROM factory_ratings WHERE factory_id=$1 AND user_id=$2', [fid, req.user.id]);
+  res.json({ user_rating: rows.length ? rows[0].rating : null });
+}));
+
 // GET /api/products/factory/list — tum fabrikalar (herkese acik; kapali fabrikalar gorunmez)
 router.get('/factory/list', asyncHandler(async (req, res) => {
   await ensureFactoryTables();
   const { rows } = await pool.query(`SELECT * FROM factories WHERE is_active IS NOT FALSE ORDER BY id ASC`);
-  res.json(rows.map(toFactoryPublic));
+  const rmap = await factoryRatingsMap(rows.map((r) => r.id));
+  const qmap = await factoryQuoteCountsMap(rows.map((r) => r.id));
+  res.json(rows.map((r) => ({ ...toFactoryPublic(r), rating_avg: (rmap[r.id] && rmap[r.id].rating_avg !== undefined) ? rmap[r.id].rating_avg : null, rating_count: (rmap[r.id] && rmap[r.id].rating_count) || 0, quote_count: qmap[r.id] || 0 })));
+}));
+
+// GET /api/products/factory/quote-counts — her fabrikanin toplam teklif sayisi (herkese acik istatistik)
+router.get('/factory/quote-counts', asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const { rows } = await pool.query(`SELECT id FROM factories WHERE is_active IS NOT FALSE ORDER BY id ASC`);
+  const counts = await factoryQuoteCountsMap(rows.map((r) => r.id));
+  res.json({ counts });
 }));
 
 // GET /api/products/factory/admin/list — tum fabrikalar + created_at (admin)
 router.get('/factory/admin/list', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
   await ensureFactoryTables();
   const { rows } = await pool.query(`SELECT * FROM factories ORDER BY id ASC`);
-  res.json(rows.map(toFactoryAdmin));
+  const rmap = await factoryRatingsMap(rows.map((r) => r.id));
+  res.json(rows.map((r) => ({ ...toFactoryAdmin(r), rating_avg: (rmap[r.id] && rmap[r.id].rating_avg !== undefined) ? rmap[r.id].rating_avg : null, rating_count: (rmap[r.id] && rmap[r.id].rating_count) || 0 })));
 }));
 
 const factoryValidators = [
@@ -610,6 +710,24 @@ const factoryValidators = [
     if (typeof v === 'string') { if (v.length > 2000) throw new Error('invalid_certs'); return true; }
     if (Array.isArray(v) && v.every((x) => typeof x === 'string')) { if (v.join(', ').length > 2000) throw new Error('invalid_certs'); return true; }
     throw new Error('invalid_certs');
+  }),
+  body('features').optional().custom((v) => {
+    if (typeof v === 'string') { if (v.length > 2000) throw new Error('invalid_features'); return true; }
+    if (Array.isArray(v) && v.every((x) => typeof x === 'string')) { if (v.join(', ').length > 2000) throw new Error('invalid_features'); return true; }
+    throw new Error('invalid_features');
+  }),
+  body('import_countries').optional().custom((v) => {
+    if (typeof v === 'string') { if (v.length > 2000) throw new Error('invalid_import_countries'); return true; }
+    if (Array.isArray(v) && v.every((x) => typeof x === 'string')) { if (v.join(', ').length > 2000) throw new Error('invalid_import_countries'); return true; }
+    throw new Error('invalid_import_countries');
+  }),
+  body('employees').optional().trim().isLength({ max: 2000 }),
+  body('factory_area').optional().trim().isLength({ max: 2000 }),
+  body('years').optional().trim().isLength({ max: 2000 }),
+  body('main_products').optional().custom((v) => {
+    if (typeof v === 'string') { if (v.length > 2000) throw new Error('invalid_main_products'); return true; }
+    if (Array.isArray(v) && v.every((x) => typeof x === 'string')) { if (v.join(', ').length > 2000) throw new Error('invalid_main_products'); return true; }
+    throw new Error('invalid_main_products');
   }),
   body('hashtags').optional().custom((v) => {
     if (typeof v === 'string') { if (v.length > 2000) throw new Error('invalid_hashtags'); return true; }
@@ -664,9 +782,19 @@ router.post('/factory/admin', requireAuth, requireAdmin,
     if (socialsClean === null) return res.status(400).json({ error: 'invalid_socials' });
     const tagsClean = cleanFactoryTags(req.body.tags);
     if (tagsClean === null) return res.status(400).json({ error: 'invalid_tags' });
+    const importCountriesClean = cleanFactoryTags(req.body.import_countries);
+    if (importCountriesClean === null) return res.status(400).json({ error: 'invalid_import_countries' });
+    const employeesClean = cleanFactoryText(req.body.employees, 2000);
+    if (employeesClean === null) return res.status(400).json({ error: 'invalid_employees' });
+    const factoryAreaClean = cleanFactoryText(req.body.factory_area, 2000);
+    if (factoryAreaClean === null) return res.status(400).json({ error: 'invalid_factory_area' });
+    const yearsClean = cleanFactoryText(req.body.years, 2000);
+    if (yearsClean === null) return res.status(400).json({ error: 'invalid_years' });
+    const mainProductsClean = cleanFactoryTags(req.body.main_products);
+    if (mainProductsClean === null) return res.status(400).json({ error: 'invalid_main_products' });
     const { rows } = await pool.query(
-      `INSERT INTO factories (name, city, category, description, moq, stock, capacity, certs, videos, hashtags)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10) RETURNING *`,
+      `INSERT INTO factories (name, city, category, description, moq, stock, capacity, certs, features, videos, hashtags)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11) RETURNING *`,
       [
         String(req.body.name).trim(),
         typeof req.body.city === 'string' ? req.body.city.trim() : '',
@@ -676,11 +804,12 @@ router.post('/factory/admin', requireAuth, requireAdmin,
         req.body.stock == null ? 0 : parseInt(req.body.stock, 10),
         typeof req.body.capacity === 'string' ? req.body.capacity.trim() : '',
         Array.isArray(req.body.certs) ? req.body.certs.map((x) => String(x).trim()).filter(Boolean).join(', ') : (typeof req.body.certs === 'string' ? req.body.certs.trim() : ''),
+        Array.isArray(req.body.features) ? req.body.features.map((x) => String(x).trim()).filter(Boolean).join(', ') : (typeof req.body.features === 'string' ? req.body.features.trim() : ''),
         JSON.stringify(videos === undefined ? [] : videos),
         hashtagsClean === undefined ? '' : hashtagsClean,
       ]
     );
-    if (addressClean !== undefined || phoneClean !== undefined || contactClean !== undefined || wechatClean !== undefined || whatsappClean !== undefined || socialsClean !== undefined || tagsClean !== undefined) {
+    if (addressClean !== undefined || phoneClean !== undefined || contactClean !== undefined || wechatClean !== undefined || whatsappClean !== undefined || socialsClean !== undefined || tagsClean !== undefined || importCountriesClean !== undefined || employeesClean !== undefined || factoryAreaClean !== undefined || yearsClean !== undefined || mainProductsClean !== undefined) {
       const updSets = [];
       const updParams = [rows[0].id];
       const updPush = (col, val, cast) => { updParams.push(val); updSets.push(`${col} = $${updParams.length}${cast || ''}`); };
@@ -691,6 +820,11 @@ router.post('/factory/admin', requireAuth, requireAdmin,
       if (whatsappClean !== undefined) updPush('whatsapp', whatsappClean);
       if (socialsClean !== undefined) updPush('socials', JSON.stringify(socialsClean), '::jsonb');
       if (tagsClean !== undefined) updPush('tags', tagsClean);
+      if (importCountriesClean !== undefined) updPush('import_countries', importCountriesClean);
+      if (employeesClean !== undefined) updPush('employees', employeesClean);
+      if (factoryAreaClean !== undefined) updPush('factory_area', factoryAreaClean);
+      if (yearsClean !== undefined) updPush('years', yearsClean);
+      if (mainProductsClean !== undefined) updPush('main_products', mainProductsClean);
       const upd = await pool.query(`UPDATE factories SET ${updSets.join(', ')} WHERE id = $1 RETURNING *`, updParams);
       if (upd.rows.length) rows[0] = upd.rows[0];
     }
@@ -717,6 +851,12 @@ router.put('/factory/admin/:id', requireAuth, requireAdmin,
     if (req.body.stock !== undefined) push('stock', req.body.stock == null ? 0 : parseInt(req.body.stock, 10));
     if (req.body.capacity !== undefined) push('capacity', String(req.body.capacity).trim());
     if (req.body.certs !== undefined) push('certs', Array.isArray(req.body.certs) ? req.body.certs.map((x) => String(x).trim()).filter(Boolean).join(', ') : String(req.body.certs).trim());
+    if (req.body.features !== undefined) push('features', Array.isArray(req.body.features) ? req.body.features.map((x) => String(x).trim()).filter(Boolean).join(', ') : String(req.body.features).trim());
+    if (req.body.import_countries !== undefined) push('import_countries', Array.isArray(req.body.import_countries) ? req.body.import_countries.map((x) => String(x).trim()).filter(Boolean).join(', ') : String(req.body.import_countries).trim());
+    if (req.body.employees !== undefined) push('employees', String(req.body.employees).trim());
+    if (req.body.factory_area !== undefined) push('factory_area', String(req.body.factory_area).trim());
+    if (req.body.years !== undefined) push('years', String(req.body.years).trim());
+    if (req.body.main_products !== undefined) push('main_products', Array.isArray(req.body.main_products) ? req.body.main_products.map((x) => String(x).trim()).filter(Boolean).join(', ') : String(req.body.main_products).trim());
     if (req.body.hashtags !== undefined) {
       const hashtagsClean = cleanFactoryHashtags(req.body.hashtags);
       if (hashtagsClean === null) return res.status(400).json({ error: 'invalid_hashtags' });
@@ -854,6 +994,42 @@ router.get('/factory/messages', requireAuth, asyncHandler(async (req, res) => {
     [req.user.id]
   );
   res.json({ messages: rows });
+}));
+
+// Teklif istekleri (Profil > Tekliflerim) — Teklif Al formu e-posta ile gonderilirken bir kopya da burada saklanir.
+async function ensureFactoryQuotesTable() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS factory_quotes (id SERIAL PRIMARY KEY, user_id INT NOT NULL, factory TEXT NOT NULL DEFAULT '', name TEXT NOT NULL DEFAULT '', contact TEXT NOT NULL DEFAULT '', qty TEXT NOT NULL DEFAULT '', msg TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ DEFAULT now())`);
+  await pool.query(`ALTER TABLE factory_quotes ADD COLUMN IF NOT EXISTS factory_id INT`);
+}
+
+// POST /api/products/factory/quotes — teklif istegi kaydet
+router.post('/factory/quotes', requireAuth,
+  body('factory').optional().trim().isLength({ max: 500 }),
+  body('name').optional().trim().isLength({ max: 200 }),
+  body('contact').optional().trim().isLength({ max: 200 }),
+  body('qty').optional().trim().isLength({ max: 50 }),
+  body('msg').optional().trim().isLength({ max: 2000 }),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    await ensureFactoryQuotesTable();
+    const rawFid = req.body.factory_id;
+    const factoryId = (typeof rawFid === 'number' && Number.isInteger(rawFid) && rawFid > 0) ? rawFid : (typeof rawFid === 'string' && /^\d+$/.test(rawFid.trim()) ? parseInt(rawFid.trim(), 10) : null);
+    const { rows } = await pool.query(
+      `INSERT INTO factory_quotes (user_id, factory, factory_id, name, contact, qty, msg) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, factory, factory_id, name, contact, qty, msg, created_at`,
+      [req.user.id, req.body.factory || '', factoryId, req.body.name || '', req.body.contact || '', req.body.qty || '', req.body.msg || '']
+    );
+    res.status(201).json({ quote: rows[0] });
+  })
+);
+
+// GET /api/products/factory/quotes — kendi teklif isteklerim (yeniden eskiye)
+router.get('/factory/quotes', requireAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryQuotesTable();
+  const { rows } = await pool.query(
+    `SELECT id, factory, factory_id, name, contact, qty, msg, created_at FROM factory_quotes WHERE user_id=$1 ORDER BY created_at DESC, id DESC`,
+    [req.user.id]
+  );
+  res.json({ quotes: rows });
 }));
 
 // GET /api/products/factory/admin/messages — tum konusmalar, kullaniciya gore gruplu (admin)
