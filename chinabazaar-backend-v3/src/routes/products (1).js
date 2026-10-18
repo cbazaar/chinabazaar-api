@@ -393,6 +393,25 @@ async function factoryRatingsMap(ids) {
   return map;
 }
 
+// v110: fabrika teklif sayilari — yeni (factory_id) + eski (factory ad, normalize) teklifler birlikte sayilir.
+async function factoryQuoteCountsMap(ids) {
+  const map = {};
+  const list = (ids || []).filter((x) => Number.isInteger(x));
+  if (!list.length) return map;
+  await ensureFactoryQuotesTable();
+  for (const id of list) map[id] = 0;
+  // yeni teklifler: factory_id ile
+  const { rows: byId } = await pool.query('SELECT factory_id, COUNT(*)::int AS cnt FROM factory_quotes WHERE factory_id = ANY($1) GROUP BY factory_id', [list]);
+  for (const r of byId) map[r.factory_id] = (map[r.factory_id] || 0) + r.cnt;
+  // eski teklifler: factory TEXT ad ile (trim + lowercase normalize, fabrika adiyla eslestir). factory_id'li olanlar cift sayilmasin diye factory_id IS NULL sarti var.
+  const { rows: facs } = await pool.query('SELECT id, name FROM factories WHERE id = ANY($1)', [list]);
+  const nameToId = {};
+  for (const f of facs) nameToId[String(f.name || '').trim().toLowerCase()] = f.id;
+  const { rows: legacy } = await pool.query(`SELECT LOWER(TRIM(factory)) AS fname, COUNT(*)::int AS cnt FROM factory_quotes WHERE factory_id IS NULL AND factory <> '' GROUP BY LOWER(TRIM(factory))`);
+  for (const r of legacy) { const fid = nameToId[r.fname]; if (fid) map[fid] = (map[fid] || 0) + r.cnt; }
+  return map;
+}
+
 function toFactoryAdmin(r) {
   return { ...toFactoryPublic(r), is_active: r.is_active !== false, created_at: r.created_at, updated_at: r.updated_at };
 }
@@ -489,6 +508,16 @@ router.get('/factory/likes', asyncHandler(async (req, res) => {
   if (!FACTORY_VIDEO_RE.test(video)) return res.status(400).json({ error: 'invalid_video' });
   const { rows } = await pool.query('SELECT COUNT(*)::int AS n FROM factory_likes WHERE video_key=$1', [video]);
   res.json({ like_count: rows[0].n });
+}));
+
+// GET /api/products/factory/likes/mine — giris yapan kullanicinin begendigi videolar (Profil > Begenilen Videolar)
+router.get('/factory/likes/mine', requireAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const { rows } = await pool.query(
+    'SELECT video_key, created_at FROM factory_likes WHERE user_id=$1 ORDER BY created_at DESC, id DESC',
+    [req.user.id]
+  );
+  res.json({ likes: rows });
 }));
 
 // POST /api/products/factory/likes {video} — begeni ac/kapa (toggle)
@@ -635,7 +664,16 @@ router.get('/factory/list', asyncHandler(async (req, res) => {
   await ensureFactoryTables();
   const { rows } = await pool.query(`SELECT * FROM factories WHERE is_active IS NOT FALSE ORDER BY id ASC`);
   const rmap = await factoryRatingsMap(rows.map((r) => r.id));
-  res.json(rows.map((r) => ({ ...toFactoryPublic(r), rating_avg: (rmap[r.id] && rmap[r.id].rating_avg !== undefined) ? rmap[r.id].rating_avg : null, rating_count: (rmap[r.id] && rmap[r.id].rating_count) || 0 })));
+  const qmap = await factoryQuoteCountsMap(rows.map((r) => r.id));
+  res.json(rows.map((r) => ({ ...toFactoryPublic(r), rating_avg: (rmap[r.id] && rmap[r.id].rating_avg !== undefined) ? rmap[r.id].rating_avg : null, rating_count: (rmap[r.id] && rmap[r.id].rating_count) || 0, quote_count: qmap[r.id] || 0 })));
+}));
+
+// GET /api/products/factory/quote-counts — her fabrikanin toplam teklif sayisi (herkese acik istatistik)
+router.get('/factory/quote-counts', asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const { rows } = await pool.query(`SELECT id FROM factories WHERE is_active IS NOT FALSE ORDER BY id ASC`);
+  const counts = await factoryQuoteCountsMap(rows.map((r) => r.id));
+  res.json({ counts });
 }));
 
 // GET /api/products/factory/admin/list — tum fabrikalar + created_at (admin)
@@ -942,6 +980,42 @@ router.get('/factory/messages', requireAuth, asyncHandler(async (req, res) => {
     [req.user.id]
   );
   res.json({ messages: rows });
+}));
+
+// Teklif istekleri (Profil > Tekliflerim) — Teklif Al formu e-posta ile gonderilirken bir kopya da burada saklanir.
+async function ensureFactoryQuotesTable() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS factory_quotes (id SERIAL PRIMARY KEY, user_id INT NOT NULL, factory TEXT NOT NULL DEFAULT '', name TEXT NOT NULL DEFAULT '', contact TEXT NOT NULL DEFAULT '', qty TEXT NOT NULL DEFAULT '', msg TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ DEFAULT now())`);
+  await pool.query(`ALTER TABLE factory_quotes ADD COLUMN IF NOT EXISTS factory_id INT`);
+}
+
+// POST /api/products/factory/quotes — teklif istegi kaydet
+router.post('/factory/quotes', requireAuth,
+  body('factory').optional().trim().isLength({ max: 500 }),
+  body('name').optional().trim().isLength({ max: 200 }),
+  body('contact').optional().trim().isLength({ max: 200 }),
+  body('qty').optional().trim().isLength({ max: 50 }),
+  body('msg').optional().trim().isLength({ max: 2000 }),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    await ensureFactoryQuotesTable();
+    const rawFid = req.body.factory_id;
+    const factoryId = (typeof rawFid === 'number' && Number.isInteger(rawFid) && rawFid > 0) ? rawFid : (typeof rawFid === 'string' && /^\d+$/.test(rawFid.trim()) ? parseInt(rawFid.trim(), 10) : null);
+    const { rows } = await pool.query(
+      `INSERT INTO factory_quotes (user_id, factory, factory_id, name, contact, qty, msg) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id, factory, factory_id, name, contact, qty, msg, created_at`,
+      [req.user.id, req.body.factory || '', factoryId, req.body.name || '', req.body.contact || '', req.body.qty || '', req.body.msg || '']
+    );
+    res.status(201).json({ quote: rows[0] });
+  })
+);
+
+// GET /api/products/factory/quotes — kendi teklif isteklerim (yeniden eskiye)
+router.get('/factory/quotes', requireAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryQuotesTable();
+  const { rows } = await pool.query(
+    `SELECT id, factory, factory_id, name, contact, qty, msg, created_at FROM factory_quotes WHERE user_id=$1 ORDER BY created_at DESC, id DESC`,
+    [req.user.id]
+  );
+  res.json({ quotes: rows });
 }));
 
 // GET /api/products/factory/admin/messages — tum konusmalar, kullaniciya gore gruplu (admin)
