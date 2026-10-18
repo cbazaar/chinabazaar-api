@@ -1287,6 +1287,7 @@ router.post('/factory/admin/subscriptions/grant', requireAuth, requireAdmin,
     );
     const RETURNING = `RETURNING id, user_id, status, plan, provider, started_at, expires_at, ends_at, amount, currency, created_at, updated_at`;
     let row;
+    let statusCode = 200;
     if (existing.length) {
       const { rows } = await pool.query(
         `UPDATE factory_subscriptions SET plan = $2, provider = 'admin_grant', status = 'active',
@@ -1295,7 +1296,6 @@ router.post('/factory/admin/subscriptions/grant', requireAuth, requireAdmin,
         [existing[0].id, plan, months]
       );
       row = rows[0];
-      res.json({ subscription: row });
     } else {
       const { rows } = await pool.query(
         `INSERT INTO factory_subscriptions (user_id, status, plan, provider, started_at, expires_at, ends_at)
@@ -1303,8 +1303,17 @@ router.post('/factory/admin/subscriptions/grant', requireAuth, requireAdmin,
         [userId, plan, months]
       );
       row = rows[0];
-      res.status(201).json({ subscription: row });
+      statusCode = 201;
     }
+    // Admin grant'i hesabı MyFactory müşterisi olarak da kaydeder (Müşteriler listesi
+    // source='myfactory' filtresine girsin diye — örn. kaynak takibi başlamadan önce
+    // kayıt olan eski hesaplar 'shop'/NULL sayıldığı için listede görünmüyordu).
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'shop'`);
+    const { rowCount: sourceUpdatedCount } = await pool.query(
+      `UPDATE users SET source = 'myfactory' WHERE id = $1 AND (source IS NULL OR source <> 'myfactory')`,
+      [userId]
+    );
+    res.status(statusCode).json({ subscription: row, source_updated: sourceUpdatedCount > 0 });
   })
 );
 
