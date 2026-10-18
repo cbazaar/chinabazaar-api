@@ -1217,11 +1217,11 @@ router.patch('/factory/admin/:id/active', requireAuth, requireAdmin, param('id')
 router.get('/factory/admin/subscriptions', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
   await ensureFactoryTables();
   const { rows } = await pool.query(
-    `SELECT fs.id, fs.user_id, COALESCE(NULLIF(u.nickname,''), NULLIF(u.name,''), split_part(u.email,'@',1), '') AS name, u.email AS email, fs.status, fs.started_at, fs.ends_at, fs.amount, fs.currency
+    `SELECT fs.id, fs.user_id, COALESCE(NULLIF(u.nickname,''), NULLIF(u.name,''), split_part(u.email,'@',1), '') AS name, u.email AS email, fs.status, fs.plan, fs.started_at, COALESCE(fs.expires_at, fs.ends_at) AS expires_at, fs.ends_at, fs.amount, fs.currency
      FROM factory_subscriptions fs LEFT JOIN users u ON u.id::text = fs.user_id::text
      ORDER BY fs.created_at DESC, fs.id DESC`
   );
-  res.json(rows.map((r) => ({ id: r.id, user_id: r.user_id, name: r.name || '', email: r.email || null, status: r.status, started_at: r.started_at, ends_at: r.ends_at, amount: r.amount, currency: r.currency })));
+  res.json(rows.map((r) => ({ id: r.id, user_id: r.user_id, name: r.name || '', email: r.email || null, status: r.status, plan: r.plan || null, started_at: r.started_at, expires_at: r.expires_at, ends_at: r.ends_at, amount: r.amount, currency: r.currency })));
 }));
 
 // Abonelik / VIP — admin_grant: odeme kaydi OLMAYAN tamamlayici abonelik.
