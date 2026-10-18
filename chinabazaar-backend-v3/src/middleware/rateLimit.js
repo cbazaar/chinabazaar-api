@@ -5,13 +5,15 @@
 const rateLimit = require('express-rate-limit');
 
 
-function limiter({ windowMs, max, message }) {
+function limiter({ windowMs, max, message, skipSuccessfulRequests, keyGenerator }) {
   return rateLimit({
     windowMs,
     max,
     standardHeaders: true,
     legacyHeaders: false,
     message: { error: message || 'too_many_requests' },
+    ...(skipSuccessfulRequests ? { skipSuccessfulRequests: true } : {}),
+    ...(keyGenerator ? { keyGenerator } : {}),
   });
 }
 
@@ -29,9 +31,25 @@ const apiLimiter = limiter({ windowMs: 15 * 60 * 1000, max: 1200 });
 const loginLimiter = limiter({ windowMs: 15 * 60 * 1000, max: 100 });
 const registerLimiter = limiter({ windowMs: 60 * 60 * 1000, max: 20 });
 
+// Şifre girişi (POST /api/auth/login) için KATI limit — yalnızca BAŞARISIZ
+// denemeler sayılır (skipSuccessfulRequests): IP başına 15 dakikada en fazla
+// 10 başarısız giriş. Başarılı girişler sayılmaz, gerçek kullanıcı kilitlenmez.
+const strictLoginLimiter = limiter({ windowMs: 15 * 60 * 1000, max: 10, skipSuccessfulRequests: true });
+
+// Aynı tanıtan (e-posta / kullanıcı adı / telefon) için katı limit — dağıtık
+// (çok IP'li) brute-force'a karşı. Anahtar yalnız gövdedeki tanıtan bilgisinden
+// üretilir (IP içermez); başarısız denemeler sayılır. Bir tanıtanın kilidini
+// kırmak için saldırganın hem IP hem tanıtan bütçesini aşması gerekir.
+const loginIdentifierLimiter = limiter({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  skipSuccessfulRequests: true,
+  keyGenerator: (req) => 'login-id:' + String((req.body && (req.body.identifier ?? req.body.email)) || '').trim().toLowerCase(),
+});
+
 
 // Herkese açık kargo takip sorgusu — numaralandırmaya (enumeration) karşı
 const trackingLimiter = limiter({ windowMs: 60 * 60 * 1000, max: 60 });
 
 
-module.exports = { apiLimiter, loginLimiter, registerLimiter, trackingLimiter };
+module.exports = { apiLimiter, loginLimiter, registerLimiter, trackingLimiter, strictLoginLimiter, loginIdentifierLimiter };
