@@ -314,6 +314,76 @@ router.get('/whatsapp/status', requireAuth, requireAdmin, asyncHandler(async (re
   res.json({ ok: true, configured: !!(kv.wa_phone_id && kv.wa_token), enabled: kv.wa_enabled === 'true', verify_set: !!kv.wa_verify, username: kv.wa_username || '', webhook_url: origin + '/api/products/whatsapp/webhook', conversations: rows[0].convs, unread: rows[0].unread });
 }));
 
+// CBF: fabrika kodu — CBF-001, CBF-002, … (buyuk harf CBF-, sifir dolgulu 3 hane).
+// Ayni normalize ad (trim + lowercase) = ayni fabrika = AYNI cbf_code (tekrar kod verilmez).
+function normalizeCbfCode(v) {
+  if (typeof v !== 'string') return '';
+  return v.trim().toUpperCase();
+}
+// CBF kilidi: gecerli kod /^CBF-\d+$/ bicimindedir. Gecerli kod SABIT'tir — bir kez
+// verildikten sonra degistirilemez. Bozuk bicimli (örn. "CBFOO1") mevcut kod bir kez
+// gecerli bicime duzeltilebilir; duzeltildikten sonra o da kilitlenir.
+function isValidCbfCode(v) {
+  return /^CBF-\d+$/.test(normalizeCbfCode(v));
+}
+function normalizeFactoryNameKey(v) {
+  return String(v == null ? '' : v).trim().toLowerCase();
+}
+function formatCbfCode(n) {
+  return 'CBF-' + String(n).padStart(3, '0');
+}
+function parseCbfCodeNumber(code) {
+  const m = /^CBF-(\d+)$/.exec(String(code || '').trim().toUpperCase());
+  return m ? parseInt(m[1], 10) : 0;
+}
+// Mevcut en buyuk CBF numarasinin bir fazlasi (kod yoksa 1).
+async function nextCbfCodeNumber() {
+  const { rows } = await pool.query(`SELECT cbf_code FROM factories WHERE cbf_code IS NOT NULL AND TRIM(cbf_code) <> ''`);
+  let max = 0;
+  for (const r of rows) max = Math.max(max, parseCbfCodeNumber(r.cbf_code));
+  return max + 1;
+}
+// Yeni fabrika icin kod cozumu: ayni isimde kod varsa onu tekrar kullan, yoksa siradaki kodu ver.
+async function resolveCbfCodeForName(name) {
+  const key = normalizeFactoryNameKey(name);
+  if (key) {
+    const { rows } = await pool.query(`SELECT cbf_code FROM factories WHERE LOWER(TRIM(name)) = $1 AND cbf_code IS NOT NULL AND TRIM(cbf_code) <> '' ORDER BY id ASC LIMIT 1`, [key]);
+    if (rows.length) return normalizeCbfCode(rows[0].cbf_code);
+  }
+  return formatCbfCode(await nextCbfCodeNumber());
+}
+// Backfill (idempotent): cbf_code'u bos olan fabrikalara kod ata. Ayni normalize ada sahip
+// satirlar AYNI kodu alir; kodlar fabrika-id sirasina gore, mevcut max + 1'den baslayarak
+// verilir. Dolu kodlar ASLA uzerine yazilmaz; baska hicbir sutuna dokunulmaz.
+async function backfillFactoryCbfCodes() {
+  try {
+    const { rows: pending } = await pool.query(`SELECT COUNT(*)::int AS n FROM factories WHERE cbf_code IS NULL OR TRIM(cbf_code) = ''`);
+    if (!pending.length || !pending[0].n) return;
+    const { rows } = await pool.query(`SELECT id, name, cbf_code FROM factories ORDER BY id ASC`);
+    let max = 0;
+    for (const r of rows) max = Math.max(max, parseCbfCodeNumber(r.cbf_code));
+    const groups = new Map();
+    for (const r of rows) {
+      const key = normalizeFactoryNameKey(r.name);
+      const existing = (typeof r.cbf_code === 'string' ? r.cbf_code.trim() : '');
+      if (!key) {
+        // Adsiz satir: grup yapilmaz, her biri kendi kodunu alir.
+        if (!existing) { max += 1; await pool.query('UPDATE factories SET cbf_code = $1 WHERE id = $2', [formatCbfCode(max), r.id]); }
+        continue;
+      }
+      if (!groups.has(key)) groups.set(key, { code: '', fill: [] });
+      const g = groups.get(key);
+      if (existing) { if (!g.code) g.code = normalizeCbfCode(existing); }
+      else g.fill.push(r.id);
+    }
+    for (const g of groups.values()) {
+      if (!g.fill.length) continue;
+      if (!g.code) { max += 1; g.code = formatCbfCode(max); }
+      for (const id of g.fill) await pool.query('UPDATE factories SET cbf_code = $1 WHERE id = $2', [g.code, id]);
+    }
+  } catch (e) { /* backfill hatasi akisi bozmaz */ }
+}
+
 // v615 (My Factory v3): fabrika video begeni/yorum + fabrika yonetimi (admin)
 // Tum /factory/* rotalari GET /:id ONCESINE kayitli — /:id bunlari yutmaz.
 async function ensureFactoryTables() {
@@ -353,6 +423,10 @@ async function ensureFactoryTables() {
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS factory_area TEXT DEFAULT ''`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS years TEXT DEFAULT ''`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS main_products TEXT DEFAULT ''`);
+  // CBF: fabrika kodu (CBF-001, …). Her ALTER kendi try/catch'indedir.
+  try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS cbf_code TEXT`); } catch (e) { /* cbf_code kolonu eklenemezse akis bozulmaz */ }
+  // VERIFIED: dogrulanmis fabrika rozeti (is_verified BOOLEAN, varsayilan FALSE). Her ALTER kendi try/catch'indedir.
+  try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT FALSE`); } catch (e) { /* is_verified kolonu eklenemezse akis bozulmaz */ }
   // v118: user_id tip onarimi — users.id UUID, ama fabrika tablolari user_id'yi INT diye
   // tanimlamisti; UUID'li kullaniciyla her user_id sorgusu 500 veriyordu. INT->TEXT
   // donusumu kayipsizdir (her INT metne cevrilir); TEXT kolonda tekrar calismak no-op'tur.
@@ -360,6 +434,8 @@ async function ensureFactoryTables() {
   for (const t of ['factory_likes', 'factory_comments', 'factory_favorites', 'factory_messages', 'factory_quotes', 'factory_ratings', 'factory_subscriptions']) {
     try { await pool.query(`ALTER TABLE ${t} ALTER COLUMN user_id TYPE TEXT USING user_id::text`); } catch (e) { /* tablo/sutun yoksa veya tip zaten TEXT ise yoksay */ }
   }
+  // CBF backfill: kodu bos fabrikalara kod ata (idempotent, hatada akis bozulmaz).
+  await backfillFactoryCbfCodes();
 }
 
 const FACTORY_VIDEO_RE = /^\d+-\d+$/;
@@ -380,6 +456,8 @@ function toFactoryPublic(r) {
   return {
     id: r.id,
     name: r.name,
+    cbf_code: r.cbf_code || '',
+    is_verified: !!r.is_verified,
     city: r.city || '',
     category: r.category || '',
     desc: r.description || '',
@@ -444,6 +522,21 @@ function parseFactorySocials(v) {
   if (!o || typeof o !== 'object' || Array.isArray(o)) return { youtube: '', facebook: '', tiktok: '', instagram: '' };
   const pick = (k) => (typeof o[k] === 'string' ? o[k].trim() : '');
   return { youtube: pick('youtube'), facebook: pick('facebook'), tiktok: pick('tiktok'), instagram: pick('instagram') };
+}
+
+// VERIFIED: is_verified cozumu — boolean, veya "true"/"false"/"1"/"0" string, veya 1/0 sayi.
+// undefined => verilmedi (UPDATE'de dokunma, CREATE'de varsayilan false); gecersiz => null (handler 400 doner).
+function parseFactoryVerified(v) {
+  if (v === undefined) return undefined;
+  if (typeof v === 'boolean') return v;
+  if (typeof v === 'number') { if (v === 1) return true; if (v === 0) return false; return null; }
+  if (typeof v === 'string') {
+    const t = v.trim().toLowerCase();
+    if (t === 'true' || t === '1') return true;
+    if (t === 'false' || t === '0') return false;
+    return null;
+  }
+  return null;
 }
 
 // v5: duz string alan — undefined => dokunma, gecersiz/uzun => null (handler 400 doner)
@@ -742,6 +835,11 @@ const factoryValidators = [
     throw new Error('invalid_hashtags');
   }),
   body('videos').optional().isArray(),
+  body('cbf_code').optional().trim().isLength({ max: 20 }),
+  body('is_verified').optional().custom((v) => {
+    if (parseFactoryVerified(v) === null) throw new Error('invalid_is_verified');
+    return true;
+  }),
   body('address').optional().trim().isLength({ max: 500 }),
   body('phone').optional().trim().isLength({ max: 200 }),
   body('contact').optional().trim().isLength({ max: 200 }),
@@ -799,9 +897,81 @@ router.post('/factory/admin', requireAuth, requireAdmin,
     if (yearsClean === null) return res.status(400).json({ error: 'invalid_years' });
     const mainProductsClean = cleanFactoryTags(req.body.main_products);
     if (mainProductsClean === null) return res.status(400).json({ error: 'invalid_main_products' });
+    // VERIFIED: CREATE — body verirse sakla (boolean / "true"/"false"/"1"/"0" / 1/0), verilmezse false.
+    const verifiedCleanCreate = parseFactoryVerified(req.body.is_verified);
+    if (verifiedCleanCreate === null) return res.status(400).json({ error: 'invalid_is_verified' });
+    const verifiedCreate = verifiedCleanCreate === undefined ? false : verifiedCleanCreate;
+    // CBF upsert-by-code (Part 1b): body cbf_code'u mevcut bir fabrikanin koduyla eslesirse
+    // YENI satir acilmaz — mevcut satira MERGE edilir: body videolari mevcut videolara
+    // URL'ye gore tekillestirilerek eklenir (mevcut kayitlar korunur, yalniz yeni URL'ler
+    // eklenir); diger skaler alanlar yalniz body'de acikca verildiyse guncellenir (PUT
+    // semantiği); NAME asla degistirilmez (kod yetkili kimliktir — farkli isimle gelen
+    // kod eslesmesi fabrikayi yeniden adlandiramaz). Eslesen satir toFactoryAdmin ile doner.
+    // CBF kilidi (CREATE): govdede verilen kod bozuk bicimliyse reddet (400).
+    if (req.body.cbf_code !== undefined && String(req.body.cbf_code).trim() !== '' && !isValidCbfCode(req.body.cbf_code)) {
+      return res.status(400).json({ error: 'invalid_cbf_code', message: 'CBF kodu CBF-001 biçiminde olmalı (örn. CBF-001).' });
+    }
+    const incomingCbfCode = normalizeCbfCode(req.body.cbf_code);
+    if (incomingCbfCode) {
+      const { rows: cbfExisting } = await pool.query(
+        `SELECT * FROM factories WHERE UPPER(TRIM(cbf_code)) = $1 ORDER BY id ASC LIMIT 1`,
+        [incomingCbfCode]
+      );
+      if (cbfExisting.length) {
+        const existingFactory = cbfExisting[0];
+        const mergeSets = [];
+        const mergeParams = [existingFactory.id];
+        const mergePush = (col, val, cast) => { mergeParams.push(val); mergeSets.push(`${col} = $${mergeParams.length}${cast || ''}`); };
+        // Skaler alanlar — PUT ile ayni: yalniz body'de varsa. NAME bilerek yok.
+        if (req.body.city !== undefined) mergePush('city', String(req.body.city).trim());
+        if (req.body.category !== undefined) mergePush('category', String(req.body.category).trim());
+        if (req.body.description !== undefined) mergePush('description', String(req.body.description).trim());
+        if (req.body.moq !== undefined) mergePush('moq', req.body.moq == null ? 0 : parseInt(req.body.moq, 10));
+        if (req.body.stock !== undefined) mergePush('stock', req.body.stock == null ? 0 : parseInt(req.body.stock, 10));
+        if (req.body.capacity !== undefined) mergePush('capacity', String(req.body.capacity).trim());
+        if (req.body.certs !== undefined) mergePush('certs', Array.isArray(req.body.certs) ? req.body.certs.map((x) => String(x).trim()).filter(Boolean).join(', ') : String(req.body.certs).trim());
+        if (req.body.features !== undefined) mergePush('features', Array.isArray(req.body.features) ? req.body.features.map((x) => String(x).trim()).filter(Boolean).join(', ') : String(req.body.features).trim());
+        if (req.body.import_countries !== undefined) mergePush('import_countries', Array.isArray(req.body.import_countries) ? req.body.import_countries.map((x) => String(x).trim()).filter(Boolean).join(', ') : String(req.body.import_countries).trim());
+        if (req.body.employees !== undefined) mergePush('employees', String(req.body.employees).trim());
+        if (req.body.factory_area !== undefined) mergePush('factory_area', String(req.body.factory_area).trim());
+        if (req.body.years !== undefined) mergePush('years', String(req.body.years).trim());
+        if (req.body.main_products !== undefined) mergePush('main_products', Array.isArray(req.body.main_products) ? req.body.main_products.map((x) => String(x).trim()).filter(Boolean).join(', ') : String(req.body.main_products).trim());
+        if (req.body.hashtags !== undefined) mergePush('hashtags', hashtagsClean);
+        if (req.body.address !== undefined) mergePush('address', addressClean);
+        if (req.body.phone !== undefined) mergePush('phone', phoneClean);
+        if (req.body.contact !== undefined) mergePush('contact', contactClean);
+        if (req.body.wechat !== undefined) mergePush('wechat', wechatClean);
+        if (req.body.whatsapp !== undefined) mergePush('whatsapp', whatsappClean);
+        if (req.body.socials !== undefined) mergePush('socials', JSON.stringify(socialsClean), '::jsonb');
+        if (req.body.tags !== undefined) mergePush('tags', tagsClean);
+        // VERIFIED (CBF merge): body verirse guncelle, verilmezse degistirme.
+        if (req.body.is_verified !== undefined) mergePush('is_verified', verifiedCreate);
+        // Videolar — REPLACE degil APPEND: mevcut videolar korunur, yalniz yeni URL'ler eklenir.
+        if (videos !== undefined) {
+          let existingVideos = existingFactory.videos;
+          if (typeof existingVideos === 'string') { try { existingVideos = JSON.parse(existingVideos); } catch { existingVideos = []; } }
+          if (!Array.isArray(existingVideos)) existingVideos = [];
+          const seenVideoUrls = new Set(existingVideos.map((v) => (v && typeof v.url === 'string' ? v.url.trim() : '')));
+          const mergedVideos = [...existingVideos];
+          for (const v of videos) {
+            if (!seenVideoUrls.has(v.url.trim())) { seenVideoUrls.add(v.url.trim()); mergedVideos.push(v); }
+          }
+          mergePush('videos', JSON.stringify(mergedVideos), '::jsonb');
+        }
+        // cbf_code zaten eslesiyor — degistirilmez; name bilerek degistirilmez.
+        if (!mergeSets.length) return res.json(toFactoryAdmin(existingFactory));
+        mergeSets.push('updated_at = now()');
+        const { rows: mergedRows } = await pool.query(`UPDATE factories SET ${mergeSets.join(', ')} WHERE id = $1 RETURNING *`, mergeParams);
+        if (!mergedRows.length) return res.status(404).json({ error: 'factory_not_found' });
+        return res.json(toFactoryAdmin(mergedRows[0]));
+      }
+    }
+    // CBF: body'de kod varsa normalize edip kullan; yoksa ayni isimde kod varsa onu tekrar kullan, yoksa siradaki kodu ata.
+    let cbfCode = normalizeCbfCode(req.body.cbf_code);
+    if (!cbfCode) cbfCode = await resolveCbfCodeForName(req.body.name);
     const { rows } = await pool.query(
-      `INSERT INTO factories (name, city, category, description, moq, stock, capacity, certs, features, videos, hashtags)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11) RETURNING *`,
+      `INSERT INTO factories (name, city, category, description, moq, stock, capacity, certs, features, videos, hashtags, cbf_code, is_verified)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13) RETURNING *`,
       [
         String(req.body.name).trim(),
         typeof req.body.city === 'string' ? req.body.city.trim() : '',
@@ -814,6 +984,8 @@ router.post('/factory/admin', requireAuth, requireAdmin,
         Array.isArray(req.body.features) ? req.body.features.map((x) => String(x).trim()).filter(Boolean).join(', ') : (typeof req.body.features === 'string' ? req.body.features.trim() : ''),
         JSON.stringify(videos === undefined ? [] : videos),
         hashtagsClean === undefined ? '' : hashtagsClean,
+        cbfCode,
+        verifiedCreate,
       ]
     );
     if (addressClean !== undefined || phoneClean !== undefined || contactClean !== undefined || wechatClean !== undefined || whatsappClean !== undefined || socialsClean !== undefined || tagsClean !== undefined || importCountriesClean !== undefined || employeesClean !== undefined || factoryAreaClean !== undefined || yearsClean !== undefined || mainProductsClean !== undefined) {
@@ -851,6 +1023,26 @@ router.put('/factory/admin/:id', requireAuth, requireAdmin,
     const params = [id];
     const push = (col, val, cast) => { params.push(val); sets.push(`${col} = $${params.length}${cast || ''}`); };
     if (req.body.name !== undefined) push('name', String(req.body.name).trim());
+    // CBF kilidi (UPDATE): gecerli kod SABIT'tir — farkli bir kodla degistirilemez.
+    // Bozuk bicimli/eksik mevcut kod, gecerli bicimli kodla bir kez duzeltilebilir.
+    if (req.body.cbf_code !== undefined) {
+      const cbfProvided = normalizeCbfCode(req.body.cbf_code);
+      if (cbfProvided) {
+        if (!isValidCbfCode(cbfProvided)) return res.status(400).json({ error: 'invalid_cbf_code', message: 'CBF kodu CBF-001 biçiminde olmalı (örn. CBF-001).' });
+        const { rows: cbfExistingRows } = await pool.query('SELECT cbf_code FROM factories WHERE id = $1', [id]);
+        const cbfExisting = cbfExistingRows.length ? normalizeCbfCode(cbfExistingRows[0].cbf_code) : '';
+        if (cbfExisting && isValidCbfCode(cbfExisting) && cbfExisting !== cbfProvided) {
+          return res.status(400).json({ error: 'cbf_code_locked', message: 'CBF kodu sabit, değiştirilemez.' });
+        }
+        if (cbfExisting !== cbfProvided) push('cbf_code', cbfProvided);
+      }
+    }
+    // VERIFIED (UPDATE): body verirse ata, verilmezse degistirme.
+    if (req.body.is_verified !== undefined) {
+      const verifiedClean = parseFactoryVerified(req.body.is_verified);
+      if (verifiedClean === null) return res.status(400).json({ error: 'invalid_is_verified' });
+      push('is_verified', verifiedClean);
+    }
     if (req.body.city !== undefined) push('city', String(req.body.city).trim());
     if (req.body.category !== undefined) push('category', String(req.body.category).trim());
     if (req.body.description !== undefined) push('description', String(req.body.description).trim());
