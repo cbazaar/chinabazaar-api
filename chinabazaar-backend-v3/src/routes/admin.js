@@ -713,4 +713,67 @@ router.post(
   })
 );
 
+// GET /api/admin/factory-activity — son ~20 fabrika etkilesimi (begeni/favori/yorum), en yeniden eskiye.
+// Bir etkilesim tablosu yoksa o tur bos doner — asla 500 olmaz. Admin korumasi router.use ile gelir.
+router.get(
+  '/factory-activity',
+  asyncHandler(async (req, res) => {
+    // Kullanici gorunumu: nickname > ad > e-posta on eki > Misafir (products.js factoryDisplayName ile ayni sira).
+    const userDisplay = `COALESCE(NULLIF(u.nickname,''), NULLIF(u.name,''), NULLIF(split_part(u.email,'@',1),''), 'Misafir') AS user_display`;
+    const oneTable = async (table, type, bodyCol) => {
+      try {
+        const { rows } = await pool.query(
+          `SELECT '${type}' AS type, x.id, x.video_key, x.created_at, ${bodyCol} AS body, ${userDisplay}
+           FROM ${table} x LEFT JOIN users u ON u.id::text = x.user_id::text
+           ORDER BY x.created_at DESC, x.id DESC LIMIT 20`
+        );
+        return rows;
+      } catch (e) {
+        if (e && e.code === '42P01') return []; // tablo henuz yok -> bu tur bos
+        throw e;
+      }
+    };
+    const [likes, favs, comments] = await Promise.all([
+      oneTable('factory_likes', 'like', 'NULL'),
+      oneTable('factory_favorites', 'favorite', 'NULL'),
+      oneTable('factory_comments', 'comment', 'x.body'),
+    ]);
+    // Fabrika adlari + video basliklari (video_key = "fabrikaId-videoIndex").
+    let factoryMap = {};
+    try {
+      const fids = [...new Set([...likes, ...favs, ...comments].map((r) => parseInt(String(r.video_key || '').split('-')[0], 10)).filter(Number.isInteger))];
+      if (fids.length) {
+        const { rows } = await pool.query('SELECT id, name, videos FROM factories WHERE id = ANY($1)', [fids]);
+        for (const f of rows) factoryMap[f.id] = f;
+      }
+    } catch (e) {
+      if (!(e && e.code === '42P01')) throw e; // factories tablosu yoksa adlar bos kalir
+    }
+    const items = [...likes, ...favs, ...comments]
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at))
+      .slice(0, 20)
+      .map((r) => {
+        const parts = String(r.video_key || '').split('-');
+        const fid = parseInt(parts[0], 10);
+        const vidx = parseInt(parts[1], 10);
+        const f = Number.isInteger(fid) ? factoryMap[fid] : null;
+        let videoTitle = null;
+        if (f) {
+          let vids = f.videos;
+          if (typeof vids === 'string') { try { vids = JSON.parse(vids); } catch (_) { vids = null; } }
+          if (Array.isArray(vids) && Number.isInteger(vidx) && vids[vidx] && typeof vids[vidx].title === 'string') videoTitle = vids[vidx].title;
+        }
+        return {
+          type: r.type,
+          user_display: r.user_display || 'Misafir',
+          factory_name: f ? f.name : null,
+          video_title: videoTitle,
+          comment_text: r.type === 'comment' && typeof r.body === 'string' ? r.body.slice(0, 140) : null,
+          created_at: r.created_at,
+        };
+      });
+    res.json({ items });
+  })
+);
+
 module.exports = router;
