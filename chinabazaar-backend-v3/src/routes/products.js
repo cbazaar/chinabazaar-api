@@ -484,6 +484,8 @@ async function ensureFactoryTables() {
   try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS cbf_code TEXT`); } catch (e) { /* cbf_code kolonu eklenemezse akis bozulmaz */ }
   // VERIFIED: dogrulanmis fabrika rozeti (is_verified BOOLEAN, varsayilan FALSE). Her ALTER kendi try/catch'indedir.
   try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT FALSE`); } catch (e) { /* is_verified kolonu eklenemezse akis bozulmaz */ }
+  // FACTORY EMAIL (fix5): fabrika e-posta adresi (opsiyonel, max 254, e-posta bicimi). Her ALTER kendi try/catch'indedir.
+  try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS email TEXT`); } catch (e) { /* email kolonu eklenemezse akis bozulmaz */ }
   // v118: user_id tip onarimi — users.id UUID, ama fabrika tablolari user_id'yi INT diye
   // tanimlamisti; UUID'li kullaniciyla her user_id sorgusu 500 veriyordu. INT->TEXT
   // donusumu kayipsizdir (her INT metne cevrilir); TEXT kolonda tekrar calismak no-op'tur.
@@ -565,6 +567,7 @@ function toFactoryPublic(r) {
     address: r.address || '',
     phone: r.phone || '',
     contact: r.contact || '',
+    email: r.email || null,
     wechat: r.wechat || '',
     whatsapp: r.whatsapp || '',
     socials: parseFactorySocials(r.socials),
@@ -635,6 +638,18 @@ function cleanFactoryText(v, max) {
   if (typeof v !== 'string') return null;
   const t = v.trim();
   if (t.length > max) return null;
+  return t;
+}
+
+// fix5: fabrika e-postasi — undefined => dokunma, bos string => '' (handler NULL saklar),
+// gecersiz (string degil / 254'ten uzun / e-posta biciminde degil) => null (handler 400 doner)
+function cleanFactoryEmail(v) {
+  if (v === undefined) return undefined;
+  if (typeof v !== 'string') return null;
+  const t = v.trim();
+  if (t === '') return '';
+  if (t.length > 254) return null;
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(t)) return null;
   return t;
 }
 
@@ -973,6 +988,8 @@ router.post('/factory/admin', requireAuth, requireAdmin,
     if (wechatClean === null) return res.status(400).json({ error: 'invalid_wechat' });
     const whatsappClean = cleanFactoryText(req.body.whatsapp, 200);
     if (whatsappClean === null) return res.status(400).json({ error: 'invalid_whatsapp' });
+    const emailClean = cleanFactoryEmail(req.body.email);
+    if (emailClean === null) return res.status(400).json({ error: 'invalid_email' });
     const socialsClean = cleanFactorySocials(req.body.socials);
     if (socialsClean === null) return res.status(400).json({ error: 'invalid_socials' });
     const tagsClean = cleanFactoryTags(req.body.tags);
@@ -1032,6 +1049,7 @@ router.post('/factory/admin', requireAuth, requireAdmin,
         if (req.body.contact !== undefined) mergePush('contact', contactClean);
         if (req.body.wechat !== undefined) mergePush('wechat', wechatClean);
         if (req.body.whatsapp !== undefined) mergePush('whatsapp', whatsappClean);
+        if (req.body.email !== undefined) mergePush('email', emailClean === '' ? null : emailClean);
         if (req.body.socials !== undefined) mergePush('socials', JSON.stringify(socialsClean), '::jsonb');
         if (req.body.tags !== undefined) mergePush('tags', tagsClean);
         // VERIFIED (CBF merge): body verirse guncelle, verilmezse degistirme.
@@ -1078,7 +1096,7 @@ router.post('/factory/admin', requireAuth, requireAdmin,
         verifiedCreate,
       ]
     );
-    if (addressClean !== undefined || phoneClean !== undefined || contactClean !== undefined || wechatClean !== undefined || whatsappClean !== undefined || socialsClean !== undefined || tagsClean !== undefined || importCountriesClean !== undefined || employeesClean !== undefined || factoryAreaClean !== undefined || yearsClean !== undefined || mainProductsClean !== undefined) {
+    if (addressClean !== undefined || phoneClean !== undefined || contactClean !== undefined || wechatClean !== undefined || whatsappClean !== undefined || emailClean !== undefined || socialsClean !== undefined || tagsClean !== undefined || importCountriesClean !== undefined || employeesClean !== undefined || factoryAreaClean !== undefined || yearsClean !== undefined || mainProductsClean !== undefined) {
       const updSets = [];
       const updParams = [rows[0].id];
       const updPush = (col, val, cast) => { updParams.push(val); updSets.push(`${col} = $${updParams.length}${cast || ''}`); };
@@ -1087,6 +1105,7 @@ router.post('/factory/admin', requireAuth, requireAdmin,
       if (contactClean !== undefined) updPush('contact', contactClean);
       if (wechatClean !== undefined) updPush('wechat', wechatClean);
       if (whatsappClean !== undefined) updPush('whatsapp', whatsappClean);
+      if (emailClean !== undefined) updPush('email', emailClean === '' ? null : emailClean);
       if (socialsClean !== undefined) updPush('socials', JSON.stringify(socialsClean), '::jsonb');
       if (tagsClean !== undefined) updPush('tags', tagsClean);
       if (importCountriesClean !== undefined) updPush('import_countries', importCountriesClean);
@@ -1175,6 +1194,11 @@ router.put('/factory/admin/:id', requireAuth, requireAdmin,
       const c = cleanFactoryText(req.body.whatsapp, 200);
       if (c === null) return res.status(400).json({ error: 'invalid_whatsapp' });
       push('whatsapp', c);
+    }
+    if (req.body.email !== undefined) {
+      const c = cleanFactoryEmail(req.body.email);
+      if (c === null) return res.status(400).json({ error: 'invalid_email' });
+      push('email', c === '' ? null : c);
     }
     if (req.body.socials !== undefined) {
       const c = cleanFactorySocials(req.body.socials);
