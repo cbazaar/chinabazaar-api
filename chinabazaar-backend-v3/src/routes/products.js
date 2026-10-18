@@ -1363,23 +1363,29 @@ async function ensureFactoryMessagesTable() {
   try { await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS attachment_name TEXT`); } catch (e) { /* attachment_name eklenemezse akis bozulmaz */ }
   try { await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS attachment_size INT`); } catch (e) { /* attachment_size eklenemezse akis bozulmaz */ }
   try { await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS attachment_mime TEXT`); } catch (e) { /* attachment_mime eklenemezse akis bozulmaz */ }
+// fix7: sohbet dosyalari Postgres'te saklanir (Railway diski gecici — her redeploy
+// yuklenen dosyalari siler, bu yuzden resimler bozuluyordu). token = tahmin edilemez URL anahtari.
+  await pool.query(`CREATE TABLE IF NOT EXISTS factory_chat_files (id SERIAL PRIMARY KEY, token TEXT NOT NULL UNIQUE, data BYTEA NOT NULL, mime TEXT NOT NULL, name TEXT, size INT, created_at TIMESTAMPTZ DEFAULT now())`);
   // v118: user_id tip onarimi (users.id UUID) — mesaj rotalari ensureFactoryTables'i
   // cagirmadigindan bu tablo icin donusum burada da calisir.
   try { await pool.query(`ALTER TABLE factory_messages ALTER COLUMN user_id TYPE TEXT USING user_id::text`); } catch (e) { /* tip zaten TEXT ise yoksay */ }
 }
 
-// Mesaj eki (resim) dogrulama: http(s) URL veya /uploads/ yolu kabul edilir.
+// Mesaj eki dogrulama: http(s) URL, /uploads/ yolu veya DB sohbet dosyasi URL'i kabul edilir.
+// fix7: /api/products/factory/chat-file/<id>/<token> sekli de gecerli (eski /uploads/ URL'leri aynen).
 function factoryMsgAttachmentOk(url) {
-  return /^https?:\/\//i.test(url) || /^\/uploads\//i.test(url);
+  return /^https?:\/\//i.test(url) || /^\/uploads\//i.test(url) || /^\/api\/products\/factory\/chat-file\/\d+\/[a-f0-9]{32}$/i.test(url);
 }
 
 // fix6: sohbet dosya ekleri — izinli turler (resim + PDF + Excel). Yurutulebilir/komut
 // dosyalari (.exe/.js/.html/.svg/.bat/.sh vb.) bu listede YOK, asla kabul edilmez.
+// fix7: + video (mp4/webm).
 const CHAT_UPLOAD_MIME = {
   'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif',
   'application/pdf': 'pdf',
   'application/vnd.ms-excel': 'xls',
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+  'video/mp4': 'mp4', 'video/webm': 'webm',
 };
 const CHAT_UPLOAD_MAX = 10 * 1024 * 1024; // 10 MB
 
@@ -1412,9 +1418,9 @@ function cleanChatAttachment(body) {
   }
   if (attachmentUrl) {
     if (!factoryMsgAttachmentOk(attachmentUrl)) return { ok: false, status: 400, error: 'invalid_attachment_url' };
-    const inferred = mime ? (mime.startsWith('image/') ? 'image' : 'file') : null;
+    const inferred = mime ? (mime.startsWith('image/') ? 'image' : mime.startsWith('video/') ? 'video' : 'file') : null;
     let kind;
-    if (rawKind === 'image' || rawKind === 'file') {
+    if (rawKind === 'image' || rawKind === 'file' || rawKind === 'video') {
       kind = rawKind;
       if (inferred && inferred !== kind) return { ok: false, status: 400, error: 'invalid_attachment_kind' };
     } else {
@@ -1423,17 +1429,17 @@ function cleanChatAttachment(body) {
     return { ok: true, attachmentUrl, kind, name, size, mime };
   }
   if (name || size !== null || mime) return { ok: false, status: 400, error: 'invalid_attachment_url' };
-  if (rawKind === 'image' || rawKind === 'file') return { ok: false, status: 400, error: 'invalid_attachment_url' };
+  if (rawKind === 'image' || rawKind === 'file' || rawKind === 'video') return { ok: false, status: 400, error: 'invalid_attachment_url' };
   if (!text) return { ok: false, status: 400, error: 'empty_message' };
   return { ok: true, attachmentUrl: null, kind: 'text', name: null, size: null, mime: null };
 }
 
 // POST /api/products/factory/messages {body?, attachment_url?, kind?} — kullanici mesaj gonderir (sender='user')
-// Yazi veya resim: resimde body bos olabilir; en az biri dolu olmali.
+// Yazi, resim, dosya veya video: ekte body bos olabilir; en az biri dolu olmali.
 router.post('/factory/messages', requireAuth, factorySpamLimiter,
   body('body').optional().trim().isLength({ max: 1000 }),
   body('attachment_url').optional().isString().isLength({ max: 2048 }),
-  body('kind').optional().isIn(['text', 'image', 'file']),
+  body('kind').optional().isIn(['text', 'image', 'file', 'video']),
   body('attachment_name').optional().isString().isLength({ max: 200 }),
   body('attachment_size').optional().isInt({ min: 0, max: 10485760 }),
   body('attachment_mime').optional().isString().isLength({ max: 100 }),
@@ -1522,7 +1528,7 @@ router.post('/factory/admin/messages/:id/reply', requireAuth, requireAdmin,
   param('id').isString().trim().isLength({ min: 1, max: 100 }),
   body('body').optional().trim().isLength({ max: 1000 }),
   body('attachment_url').optional().isString().isLength({ max: 2048 }),
-  body('kind').optional().isIn(['text', 'image', 'file']),
+  body('kind').optional().isIn(['text', 'image', 'file', 'video']),
   body('attachment_name').optional().isString().isLength({ max: 200 }),
   body('attachment_size').optional().isInt({ min: 0, max: 10485760 }),
   body('attachment_mime').optional().isString().isLength({ max: 100 }),
@@ -1547,10 +1553,10 @@ router.post('/factory/admin/messages/:id/reply', requireAuth, requireAdmin,
 // On yuz FormData ile gonderir (alan: `file`); ham dosya govdesi de kabul edilir.
 // Multer pakette yok — multipart siniri (boundary) elle cozumlenir, yeni bagimlilik yok.
 // fix6: resim (jpg/png/webp/gif) + PDF + Excel (xls/xlsx), en fazla 10MB, sihirli bayt
-// kontrolu, uzanti+MIME capraz dogrulama, rastgele saklama adi + temizlenmis orijinal ad.
-// Dosya src/uploads/factory-chat/ altina kaydedilir, herkese acik URL doner.
-// Donen URL'in calismasi icin index.js'de /uploads static sunumu gerekir (v630'da eklendi).
-const CHAT_UPLOAD_DIR = path.join(__dirname, '..', 'uploads', 'factory-chat');
+// kontrolu, uzanti+MIME capraz dogrulama, temizlenmis orijinal ad.
+// fix7: + video (mp4/webm). Dosya diske DEGIL Postgres'e (factory_chat_files) yazilir —
+// Railway diski her redeploy'da silindigi icin diske yazilan resimler bozuluyordu.
+// Donen URL /api/products/factory/chat-file/:id/:token uzerinden DB'den akar, redeploy'dan etkilenmez.
 // CHAT_UPLOAD_MIME + CHAT_UPLOAD_MAX + sanitizeChatFilename + cleanChatAttachment fix6'da
 // mesaj uclarinin ustunde tanimli (ortak kullanim).
 
@@ -1563,6 +1569,8 @@ function chatUploadMagicOk(buf, mime) {
   if (mime === 'application/pdf') return buf.toString('ascii', 0, 5) === '%PDF-';
   if (mime === 'application/vnd.ms-excel') return buf.length >= 8 && buf[0] === 0xd0 && buf[1] === 0xcf && buf[2] === 0x11 && buf[3] === 0xe0 && buf[4] === 0xa1 && buf[5] === 0xb1 && buf[6] === 0x1a && buf[7] === 0xe1;
   if (mime === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet') return buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04;
+  if (mime === 'video/mp4') return buf.length >= 8 && buf.toString('ascii', 4, 8) === 'ftyp';
+  if (mime === 'video/webm') return buf.length >= 4 && buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3;
   return false;
 }
 
@@ -1644,14 +1652,39 @@ router.post(
       const extMatch = /\.([A-Za-z0-9]+)$/.exec(file.filename.trim());
       if (!extMatch || CHAT_UPLOAD_MIME[mime] !== extMatch[1].toLowerCase()) return res.status(400).json({ error: 'unsupported_file_type' });
     }
-    await fs.promises.mkdir(CHAT_UPLOAD_DIR, { recursive: true });
-    const name = 'chat-' + Date.now() + '-' + crypto.randomBytes(8).toString('hex') + '.' + CHAT_UPLOAD_MIME[mime];
-    await fs.promises.writeFile(path.join(CHAT_UPLOAD_DIR, name), file.data);
-    const base = req.protocol + '://' + req.get('host');
+    // fix7: dosya diske DEGIL Postgres'e yazilir (Railway diski her redeploy'da silinir).
+    await ensureFactoryMessagesTable();
     const displayName = sanitizeChatFilename(file.filename) || ('dosya.' + CHAT_UPLOAD_MIME[mime]);
-    res.status(201).json({ ok: true, url: base + '/uploads/factory-chat/' + name, filename: displayName, size: file.data.length, mime });
+    const token = crypto.randomBytes(16).toString('hex');
+    const { rows } = await pool.query(
+      `INSERT INTO factory_chat_files (token, data, mime, name, size) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+      [token, file.data, mime, displayName, file.data.length]
+    );
+    const base = req.protocol + '://' + req.get('host');
+    res.status(201).json({ ok: true, url: base + '/api/products/factory/chat-file/' + rows[0].id + '/' + token, filename: displayName, size: file.data.length, mime });
   })
 );
+
+// fix7: GET /api/products/factory/chat-file/:id/:token — DB'deki sohbet dosyasini akar.
+// Kimlik dogrulama YOK: token tahmin edilemez (32 hex), URL'yi bilen indirir.
+// ?download=1 ise Content-Disposition: attachment (bilgisayara kaydetme), yoksa inline.
+// /factory/* rotalari GET /:id ONCESINE kayitli — /:id bunu yutmaz.
+router.get('/factory/chat-file/:id/:token', asyncHandler(async (req, res) => {
+  await ensureFactoryMessagesTable();
+  const id = parseInt(req.params.id, 10);
+  const token = String(req.params.token || '');
+  if (!Number.isInteger(id) || id <= 0 || !/^[a-f0-9]{32}$/i.test(token)) return res.status(404).json({ error: 'file_not_found' });
+  const { rows } = await pool.query(`SELECT data, mime, name, size FROM factory_chat_files WHERE id = $1 AND token = $2`, [id, token]);
+  if (!rows.length) return res.status(404).json({ error: 'file_not_found' });
+  const f = rows[0];
+  res.set('Content-Type', f.mime);
+  res.set('Cache-Control', 'private, max-age=31536000');
+  const safeName = sanitizeChatFilename(f.name) || 'dosya';
+  const asciiName = safeName.replace(/[^\x20-\x7e]/g, '_') || 'dosya';
+  res.set('Content-Disposition', (req.query.download === '1' ? 'attachment' : 'inline') + '; filename="' + asciiName.replace(/"/g, '') + '"; filename*=UTF-8\'\'' + encodeURIComponent(safeName));
+  if (f.size) res.set('Content-Length', String(f.size));
+  res.send(f.data);
+}));
 
 // GET /api/products/:id
 // GET /api/products/liked — kullanıcının beğendiği ürünler (profil: Beğendiğim Videolar, v570)
