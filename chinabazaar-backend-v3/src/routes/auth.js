@@ -1,10 +1,10 @@
 // Kimlik doğrulama: kayıt + giriş (JWT)
 const express = require('express');
 const bcrypt = require('bcryptjs');
-const { body } = require('express-validator');
+const { body, validationResult } = require('express-validator');
 const asyncHandler = require('../middleware/asyncHandler');
 const { checkValidation } = require('../middleware/validate');
-const { loginLimiter, registerLimiter } = require('../middleware/rateLimit');
+const { loginLimiter, registerLimiter, strictLoginLimiter, loginIdentifierLimiter } = require('../middleware/rateLimit');
 const codeLimiter = require('express-rate-limit')({ windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: { error: 'too_many_requests' } });
 const nicknameCheckLimiter = require('express-rate-limit')({ windowMs: 60 * 1000, max: 60, standardHeaders: true, legacyHeaders: false, message: { error: 'too_many_requests' } });
 const { signToken, requireAuth, optionalAuth } = require('../middleware/auth');
@@ -17,6 +17,23 @@ const router = express.Router();
 
 function publicUser(row) {
   return { id: row.id, email: row.email, name: row.name, nickname: row.nickname || null, phone: row.phone, is_admin: !!row.is_admin, customer_code: row.customer_code || null };
+}
+
+// ---- Giriş: tanıtan (identifier) yardımcıları ----
+// Kullanıcı yoksa bile bcrypt karşılaştırması yapılır (zamanlama ile kullanıcı
+// sayımını zorlaştırmak için); sahte hash başlangıçta bir kez üretilir.
+const DUMMY_HASH = bcrypt.hashSync('__chinabazaar_no_such_user__', 10);
+// Telefon varyantları: kayıtlı numara hangi formatta yazılmış olursa olsun
+// eşleşsin diye boşluk/tire/parantez atılır; +90 ↔ 0 ↔ çıplak alan kodu
+// dönüşümleri denenir. Şifre ASLA loglanmaz, tanıtan şifreyle birlikte loglanmaz.
+function phoneCandidates(identifier) {
+  const raw = String(identifier || '').replace(/[\s\-().]/g, '');
+  if (!raw) return [];
+  const out = new Set([raw]);
+  if (raw.startsWith('+90')) { out.add('0' + raw.slice(3)); out.add(raw.slice(3)); }
+  else if (raw.startsWith('90') && raw.length >= 11) { out.add('+90' + raw.slice(2)); out.add('0' + raw.slice(2)); }
+  else if (raw.startsWith('0')) { out.add('+90' + raw.slice(1)); out.add(raw.slice(1)); }
+  return [...out];
 }
 
 // ---- Kullanici adi korumasi ----
@@ -133,21 +150,41 @@ router.post(
   })
 );
 
-// POST /api/auth/login  { email, password }
+// POST /api/auth/login  { identifier | email, password }
+// identifier: e-posta, kullanıcı adı (nickname) veya telefon.
+// GÜVENLİK: Tüm başarısızlıklar (kullanıcı yok / yanlış şifre / bozuk tanıtan /
+// engelli hesap) AYNI 401 { error: 'invalid_credentials' } cevabını döner —
+// kullanıcı sayımı (enumeration) yapılamaz. Katı hız limiti: IP başına ve
+// tanıtan başına 15 dakikada en fazla 10 BAŞARISIZ deneme.
 router.post(
   '/login',
-  loginLimiter,
-  body('email').isEmail().normalizeEmail(),
-  body('password').notEmpty(),
+  strictLoginLimiter,
+  loginIdentifierLimiter,
+  body('identifier').optional().isString().trim().isLength({ min: 1, max: 320 }),
+  body('email').optional().isString().trim().isLength({ min: 1, max: 320 }),
+  body('password').optional().isString().isLength({ min: 1, max: 256 }),
   asyncHandler(async (req, res) => {
-    if (!checkValidation(req, res)) return;
-    const { email, password } = req.body;
-    const { rows } = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-    const row = rows[0];
-    if (!row || !(await bcrypt.compare(password, row.password_hash))) {
-      return res.status(401).json({ error: 'invalid_credentials' });
+    const GENERIC = { error: 'invalid_credentials' };
+    const identifier = String(req.body.identifier ?? req.body.email ?? '').trim();
+    const password = req.body.password;
+    if (!validationResult(req).isEmpty() || !identifier || typeof password !== 'string' || !password) {
+      return res.status(401).json(GENERIC);
     }
-    if (row.is_blocked) return res.status(403).json({ error: 'user_blocked' });
+    const candidates = phoneCandidates(identifier);
+    const { rows } = await pool.query(
+      `SELECT * FROM users
+       WHERE LOWER(email) = LOWER($1)
+          OR LOWER(nickname) = LOWER($1)
+          OR REGEXP_REPLACE(COALESCE(phone, ''), '[\\s\\-().]', '', 'g') = ANY($2)
+       ORDER BY CASE WHEN LOWER(email) = LOWER($1) THEN 0 WHEN LOWER(nickname) = LOWER($1) THEN 1 ELSE 2 END
+       LIMIT 1`,
+      [identifier, candidates]
+    );
+    const row = rows[0];
+    const ok = await bcrypt.compare(password, row ? row.password_hash : DUMMY_HASH);
+    if (!row || !ok || row.is_blocked) {
+      return res.status(401).json(GENERIC);
+    }
     const user = publicUser(row);
     res.json({ user, token: signToken(user) });
   })
