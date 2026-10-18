@@ -1359,6 +1359,10 @@ async function ensureFactoryMessagesTable() {
   await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS sender TEXT NOT NULL DEFAULT 'user'`);
   await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS attachment_url TEXT`);
   await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'text'`);
+// fix6: dosya eki meta alanlari (PDF/Excel/resim) — her biri kendi try/catch'inde, e-posta deseni.
+  try { await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS attachment_name TEXT`); } catch (e) { /* attachment_name eklenemezse akis bozulmaz */ }
+  try { await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS attachment_size INT`); } catch (e) { /* attachment_size eklenemezse akis bozulmaz */ }
+  try { await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS attachment_mime TEXT`); } catch (e) { /* attachment_mime eklenemezse akis bozulmaz */ }
   // v118: user_id tip onarimi (users.id UUID) — mesaj rotalari ensureFactoryTables'i
   // cagirmadigindan bu tablo icin donusum burada da calisir.
   try { await pool.query(`ALTER TABLE factory_messages ALTER COLUMN user_id TYPE TEXT USING user_id::text`); } catch (e) { /* tip zaten TEXT ise yoksay */ }
@@ -1369,27 +1373,79 @@ function factoryMsgAttachmentOk(url) {
   return /^https?:\/\//i.test(url) || /^\/uploads\//i.test(url);
 }
 
+// fix6: sohbet dosya ekleri — izinli turler (resim + PDF + Excel). Yurutulebilir/komut
+// dosyalari (.exe/.js/.html/.svg/.bat/.sh vb.) bu listede YOK, asla kabul edilmez.
+const CHAT_UPLOAD_MIME = {
+  'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif',
+  'application/pdf': 'pdf',
+  'application/vnd.ms-excel': 'xls',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+};
+const CHAT_UPLOAD_MAX = 10 * 1024 * 1024; // 10 MB
+
+// Dosya adi temizleme: basename al, yol ayiraci + kontrol karakterlerini at, en fazla 200 karakter.
+function sanitizeChatFilename(name) {
+  if (typeof name !== 'string') return '';
+  const base = name.split(/[\\/]/).pop() || '';
+  return base.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 200);
+}
+
+// fix6: mesaj eki meta dogrulama — kullanici + admin gonderim uclari ortak kullanir.
+// Donus: { ok:true, attachmentUrl, kind, name, size, mime } veya { ok:false, status, error }.
+function cleanChatAttachment(body) {
+  const text = (body.body || '').trim();
+  const attachmentUrl = typeof body.attachment_url === 'string' ? body.attachment_url.trim() : '';
+  const rawKind = body.kind;
+  let name = null, size = null, mime = null;
+  if (typeof body.attachment_name === 'string' && body.attachment_name.trim()) {
+    name = sanitizeChatFilename(body.attachment_name);
+    if (!name) return { ok: false, status: 400, error: 'invalid_attachment_name' };
+  }
+  if (body.attachment_size !== undefined && body.attachment_size !== null && body.attachment_size !== '') {
+    const n = Number(body.attachment_size);
+    if (!Number.isInteger(n) || n < 0 || n > CHAT_UPLOAD_MAX) return { ok: false, status: 400, error: 'invalid_attachment_size' };
+    size = n;
+  }
+  if (typeof body.attachment_mime === 'string' && body.attachment_mime.trim()) {
+    mime = body.attachment_mime.trim().toLowerCase();
+    if (!CHAT_UPLOAD_MIME[mime]) return { ok: false, status: 400, error: 'unsupported_file_type' };
+  }
+  if (attachmentUrl) {
+    if (!factoryMsgAttachmentOk(attachmentUrl)) return { ok: false, status: 400, error: 'invalid_attachment_url' };
+    const inferred = mime ? (mime.startsWith('image/') ? 'image' : 'file') : null;
+    let kind;
+    if (rawKind === 'image' || rawKind === 'file') {
+      kind = rawKind;
+      if (inferred && inferred !== kind) return { ok: false, status: 400, error: 'invalid_attachment_kind' };
+    } else {
+      kind = inferred || 'image';
+    }
+    return { ok: true, attachmentUrl, kind, name, size, mime };
+  }
+  if (name || size !== null || mime) return { ok: false, status: 400, error: 'invalid_attachment_url' };
+  if (rawKind === 'image' || rawKind === 'file') return { ok: false, status: 400, error: 'invalid_attachment_url' };
+  if (!text) return { ok: false, status: 400, error: 'empty_message' };
+  return { ok: true, attachmentUrl: null, kind: 'text', name: null, size: null, mime: null };
+}
+
 // POST /api/products/factory/messages {body?, attachment_url?, kind?} — kullanici mesaj gonderir (sender='user')
 // Yazi veya resim: resimde body bos olabilir; en az biri dolu olmali.
 router.post('/factory/messages', requireAuth, factorySpamLimiter,
   body('body').optional().trim().isLength({ max: 1000 }),
   body('attachment_url').optional().isString().isLength({ max: 2048 }),
-  body('kind').optional().isIn(['text', 'image']),
+  body('kind').optional().isIn(['text', 'image', 'file']),
+  body('attachment_name').optional().isString().isLength({ max: 200 }),
+  body('attachment_size').optional().isInt({ min: 0, max: 10485760 }),
+  body('attachment_mime').optional().isString().isLength({ max: 100 }),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     await ensureFactoryMessagesTable();
     const text = (req.body.body || '').trim();
-    const attachmentUrl = typeof req.body.attachment_url === 'string' ? req.body.attachment_url.trim() : '';
-    let kind = req.body.kind === 'image' ? 'image' : 'text';
-    if (attachmentUrl) {
-      if (!factoryMsgAttachmentOk(attachmentUrl)) return res.status(400).json({ error: 'invalid_attachment_url' });
-      kind = 'image';
-    } else if (!text) {
-      return res.status(400).json({ error: 'empty_message' });
-    }
+    const att = cleanChatAttachment(req.body);
+    if (!att.ok) return res.status(att.status).json({ error: att.error });
     const { rows } = await pool.query(
-      `INSERT INTO factory_messages (user_id, body, sender, attachment_url, kind) VALUES ($1, $2, 'user', $3, $4) RETURNING id, user_id, body, sender, attachment_url, kind, created_at`,
-      [req.user.id, text, attachmentUrl || null, kind]
+      `INSERT INTO factory_messages (user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime) VALUES ($1, $2, 'user', $3, $4, $5, $6, $7) RETURNING id, user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, created_at`,
+      [req.user.id, text, att.attachmentUrl, att.kind, att.name, att.size, att.mime]
     );
     res.status(201).json({ message: rows[0] });
   })
@@ -1399,7 +1455,7 @@ router.post('/factory/messages', requireAuth, factorySpamLimiter,
 router.get('/factory/messages', requireAuth, asyncHandler(async (req, res) => {
   await ensureFactoryMessagesTable();
   const { rows } = await pool.query(
-    `SELECT id, user_id, body, sender, attachment_url, kind, created_at FROM factory_messages WHERE user_id=$1 ORDER BY created_at ASC, id ASC`,
+    `SELECT id, user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, created_at FROM factory_messages WHERE user_id=$1 ORDER BY created_at ASC, id ASC`,
     [req.user.id]
   );
   res.json({ messages: rows });
@@ -1448,7 +1504,7 @@ router.get('/factory/quotes', requireAuth, asyncHandler(async (req, res) => {
 router.get('/factory/admin/messages', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
   await ensureFactoryMessagesTable();
   const { rows } = await pool.query(
-    `SELECT m.id, m.user_id, m.body, m.sender, m.attachment_url, m.kind, m.created_at,
+    `SELECT m.id, m.user_id, m.body, m.sender, m.attachment_url, m.kind, m.attachment_name, m.attachment_size, m.attachment_mime, m.created_at,
             COALESCE(NULLIF(u.nickname,''), NULLIF(u.name,''), split_part(u.email,'@',1), 'Misafir') AS name
      FROM factory_messages m LEFT JOIN users u ON u.id::text = m.user_id::text
      ORDER BY m.user_id ASC, m.created_at ASC, m.id ASC`
@@ -1456,7 +1512,7 @@ router.get('/factory/admin/messages', requireAuth, requireAdmin, asyncHandler(as
   const byUser = new Map();
   for (const r of rows) {
     if (!byUser.has(r.user_id)) byUser.set(r.user_id, { user_id: r.user_id, name: r.name || 'Misafir', messages: [] });
-    byUser.get(r.user_id).messages.push({ id: r.id, body: r.body, sender: r.sender, attachment_url: r.attachment_url || null, kind: r.kind || 'text', created_at: r.created_at });
+    byUser.get(r.user_id).messages.push({ id: r.id, body: r.body, sender: r.sender, attachment_url: r.attachment_url || null, kind: r.kind || 'text', attachment_name: r.attachment_name || null, attachment_size: r.attachment_size ?? null, attachment_mime: r.attachment_mime || null, created_at: r.created_at });
   }
   res.json({ conversations: [...byUser.values()] });
 }));
@@ -1466,7 +1522,10 @@ router.post('/factory/admin/messages/:id/reply', requireAuth, requireAdmin,
   param('id').isString().trim().isLength({ min: 1, max: 100 }),
   body('body').optional().trim().isLength({ max: 1000 }),
   body('attachment_url').optional().isString().isLength({ max: 2048 }),
-  body('kind').optional().isIn(['text', 'image']),
+  body('kind').optional().isIn(['text', 'image', 'file']),
+  body('attachment_name').optional().isString().isLength({ max: 200 }),
+  body('attachment_size').optional().isInt({ min: 0, max: 10485760 }),
+  body('attachment_mime').optional().isString().isLength({ max: 100 }),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     await ensureFactoryMessagesTable();
@@ -1474,31 +1533,26 @@ router.post('/factory/admin/messages/:id/reply', requireAuth, requireAdmin,
     const { rows: urows } = await pool.query('SELECT id FROM users WHERE id = $1', [userId]);
     if (!urows.length) return res.status(404).json({ error: 'user_not_found' });
     const text = (req.body.body || '').trim();
-    const attachmentUrl = typeof req.body.attachment_url === 'string' ? req.body.attachment_url.trim() : '';
-    let kind = req.body.kind === 'image' ? 'image' : 'text';
-    if (attachmentUrl) {
-      if (!factoryMsgAttachmentOk(attachmentUrl)) return res.status(400).json({ error: 'invalid_attachment_url' });
-      kind = 'image';
-    } else if (!text) {
-      return res.status(400).json({ error: 'empty_message' });
-    }
+    const att = cleanChatAttachment(req.body);
+    if (!att.ok) return res.status(att.status).json({ error: att.error });
     const { rows } = await pool.query(
-      `INSERT INTO factory_messages (user_id, body, sender, attachment_url, kind) VALUES ($1, $2, 'admin', $3, $4) RETURNING id, user_id, body, sender, attachment_url, kind, created_at`,
-      [userId, text, attachmentUrl || null, kind]
+      `INSERT INTO factory_messages (user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime) VALUES ($1, $2, 'admin', $3, $4, $5, $6, $7) RETURNING id, user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, created_at`,
+      [userId, text, att.attachmentUrl, att.kind, att.name, att.size, att.mime]
     );
     res.status(201).json({ message: rows[0] });
   })
 );
 
-// POST /api/products/factory/chat-upload — CBAI sohbetine resim yukle (giris yapmis kullanici)
-// On yuz FormData ile gonderir (alan: `file`); ham resim govdesi de kabul edilir.
+// POST /api/products/factory/chat-upload — CBAI sohbetine dosya yukle (giris yapmis kullanici)
+// On yuz FormData ile gonderir (alan: `file`); ham dosya govdesi de kabul edilir.
 // Multer pakette yok — multipart siniri (boundary) elle cozumlenir, yeni bagimlilik yok.
-// Yalnizca jpg/png/webp/gif, en fazla 10MB, sihirli bayt kontrolu, rastgele ad.
+// fix6: resim (jpg/png/webp/gif) + PDF + Excel (xls/xlsx), en fazla 10MB, sihirli bayt
+// kontrolu, uzanti+MIME capraz dogrulama, rastgele saklama adi + temizlenmis orijinal ad.
 // Dosya src/uploads/factory-chat/ altina kaydedilir, herkese acik URL doner.
 // Donen URL'in calismasi icin index.js'de /uploads static sunumu gerekir (v630'da eklendi).
 const CHAT_UPLOAD_DIR = path.join(__dirname, '..', 'uploads', 'factory-chat');
-const CHAT_UPLOAD_MAX = 10 * 1024 * 1024; // 10 MB
-const CHAT_UPLOAD_MIME = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif' };
+// CHAT_UPLOAD_MIME + CHAT_UPLOAD_MAX + sanitizeChatFilename + cleanChatAttachment fix6'da
+// mesaj uclarinin ustunde tanimli (ortak kullanim).
 
 function chatUploadMagicOk(buf, mime) {
   if (!Buffer.isBuffer(buf) || buf.length < 4) return false;
@@ -1506,6 +1560,9 @@ function chatUploadMagicOk(buf, mime) {
   if (mime === 'image/png') return buf.length >= 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47 && buf[4] === 0x0d && buf[5] === 0x0a && buf[6] === 0x1a && buf[7] === 0x0a;
   if (mime === 'image/gif') return buf.toString('ascii', 0, 6) === 'GIF87a' || buf.toString('ascii', 0, 6) === 'GIF89a';
   if (mime === 'image/webp') return buf.length >= 12 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP';
+  if (mime === 'application/pdf') return buf.toString('ascii', 0, 5) === '%PDF-';
+  if (mime === 'application/vnd.ms-excel') return buf.length >= 8 && buf[0] === 0xd0 && buf[1] === 0xcf && buf[2] === 0x11 && buf[3] === 0xe0 && buf[4] === 0xa1 && buf[5] === 0xb1 && buf[6] === 0x1a && buf[7] === 0xe1;
+  if (mime === 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet') return buf[0] === 0x50 && buf[1] === 0x4b && buf[2] === 0x03 && buf[3] === 0x04;
   return false;
 }
 
@@ -1535,9 +1592,11 @@ function parseMultipartFile(buf, contentType) {
     const nameMatch = /name="([^"]*)"/i.exec(headers);
     if (nameMatch && nameMatch[1] === 'file') {
       const typeMatch = /content-type:\s*([^\r\n;]+)/i.exec(headers);
+      const fnMatch = /filename="([^"]*)"/i.exec(headers); // fix6: orijinal dosya adi (meta icin)
       return {
         data: Buffer.from(buf.subarray(dataStart, dataEnd)),
         contentType: typeMatch ? typeMatch[1].trim().toLowerCase() : '',
+        filename: fnMatch ? fnMatch[1] : '',
       };
     }
     pos = dataEnd + nextDelim.length;
@@ -1572,19 +1631,25 @@ router.post(
       if (!file) return res.status(400).json({ error: 'empty_file' });
     } else if (CHAT_UPLOAD_MIME[ct]) {
       if (!Buffer.isBuffer(req.body) || !req.body.length) return res.status(400).json({ error: 'empty_file' });
-      file = { data: req.body, contentType: ct };
+      file = { data: req.body, contentType: ct, filename: '' };
     } else {
-      return res.status(415).json({ error: 'invalid_content_type' });
+      return res.status(400).json({ error: 'unsupported_file_type' });
     }
     const mime = file.contentType;
-    if (!CHAT_UPLOAD_MIME[mime]) return res.status(415).json({ error: 'invalid_content_type' });
-    if (file.data.length > CHAT_UPLOAD_MAX) return res.status(413).json({ error: 'file_too_large' });
+    if (!CHAT_UPLOAD_MIME[mime]) return res.status(400).json({ error: 'unsupported_file_type' });
+    if (file.data.length > CHAT_UPLOAD_MAX) return res.status(400).json({ error: 'file_too_large' });
     if (!chatUploadMagicOk(file.data, mime)) return res.status(415).json({ error: 'invalid_file' });
+    // Uzanti + MIME capraz dogrulama (multipart'ta dosya adi varsa): uzanti MIME ile eslesmeli.
+    if (file.filename) {
+      const extMatch = /\.([A-Za-z0-9]+)$/.exec(file.filename.trim());
+      if (!extMatch || CHAT_UPLOAD_MIME[mime] !== extMatch[1].toLowerCase()) return res.status(400).json({ error: 'unsupported_file_type' });
+    }
     await fs.promises.mkdir(CHAT_UPLOAD_DIR, { recursive: true });
     const name = 'chat-' + Date.now() + '-' + crypto.randomBytes(8).toString('hex') + '.' + CHAT_UPLOAD_MIME[mime];
     await fs.promises.writeFile(path.join(CHAT_UPLOAD_DIR, name), file.data);
     const base = req.protocol + '://' + req.get('host');
-    res.status(201).json({ ok: true, url: base + '/uploads/factory-chat/' + name, size: file.data.length });
+    const displayName = sanitizeChatFilename(file.filename) || ('dosya.' + CHAT_UPLOAD_MIME[mime]);
+    res.status(201).json({ ok: true, url: base + '/uploads/factory-chat/' + name, filename: displayName, size: file.data.length, mime });
   })
 );
 
