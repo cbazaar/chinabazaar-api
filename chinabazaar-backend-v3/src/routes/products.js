@@ -9,6 +9,8 @@ const { requireAuth, optionalAuth } = require('../middleware/auth');
 const { requireAdmin } = require('../middleware/admin');
 const pool = require('../db');
 const crypto = require('crypto');
+
+const rateLimit = require('express-rate-limit');
 const fs = require('fs');
 const path = require('path');
 
@@ -123,8 +125,11 @@ router.get(
   optionalAuth,
   asyncHandler(async (req, res) => {
     const { category, q } = req.query;
-    const limit = Math.min(parseInt(req.query.limit || '20', 10), 100);
-    const offset = Math.max(parseInt(req.query.offset || '0', 10), 0);
+    // SHOP SECURITY: limit/offset sayisal degilse veya negatifse varsayilana dus (NaN/negatif LIMIT Postgres 500'u verirdi).
+    const limitRaw = parseInt(req.query.limit || '20', 10);
+    const offsetRaw = parseInt(req.query.offset || '0', 10);
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 100) : 20;
+    const offset = Number.isFinite(offsetRaw) ? Math.max(offsetRaw, 0) : 0;
     const sort = req.query.sort || 'popular'; // popular | newest | price_asc | price_desc
 
     let showAll = false;
@@ -190,6 +195,7 @@ router.post(
   '/:id/share',
   param('id').isUUID(),
   optionalAuth,
+  shopShareLimiter,
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     const { rows: pr } = await pool.query('SELECT id FROM products WHERE id=$1', [req.params.id]);
@@ -206,10 +212,38 @@ async function ensureWhatsappTables() {
   await pool.query(`CREATE TABLE IF NOT EXISTS whatsapp_messages (id SERIAL PRIMARY KEY, conversation_id INT NOT NULL REFERENCES whatsapp_conversations(id) ON DELETE CASCADE, wa_message_id TEXT UNIQUE, direction TEXT NOT NULL, body TEXT DEFAULT '', msg_type TEXT DEFAULT 'text', status TEXT DEFAULT '', created_at TIMESTAMPTZ DEFAULT now())`);
 }
 async function waSettings() {
-  const { rows } = await pool.query(`SELECT key, value FROM settings WHERE key IN ('wa_phone_id', 'wa_token', 'wa_verify', 'wa_enabled', 'wa_username')`);
+  const { rows } = await pool.query(`SELECT key, value FROM settings WHERE key IN ('wa_phone_id', 'wa_token', 'wa_verify', 'wa_enabled', 'wa_username', 'wa_app_secret')`);
   const kv = {};
   rows.forEach((r) => { kv[r.key] = r.value; });
   return kv;
+}
+// WHATSAPP SECURITY: X-Hub-Signature-256 dogrulamasi (Meta App Secret ile HMAC-SHA256).
+// - Secret bos/yoksa: eski davranis aynen (kabul) — geriye donuk uyumlu, kirilma yok.
+// - Secret VARSA: imza eksik/gecersizse reddet (401). Yanlis imza asla kabul edilmez:
+//   saldirgan secret'i bilmeden gecerli bir HMAC uretemez (yanlis govde karsilastirmasi
+//   yalnizca hatali REDDE yol acabilir, hatali kabule degil — fail-closed).
+// - Govde adaylari: req.rawBody (index.js express.json verify kancasi varsa, KESIN yol) ve
+//   JSON.stringify(req.body) (yedek; Meta'nin compact JSON govdesiyle pratikte aynidir).
+//   Tam ham-govde yakalama icin onerilen izleyen adim: index.js'te
+//   express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }).
+function verifyWhatsappSignature(req, secret) {
+  try {
+    if (!secret || !String(secret).trim()) return true; // secret yoksa: eski davranis
+    const sig = String(req.headers['x-hub-signature-256'] || '');
+    const m = /^sha256=([a-f0-9]{64})$/i.exec(sig);
+    if (!m) return false;
+    const expected = Buffer.from(m[1], 'hex');
+    const candidates = [];
+    if (Buffer.isBuffer(req.rawBody)) candidates.push(req.rawBody);
+    try { candidates.push(Buffer.from(JSON.stringify(req.body ?? {}), 'utf8')); } catch { /* yoksay */ }
+    for (const bodyBuf of candidates) {
+      const hmac = crypto.createHmac('sha256', String(secret)).update(bodyBuf).digest();
+      if (hmac.length === expected.length && crypto.timingSafeEqual(hmac, expected)) return true;
+    }
+    return false;
+  } catch {
+    return false; // suphede reddet (fail-closed), asla acik kapı birakma
+  }
 }
 // GET /api/products/whatsapp/webhook — Meta dogrulama (herkese acik, jeton sart)
 router.get('/whatsapp/webhook', asyncHandler(async (req, res) => {
@@ -218,12 +252,16 @@ router.get('/whatsapp/webhook', asyncHandler(async (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
-  if (mode === 'subscribe' && kv.wa_verify && token === kv.wa_verify) return res.status(200).send(challenge);
+  if (mode === 'subscribe' && kv.wa_verify && typeof token === 'string' && timingSafeEqualStr(kv.wa_verify, token)) return res.status(200).send(challenge);
   return res.sendStatus(403);
 }));
 // POST /api/products/whatsapp/webhook — Meta gelen mesaj + durum bildirimi (herkese acik, her zaman 200)
+// WHATSAPP SECURITY: wa_app_secret ayarlanmissa X-Hub-Signature-256 dogrulanir; imza
+// gecersizse 401 (sahte webhook / sahte mesaj enjeksiyonu engellenir). Secret yoksa eski davranis.
 router.post('/whatsapp/webhook', asyncHandler(async (req, res) => {
   try {
+    const kvSig = await waSettings().catch(() => ({}));
+    if (!verifyWhatsappSignature(req, kvSig.wa_app_secret)) return res.sendStatus(401);
     await ensureWhatsappTables();
     const entries = (req.body && req.body.entry) || [];
     for (const entry of entries) {
@@ -311,7 +349,7 @@ router.get('/whatsapp/status', requireAuth, requireAdmin, asyncHandler(async (re
   const kv = await waSettings();
   const { rows } = await pool.query(`SELECT COUNT(*)::int AS convs, COALESCE(SUM(unread_count),0)::int AS unread FROM whatsapp_conversations`);
   const origin = `${req.protocol}://${req.get('host')}`;
-  res.json({ ok: true, configured: !!(kv.wa_phone_id && kv.wa_token), enabled: kv.wa_enabled === 'true', verify_set: !!kv.wa_verify, username: kv.wa_username || '', webhook_url: origin + '/api/products/whatsapp/webhook', conversations: rows[0].convs, unread: rows[0].unread });
+  res.json({ ok: true, configured: !!(kv.wa_phone_id && kv.wa_token), enabled: kv.wa_enabled === 'true', verify_set: !!kv.wa_verify, app_secret_set: !!kv.wa_app_secret, username: kv.wa_username || '', webhook_url: origin + '/api/products/whatsapp/webhook', conversations: rows[0].convs, unread: rows[0].unread });
 }));
 
 // CBF: fabrika kodu — CBF-001, CBF-002, … (buyuk harf CBF-, sifir dolgulu 3 hane).
@@ -407,6 +445,12 @@ async function ensureFactoryTables() {
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_video_views (video TEXT PRIMARY KEY, views INT NOT NULL DEFAULT 0)`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_ratings (id SERIAL PRIMARY KEY, factory_id INT NOT NULL REFERENCES factories(id) ON DELETE CASCADE, user_id TEXT NOT NULL, rating INT NOT NULL CHECK (rating BETWEEN 1 AND 5), created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now(), UNIQUE(factory_id, user_id))`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_subscriptions (id SERIAL PRIMARY KEY, user_id TEXT NOT NULL, status TEXT DEFAULT 'pending', started_at TIMESTAMPTZ, ends_at TIMESTAMPTZ, paytr_merchant_oid TEXT UNIQUE, amount INT, currency TEXT DEFAULT 'USD', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now())`);
+  // Abonelik/VIP: admin_grant tamamlayici abonelik icin plan/provider/expires_at.
+  // Eski (odemeli) satirlarda yalniz ends_at dolu olabilir — /me ikisini COALESCE ile okur,
+  // grant her iki sutunu da ayni degere yazar; boylece ends_at okuyan mevcut kod bozulmaz.
+  await pool.query(`ALTER TABLE factory_subscriptions ADD COLUMN IF NOT EXISTS plan TEXT`);
+  await pool.query(`ALTER TABLE factory_subscriptions ADD COLUMN IF NOT EXISTS provider TEXT`);
+  await pool.query(`ALTER TABLE factory_subscriptions ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factories (id SERIAL PRIMARY KEY, name TEXT NOT NULL, city TEXT DEFAULT '', category TEXT DEFAULT '', description TEXT DEFAULT '', moq INT DEFAULT 0, stock INT DEFAULT 0, capacity TEXT DEFAULT '', certs TEXT DEFAULT '', features TEXT DEFAULT '', import_countries TEXT DEFAULT '', employees TEXT DEFAULT '', factory_area TEXT DEFAULT '', years TEXT DEFAULT '', main_products TEXT DEFAULT '', videos JSONB DEFAULT '[]', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now())`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS hashtags TEXT DEFAULT ''`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS address TEXT DEFAULT ''`);
@@ -439,6 +483,47 @@ async function ensureFactoryTables() {
 }
 
 const FACTORY_VIDEO_RE = /^\d+-\d+$/;
+
+// SECURITY v128: spam koruması — yorum + CBAI mesaj gönderimi için kullanıcı başına
+// nazik limit (15 dakikada 60). Normal kullanıcı kilitlenmez; spam/bot akışı
+// yavaşlatılır. rateLimit.js deseniyle aynı (message: { error }).
+const factorySpamLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'too_many_requests' },
+  keyGenerator: (req) => 'factory-spam:' + (req.user && req.user.id ? String(req.user.id) : req.ip),
+});
+
+// SHOP SECURITY: magaza yorum + paylasim icin nazik limit (fabrika deseniyle ayni).
+// Yorum: giris yapan kullanici basina 15 dakikada 60. Paylasim: kullanici/IP basina 15 dakikada 120.
+// Normal kullanici kilitlenmez; botun tabloyu satirla sisirmesi yavaslatilir.
+const shopSpamLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'too_many_requests' },
+  keyGenerator: (req) => 'shop-spam:' + (req.user && req.user.id ? String(req.user.id) : req.ip),
+});
+const shopShareLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'too_many_requests' },
+  keyGenerator: (req) => 'shop-share:' + (req.user && req.user.id ? String(req.user.id) : req.ip),
+});
+
+// SHOP SECURITY: gizli jeton karsilastirmasi icin zamanlama-saldirisina dayanikli esitlik.
+function timingSafeEqualStr(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
+}
 
 // Goruntulenecek ad: nickname || name || e-posta on eki (e-posta adresinin tamami ASLA donulmez)
 function factoryDisplayName(u) {
@@ -695,7 +780,7 @@ router.get('/factory/comments', asyncHandler(async (req, res) => {
 }));
 
 // POST /api/products/factory/comments {video, body} — yorum ekle
-router.post('/factory/comments', requireAuth,
+router.post('/factory/comments', requireAuth, factorySpamLimiter,
   body('video').matches(/^\d+-\d+$/),
   body('body').trim().isLength({ min: 1, max: 1000 }),
   asyncHandler(async (req, res) => {
@@ -1139,6 +1224,90 @@ router.get('/factory/admin/subscriptions', requireAuth, requireAdmin, asyncHandl
   res.json(rows.map((r) => ({ id: r.id, user_id: r.user_id, name: r.name || '', email: r.email || null, status: r.status, started_at: r.started_at, ends_at: r.ends_at, amount: r.amount, currency: r.currency })));
 }));
 
+// Abonelik / VIP — admin_grant: odeme kaydi OLMAYAN tamamlayici abonelik.
+// provider='admin_grant' satirlari ASLA sahte PayTR/odeme kaydi degildir: paytr_merchant_oid
+// bos birakilir, amount yazilmaz. Aktiflik tanimi saglayicidan bagimsizdir:
+// status='active' AND (expires_at IS NULL OR expires_at > now()) — provider'a gore
+// filtre YOK, yani admin_grant satiri odemeli aktif satirla birebir ayni sayilir.
+// Eski odemeli satirlarda yalniz ends_at dolu olabilir; okuma COALESCE(expires_at, ends_at) ile yapilir.
+// UYELIK KAPISI: factory/quotes ve factory/messages olusturma su an ACIK (uyelik kontrolu yok);
+// bu gorevde kilitlenmedi — mevcut davranis aynen korundu.
+
+// GET /api/products/factory/subscription/me — giris yapan kullanicinin kendi aboneligi (baskasinin satiri donulmez)
+// { has_active, plan, expires_at, is_vip } — is_vip = aktif + plan='yearly' (on yuz VIP rozeti icin).
+router.get('/factory/subscription/me', requireAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const { rows } = await pool.query(
+    `SELECT id, user_id, status, plan, provider, started_at, COALESCE(expires_at, ends_at) AS expires_at
+     FROM factory_subscriptions
+     WHERE user_id = $1 AND status = 'active'
+       AND (COALESCE(expires_at, ends_at) IS NULL OR COALESCE(expires_at, ends_at) > now())
+     ORDER BY COALESCE(expires_at, ends_at) DESC NULLS LAST, id DESC LIMIT 1`,
+    [String(req.user.id)]
+  );
+  if (!rows.length) return res.json({ has_active: false, plan: null, expires_at: null, is_vip: false });
+  const plan = rows[0].plan || null;
+  res.json({ has_active: true, plan, expires_at: rows[0].expires_at, is_vip: plan === 'yearly' });
+}));
+
+// POST /api/products/factory/admin/subscriptions/grant — admin tamamlayici abonelik tanimlar.
+// Body { identifier, plan='yearly', months=12 }. identifier = e-posta veya nickname
+// (bastaki @ isaretleri atilir: "@iiec" -> "iiec").
+// (giris ile ayni eslesme: auth.js — LOWER(email) / LOWER(nickname)).
+// Tabloda user_id UNIQUE yok; aktif satir varsa mukerrer olusturulmadan guncellenir
+// (select-then-update), yoksa yeni aktif satir eklenir. Donus: olusturulan/guncellenen satir
+// (sifre/token/baska kullanici verisi yok).
+router.post('/factory/admin/subscriptions/grant', requireAuth, requireAdmin,
+  body('identifier').optional().isString().trim().isLength({ min: 1, max: 320 }),
+  body('plan').optional().isString().trim(),
+  body('months').optional().isInt(),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    await ensureFactoryTables();
+    const identifierRaw = typeof req.body.identifier === 'string' ? req.body.identifier.trim() : '';
+    // VIP FIX: "@iiec" -> "iiec" — bastaki @ isaretleri (hepsi) atilir, yoksa nickname eslesmez.
+    const identifier = identifierRaw.replace(/^@+/, '');
+    if (!identifier) return res.status(400).json({ error: 'identifier_required' });
+    const plan = typeof req.body.plan === 'string' && req.body.plan.trim() ? req.body.plan.trim() : 'yearly';
+    if (!['monthly', 'yearly'].includes(plan)) return res.status(400).json({ error: 'invalid_plan' });
+    const monthsRaw = (req.body.months === undefined || req.body.months === null || req.body.months === '') ? 12 : req.body.months;
+    const months = Number(monthsRaw);
+    if (!Number.isInteger(months) || months < 1 || months > 60) return res.status(400).json({ error: 'invalid_months' });
+    const { rows: urows } = await pool.query(
+      `SELECT id FROM users WHERE LOWER(email) = LOWER($1) OR LOWER(nickname) = LOWER($1)
+       ORDER BY CASE WHEN LOWER(email) = LOWER($1) THEN 0 ELSE 1 END LIMIT 1`,
+      [identifier]
+    );
+    if (!urows.length) return res.status(404).json({ error: 'user_not_found' });
+    const userId = String(urows[0].id);
+    const { rows: existing } = await pool.query(
+      `SELECT id FROM factory_subscriptions WHERE user_id = $1 AND status = 'active'
+       ORDER BY COALESCE(expires_at, ends_at) DESC NULLS LAST, id DESC LIMIT 1`,
+      [userId]
+    );
+    const RETURNING = `RETURNING id, user_id, status, plan, provider, started_at, expires_at, ends_at, amount, currency, created_at, updated_at`;
+    let row;
+    if (existing.length) {
+      const { rows } = await pool.query(
+        `UPDATE factory_subscriptions SET plan = $2, provider = 'admin_grant', status = 'active',
+         started_at = now(), expires_at = now() + ($3 * INTERVAL '1 month'), ends_at = now() + ($3 * INTERVAL '1 month'),
+         updated_at = now() WHERE id = $1 ${RETURNING}`,
+        [existing[0].id, plan, months]
+      );
+      row = rows[0];
+      res.json({ subscription: row });
+    } else {
+      const { rows } = await pool.query(
+        `INSERT INTO factory_subscriptions (user_id, status, plan, provider, started_at, expires_at, ends_at)
+         VALUES ($1, 'active', $2, 'admin_grant', now(), now() + ($3 * INTERVAL '1 month'), now() + ($3 * INTERVAL '1 month')) ${RETURNING}`,
+        [userId, plan, months]
+      );
+      row = rows[0];
+      res.status(201).json({ subscription: row });
+    }
+  })
+);
+
 
 // v620: Factory mesajlasma (CBAI — SADECE MyFactory'den gelen konusmalar; magaza CBAI'ndan ayri)
 // Tum /factory/* rotalari GET /:id ONCESINE kayitli — /:id bunlari yutmaz.
@@ -1164,7 +1333,7 @@ function factoryMsgAttachmentOk(url) {
 
 // POST /api/products/factory/messages {body?, attachment_url?, kind?} — kullanici mesaj gonderir (sender='user')
 // Yazi veya resim: resimde body bos olabilir; en az biri dolu olmali.
-router.post('/factory/messages', requireAuth,
+router.post('/factory/messages', requireAuth, factorySpamLimiter,
   body('body').optional().trim().isLength({ max: 1000 }),
   body('attachment_url').optional().isString().isLength({ max: 2048 }),
   body('kind').optional().isIn(['text', 'image']),
@@ -1483,7 +1652,7 @@ router.all('/enable-mp4', requireAuth, requireAdmin, async (req, res) => {
     }
     res.json({ ok: true, enabled: ok, failed: fail, total: rows.length, errors });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ ok: false, error: 'enable_failed' });
   }
 });
 
@@ -1620,6 +1789,8 @@ router.put('/settings', requireAuth, requireAdmin, asyncHandler(async (req, res)
     if (typeof v !== 'string' && typeof v !== 'boolean') continue;
     const val = typeof v === 'boolean' ? (v ? 'true' : 'false') : v.trim();
     if (val === '') continue;
+    // SHOP SECURITY: ayar degeri en fazla 4096 karakter (asiri uzun girdi DB'yi sisiremez).
+    if (val.length > 4096) return res.status(400).json({ ok: false, message: 'Değer çok uzun (en fazla 4096 karakter).' });
     await pool.query(`INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, now()) ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = now()`, [k, val]);
   }
   res.json({ ok: true });
@@ -1716,7 +1887,7 @@ router.get('/feed.xml', asyncHandler(async (req, res) => {
   const kv = {};
   srows.forEach((r) => { kv[r.key] = r.value; });
   if (kv.xml_feed_enabled !== 'true') return res.status(404).type('application/xml').send('<?xml version="1.0" encoding="UTF-8"?>\n<error>feed_disabled</error>');
-  if (kv.xml_feed_mode === 'key' && (!kv.api_key || req.query.api_key !== kv.api_key)) {
+  if (kv.xml_feed_mode === 'key' && (!kv.api_key || !timingSafeEqualStr(kv.api_key, String(req.query.api_key || '')))) {
     return res.status(403).type('application/xml').send('<?xml version="1.0" encoding="UTF-8"?>\n<error>api_key_required</error>');
   }
   const { rows } = await pool.query(`SELECT p.id, p.sku, p.name, p.price_cents, p.currency, p.stock, p.thumb_url, p.description, c.name AS category_name FROM products p LEFT JOIN categories c ON c.id = p.category_id WHERE p.is_active = TRUE ORDER BY p.name LIMIT 5000`);
@@ -1790,6 +1961,8 @@ const productValidators = [
   body('connector').optional().trim().isLength({ max: 200 }),
   body('power_type').optional().trim().isLength({ max: 200 }),
   body('barcode').optional().trim().matches(/^[0-9]{8,14}$/),
+  // SHOP SECURITY: brand validator eksikti — dogrulanmadan DB'ye gidiyordu.
+  body('brand').optional().trim().isLength({ max: 200 }),
 ];
 
 // category: slug veya UUID kabul eder → category_id çözer (boşsa NULL)
@@ -1838,7 +2011,7 @@ router.post(
       res.status(201).json(toProduct({ ...rows[0], category_slug: null, category_name: null }));
     } catch (err) {
       if (err.code === '23505') return res.status(409).json({ error: 'sku_in_use' });
-      return res.status(500).json({ error: 'db_error', detail: err.message });
+      return res.status(500).json({ error: 'db_error' });
     }
   })
 );
@@ -1877,6 +2050,8 @@ router.put(
   body('connector').optional().trim().isLength({ max: 200 }),
   body('power_type').optional().trim().isLength({ max: 200 }),
   body('barcode').optional().trim().matches(/^[0-9]{8,14}$/),
+  // SHOP SECURITY: brand validator eksikti — dogrulanmadan DB'ye gidiyordu.
+  body('brand').optional().trim().isLength({ max: 200 }),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     await ensureMarketplaceColumns();
@@ -1930,7 +2105,7 @@ router.put(
       res.json(toProduct({ ...rows[0], category_slug: null, category_name: null }));
     } catch (err) {
       if (err.code === '23505') return res.status(409).json({ error: 'sku_in_use' });
-      return res.status(500).json({ error: 'db_error', detail: err.message });
+      return res.status(500).json({ error: 'db_error' });
     }
   })
 );
@@ -1984,10 +2159,14 @@ router.post(
   requireAuth,
   param('id').isUUID(),
   body('body').trim().isLength({ min: 1, max: 1000 }),
+  shopSpamLimiter,
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     const me = await pool.query('SELECT is_blocked FROM users WHERE id = $1', [req.user.id]);
     if (me.rows[0]?.is_blocked) return res.status(403).json({ error: 'user_blocked' });
+    // SHOP SECURITY: olmayan/pasif urune yorum FK hatasiyla 500 degil 404 doner.
+    const { rows: pr } = await pool.query('SELECT id FROM products WHERE id = $1 AND is_active = TRUE', [req.params.id]);
+    if (!pr.length) return res.status(404).json({ error: 'product_not_found' });
     const { rows } = await pool.query(
       `INSERT INTO comments (product_id, user_id, body) VALUES ($1, $2, $3)
        RETURNING id, body, created_at`,
