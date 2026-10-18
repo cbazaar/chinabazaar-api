@@ -320,6 +320,20 @@ async function ensureFactoryTables() {
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_likes (id SERIAL PRIMARY KEY, user_id INT NOT NULL, video_key TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now(), UNIQUE(user_id, video_key))`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_comments (id SERIAL PRIMARY KEY, user_id INT NOT NULL, video_key TEXT NOT NULL, body TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now())`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_favorites (id SERIAL PRIMARY KEY, user_id INT NOT NULL, video_key TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now(), UNIQUE(user_id, video_key))`);
+  // v115: şema onarımı — tablo eski bir sürümle oluşmuşsa (eksik sütun / eksik UNIQUE) eksikleri tamamla.
+  // CREATE TABLE IF NOT EXISTS eski tabloya dokunmaz; bu ALTER'lar olmadan eski tabloda her sorgu 500 verirdi.
+  await pool.query(`ALTER TABLE factory_likes ADD COLUMN IF NOT EXISTS user_id INT NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE factory_likes ADD COLUMN IF NOT EXISTS video_key TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE factory_comments ADD COLUMN IF NOT EXISTS user_id INT NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE factory_comments ADD COLUMN IF NOT EXISTS video_key TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE factory_comments ADD COLUMN IF NOT EXISTS body TEXT NOT NULL DEFAULT ''`);
+  await pool.query(`ALTER TABLE factory_favorites ADD COLUMN IF NOT EXISTS user_id INT NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE factory_favorites ADD COLUMN IF NOT EXISTS video_key TEXT NOT NULL DEFAULT ''`);
+  // Tekrarlı (user_id, video_key) satırları UNIQUE index'i kurmayı engeller — önce tekilleştir.
+  await pool.query(`DELETE FROM factory_likes a USING factory_likes b WHERE a.id < b.id AND a.user_id = b.user_id AND a.video_key = b.video_key`);
+  await pool.query(`DELETE FROM factory_favorites a USING factory_favorites b WHERE a.id < b.id AND a.user_id = b.user_id AND a.video_key = b.video_key`);
+  try { await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS factory_likes_user_video_uidx ON factory_likes (user_id, video_key)`); } catch (e) { /* eski şemada index kurulamazsa akış bozulmaz */ }
+  try { await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS factory_favorites_user_video_uidx ON factory_favorites (user_id, video_key)`); } catch (e) { /* eski şemada index kurulamazsa akış bozulmaz */ }
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_video_views (video TEXT PRIMARY KEY, views INT NOT NULL DEFAULT 0)`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_ratings (id SERIAL PRIMARY KEY, factory_id INT NOT NULL REFERENCES factories(id) ON DELETE CASCADE, user_id INT NOT NULL, rating INT NOT NULL CHECK (rating BETWEEN 1 AND 5), created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now(), UNIQUE(factory_id, user_id))`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_subscriptions (id SERIAL PRIMARY KEY, user_id INT NOT NULL, status TEXT DEFAULT 'pending', started_at TIMESTAMPTZ, ends_at TIMESTAMPTZ, paytr_merchant_oid TEXT UNIQUE, amount INT, currency TEXT DEFAULT 'USD', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now())`);
