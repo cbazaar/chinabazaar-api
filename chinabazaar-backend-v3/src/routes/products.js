@@ -16,6 +16,19 @@ const path = require('path');
 
 const router = express.Router();
 
+// SHOP SECURITY: paylasim limiti — /:id/share rotasi tarafindan kullanilir.
+// TANIM KULLANIMDAN ONCE OLMALI: const TDZ — rota kaydi dosya yuklenirken
+// calisir; tanim asagida olursa "Cannot access before initialization" ile
+// uygulama acilista coker (Railway healthcheck FAILED).
+const shopShareLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'too_many_requests' },
+  keyGenerator: (req) => 'shop-share:' + (req.user && req.user.id ? String(req.user.id) : req.ip),
+});
+
 // v582: Pazaryerleri kolonlari (orders.js ensure deseniyle ayni)
 async function ensureMarketplaceColumns() {
   await pool.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS marketplaces TEXT DEFAULT 'chinabazaar'`);
@@ -506,14 +519,6 @@ const shopSpamLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: 'too_many_requests' },
   keyGenerator: (req) => 'shop-spam:' + (req.user && req.user.id ? String(req.user.id) : req.ip),
-});
-const shopShareLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 120,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'too_many_requests' },
-  keyGenerator: (req) => 'shop-share:' + (req.user && req.user.id ? String(req.user.id) : req.ip),
 });
 
 // SHOP SECURITY: gizli jeton karsilastirmasi icin zamanlama-saldirisina dayanikli esitlik.
