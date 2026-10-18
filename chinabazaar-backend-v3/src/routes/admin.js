@@ -14,14 +14,17 @@ const crypto = require('crypto');
 const router = express.Router();
 router.use(requireAuth, requireAdmin);
 
-// GET /api/admin/users — kayıtlı profiller
+// GET /api/admin/users — kayıtlı profiller (?source=myfactory|shop filtresi)
 router.get(
   '/users',
-  asyncHandler(async (_req, res) => {
+  asyncHandler(async (req, res) => {
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'shop'`);
+    const src = req.query.source === 'myfactory' || req.query.source === 'shop' ? req.query.source : null;
     const { rows } = await pool.query(
-      `SELECT u.id, u.email, u.name, u.nickname, u.phone, u.is_admin, u.is_blocked, u.email_verified, u.created_at, u.customer_code,
+      `SELECT u.id, u.email, u.name, u.nickname, u.phone, u.is_admin, u.is_blocked, u.email_verified, u.created_at, u.customer_code, u.source,
               (SELECT count(*)::int FROM orders o WHERE o.user_id = u.id) AS order_count
-       FROM users u ORDER BY u.name ASC LIMIT 500`
+       FROM users u ${src ? 'WHERE u.source = $1' : ''} ORDER BY u.name ASC LIMIT 500`,
+      src ? [src] : []
     );
     res.json({ items: rows });
   })

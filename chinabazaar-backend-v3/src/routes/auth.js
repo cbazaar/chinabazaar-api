@@ -66,16 +66,19 @@ router.post(
   body('name').trim().isLength({ min: 2, max: 100 }),
   body('phone').optional().matches(/^\+?[0-9][0-9\s\-().]{6,19}$/),
   body('admin_key').optional().isString().isLength({ max: 128 }),
+  body('source').optional().isIn(['myfactory', 'shop']),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     const { email, password, name, phone, admin_key } = req.body;
+    const source = req.body.source === 'myfactory' ? 'myfactory' : 'shop';
     const makeAdmin = Boolean(cfg.adminSetupKey && admin_key && admin_key === cfg.adminSetupKey);
     const hash = await bcrypt.hash(password, 12);
     try {
+      await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'shop'`);
       const { rows } = await pool.query(
-        `INSERT INTO users (email, password_hash, name, phone, is_admin)
-         VALUES ($1, $2, $3, $4, $5) RETURNING id, email, name, phone, is_admin`,
-        [email, hash, name, phone || null, makeAdmin]
+        `INSERT INTO users (email, password_hash, name, phone, is_admin, source)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, email, name, phone, is_admin`,
+        [email, hash, name, phone || null, makeAdmin, source]
       );
       const user = publicUser(rows[0]);
       res.status(201).json({ user, token: signToken(user) });
