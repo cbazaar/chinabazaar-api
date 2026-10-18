@@ -322,7 +322,7 @@ async function ensureFactoryTables() {
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_favorites (id SERIAL PRIMARY KEY, user_id INT NOT NULL, video_key TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now(), UNIQUE(user_id, video_key))`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_video_views (video TEXT PRIMARY KEY, views INT NOT NULL DEFAULT 0)`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_subscriptions (id SERIAL PRIMARY KEY, user_id INT NOT NULL, status TEXT DEFAULT 'pending', started_at TIMESTAMPTZ, ends_at TIMESTAMPTZ, paytr_merchant_oid TEXT UNIQUE, amount INT, currency TEXT DEFAULT 'USD', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now())`);
-  await pool.query(`CREATE TABLE IF NOT EXISTS factories (id SERIAL PRIMARY KEY, name TEXT NOT NULL, city TEXT DEFAULT '', category TEXT DEFAULT '', description TEXT DEFAULT '', moq INT DEFAULT 0, stock INT DEFAULT 0, capacity TEXT DEFAULT '', certs TEXT DEFAULT '', videos JSONB DEFAULT '[]', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now())`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS factories (id SERIAL PRIMARY KEY, name TEXT NOT NULL, city TEXT DEFAULT '', category TEXT DEFAULT '', description TEXT DEFAULT '', moq INT DEFAULT 0, stock INT DEFAULT 0, capacity TEXT DEFAULT '', certs TEXT DEFAULT '', features TEXT DEFAULT '', import_countries TEXT DEFAULT '', employees TEXT DEFAULT '', factory_area TEXT DEFAULT '', years TEXT DEFAULT '', videos JSONB DEFAULT '[]', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now())`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS hashtags TEXT DEFAULT ''`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS address TEXT DEFAULT ''`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS phone TEXT DEFAULT ''`);
@@ -332,6 +332,11 @@ async function ensureFactoryTables() {
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS socials JSONB DEFAULT '{}'`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS tags TEXT DEFAULT ''`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE`);
+  await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS features TEXT DEFAULT ''`);
+  await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS import_countries TEXT DEFAULT ''`);
+  await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS employees TEXT DEFAULT ''`);
+  await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS factory_area TEXT DEFAULT ''`);
+  await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS years TEXT DEFAULT ''`);
 }
 
 const FACTORY_VIDEO_RE = /^\d+-\d+$/;
@@ -359,6 +364,11 @@ function toFactoryPublic(r) {
     stock: r.stock ?? 0,
     capacity: r.capacity || '',
     certs: r.certs || '',
+    features: r.features || '',
+    import_countries: r.import_countries || '',
+    employees: r.employees || '',
+    factory_area: r.factory_area || '',
+    years: r.years || '',
     hashtags: r.hashtags || '',
     address: r.address || '',
     phone: r.phone || '',
@@ -611,6 +621,19 @@ const factoryValidators = [
     if (Array.isArray(v) && v.every((x) => typeof x === 'string')) { if (v.join(', ').length > 2000) throw new Error('invalid_certs'); return true; }
     throw new Error('invalid_certs');
   }),
+  body('features').optional().custom((v) => {
+    if (typeof v === 'string') { if (v.length > 2000) throw new Error('invalid_features'); return true; }
+    if (Array.isArray(v) && v.every((x) => typeof x === 'string')) { if (v.join(', ').length > 2000) throw new Error('invalid_features'); return true; }
+    throw new Error('invalid_features');
+  }),
+  body('import_countries').optional().custom((v) => {
+    if (typeof v === 'string') { if (v.length > 2000) throw new Error('invalid_import_countries'); return true; }
+    if (Array.isArray(v) && v.every((x) => typeof x === 'string')) { if (v.join(', ').length > 2000) throw new Error('invalid_import_countries'); return true; }
+    throw new Error('invalid_import_countries');
+  }),
+  body('employees').optional().trim().isLength({ max: 2000 }),
+  body('factory_area').optional().trim().isLength({ max: 2000 }),
+  body('years').optional().trim().isLength({ max: 2000 }),
   body('hashtags').optional().custom((v) => {
     if (typeof v === 'string') { if (v.length > 2000) throw new Error('invalid_hashtags'); return true; }
     if (Array.isArray(v) && v.every((x) => typeof x === 'string')) { if (v.join(', ').length > 2000) throw new Error('invalid_hashtags'); return true; }
@@ -664,9 +687,17 @@ router.post('/factory/admin', requireAuth, requireAdmin,
     if (socialsClean === null) return res.status(400).json({ error: 'invalid_socials' });
     const tagsClean = cleanFactoryTags(req.body.tags);
     if (tagsClean === null) return res.status(400).json({ error: 'invalid_tags' });
+    const importCountriesClean = cleanFactoryTags(req.body.import_countries);
+    if (importCountriesClean === null) return res.status(400).json({ error: 'invalid_import_countries' });
+    const employeesClean = cleanFactoryText(req.body.employees, 2000);
+    if (employeesClean === null) return res.status(400).json({ error: 'invalid_employees' });
+    const factoryAreaClean = cleanFactoryText(req.body.factory_area, 2000);
+    if (factoryAreaClean === null) return res.status(400).json({ error: 'invalid_factory_area' });
+    const yearsClean = cleanFactoryText(req.body.years, 2000);
+    if (yearsClean === null) return res.status(400).json({ error: 'invalid_years' });
     const { rows } = await pool.query(
-      `INSERT INTO factories (name, city, category, description, moq, stock, capacity, certs, videos, hashtags)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10) RETURNING *`,
+      `INSERT INTO factories (name, city, category, description, moq, stock, capacity, certs, features, videos, hashtags)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11) RETURNING *`,
       [
         String(req.body.name).trim(),
         typeof req.body.city === 'string' ? req.body.city.trim() : '',
@@ -676,11 +707,12 @@ router.post('/factory/admin', requireAuth, requireAdmin,
         req.body.stock == null ? 0 : parseInt(req.body.stock, 10),
         typeof req.body.capacity === 'string' ? req.body.capacity.trim() : '',
         Array.isArray(req.body.certs) ? req.body.certs.map((x) => String(x).trim()).filter(Boolean).join(', ') : (typeof req.body.certs === 'string' ? req.body.certs.trim() : ''),
+        Array.isArray(req.body.features) ? req.body.features.map((x) => String(x).trim()).filter(Boolean).join(', ') : (typeof req.body.features === 'string' ? req.body.features.trim() : ''),
         JSON.stringify(videos === undefined ? [] : videos),
         hashtagsClean === undefined ? '' : hashtagsClean,
       ]
     );
-    if (addressClean !== undefined || phoneClean !== undefined || contactClean !== undefined || wechatClean !== undefined || whatsappClean !== undefined || socialsClean !== undefined || tagsClean !== undefined) {
+    if (addressClean !== undefined || phoneClean !== undefined || contactClean !== undefined || wechatClean !== undefined || whatsappClean !== undefined || socialsClean !== undefined || tagsClean !== undefined || importCountriesClean !== undefined || employeesClean !== undefined || factoryAreaClean !== undefined || yearsClean !== undefined) {
       const updSets = [];
       const updParams = [rows[0].id];
       const updPush = (col, val, cast) => { updParams.push(val); updSets.push(`${col} = $${updParams.length}${cast || ''}`); };
@@ -691,6 +723,10 @@ router.post('/factory/admin', requireAuth, requireAdmin,
       if (whatsappClean !== undefined) updPush('whatsapp', whatsappClean);
       if (socialsClean !== undefined) updPush('socials', JSON.stringify(socialsClean), '::jsonb');
       if (tagsClean !== undefined) updPush('tags', tagsClean);
+      if (importCountriesClean !== undefined) updPush('import_countries', importCountriesClean);
+      if (employeesClean !== undefined) updPush('employees', employeesClean);
+      if (factoryAreaClean !== undefined) updPush('factory_area', factoryAreaClean);
+      if (yearsClean !== undefined) updPush('years', yearsClean);
       const upd = await pool.query(`UPDATE factories SET ${updSets.join(', ')} WHERE id = $1 RETURNING *`, updParams);
       if (upd.rows.length) rows[0] = upd.rows[0];
     }
@@ -717,6 +753,11 @@ router.put('/factory/admin/:id', requireAuth, requireAdmin,
     if (req.body.stock !== undefined) push('stock', req.body.stock == null ? 0 : parseInt(req.body.stock, 10));
     if (req.body.capacity !== undefined) push('capacity', String(req.body.capacity).trim());
     if (req.body.certs !== undefined) push('certs', Array.isArray(req.body.certs) ? req.body.certs.map((x) => String(x).trim()).filter(Boolean).join(', ') : String(req.body.certs).trim());
+    if (req.body.features !== undefined) push('features', Array.isArray(req.body.features) ? req.body.features.map((x) => String(x).trim()).filter(Boolean).join(', ') : String(req.body.features).trim());
+    if (req.body.import_countries !== undefined) push('import_countries', Array.isArray(req.body.import_countries) ? req.body.import_countries.map((x) => String(x).trim()).filter(Boolean).join(', ') : String(req.body.import_countries).trim());
+    if (req.body.employees !== undefined) push('employees', String(req.body.employees).trim());
+    if (req.body.factory_area !== undefined) push('factory_area', String(req.body.factory_area).trim());
+    if (req.body.years !== undefined) push('years', String(req.body.years).trim());
     if (req.body.hashtags !== undefined) {
       const hashtagsClean = cleanFactoryHashtags(req.body.hashtags);
       if (hashtagsClean === null) return res.status(400).json({ error: 'invalid_hashtags' });
