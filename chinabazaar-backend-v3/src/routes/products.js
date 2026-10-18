@@ -317,17 +317,17 @@ router.get('/whatsapp/status', requireAuth, requireAdmin, asyncHandler(async (re
 // v615 (My Factory v3): fabrika video begeni/yorum + fabrika yonetimi (admin)
 // Tum /factory/* rotalari GET /:id ONCESINE kayitli — /:id bunlari yutmaz.
 async function ensureFactoryTables() {
-  await pool.query(`CREATE TABLE IF NOT EXISTS factory_likes (id SERIAL PRIMARY KEY, user_id INT NOT NULL, video_key TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now(), UNIQUE(user_id, video_key))`);
-  await pool.query(`CREATE TABLE IF NOT EXISTS factory_comments (id SERIAL PRIMARY KEY, user_id INT NOT NULL, video_key TEXT NOT NULL, body TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now())`);
-  await pool.query(`CREATE TABLE IF NOT EXISTS factory_favorites (id SERIAL PRIMARY KEY, user_id INT NOT NULL, video_key TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now(), UNIQUE(user_id, video_key))`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS factory_likes (id SERIAL PRIMARY KEY, user_id TEXT NOT NULL, video_key TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now(), UNIQUE(user_id, video_key))`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS factory_comments (id SERIAL PRIMARY KEY, user_id TEXT NOT NULL, video_key TEXT NOT NULL, body TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now())`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS factory_favorites (id SERIAL PRIMARY KEY, user_id TEXT NOT NULL, video_key TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now(), UNIQUE(user_id, video_key))`);
   // v115: şema onarımı — tablo eski bir sürümle oluşmuşsa (eksik sütun / eksik UNIQUE) eksikleri tamamla.
   // CREATE TABLE IF NOT EXISTS eski tabloya dokunmaz; bu ALTER'lar olmadan eski tabloda her sorgu 500 verirdi.
-  await pool.query(`ALTER TABLE factory_likes ADD COLUMN IF NOT EXISTS user_id INT NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE factory_likes ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE factory_likes ADD COLUMN IF NOT EXISTS video_key TEXT NOT NULL DEFAULT ''`);
-  await pool.query(`ALTER TABLE factory_comments ADD COLUMN IF NOT EXISTS user_id INT NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE factory_comments ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE factory_comments ADD COLUMN IF NOT EXISTS video_key TEXT NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE factory_comments ADD COLUMN IF NOT EXISTS body TEXT NOT NULL DEFAULT ''`);
-  await pool.query(`ALTER TABLE factory_favorites ADD COLUMN IF NOT EXISTS user_id INT NOT NULL DEFAULT 0`);
+  await pool.query(`ALTER TABLE factory_favorites ADD COLUMN IF NOT EXISTS user_id TEXT NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE factory_favorites ADD COLUMN IF NOT EXISTS video_key TEXT NOT NULL DEFAULT ''`);
   // Tekrarlı (user_id, video_key) satırları UNIQUE index'i kurmayı engeller — önce tekilleştir.
   await pool.query(`DELETE FROM factory_likes a USING factory_likes b WHERE a.id < b.id AND a.user_id = b.user_id AND a.video_key = b.video_key`);
@@ -335,8 +335,8 @@ async function ensureFactoryTables() {
   try { await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS factory_likes_user_video_uidx ON factory_likes (user_id, video_key)`); } catch (e) { /* eski şemada index kurulamazsa akış bozulmaz */ }
   try { await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS factory_favorites_user_video_uidx ON factory_favorites (user_id, video_key)`); } catch (e) { /* eski şemada index kurulamazsa akış bozulmaz */ }
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_video_views (video TEXT PRIMARY KEY, views INT NOT NULL DEFAULT 0)`);
-  await pool.query(`CREATE TABLE IF NOT EXISTS factory_ratings (id SERIAL PRIMARY KEY, factory_id INT NOT NULL REFERENCES factories(id) ON DELETE CASCADE, user_id INT NOT NULL, rating INT NOT NULL CHECK (rating BETWEEN 1 AND 5), created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now(), UNIQUE(factory_id, user_id))`);
-  await pool.query(`CREATE TABLE IF NOT EXISTS factory_subscriptions (id SERIAL PRIMARY KEY, user_id INT NOT NULL, status TEXT DEFAULT 'pending', started_at TIMESTAMPTZ, ends_at TIMESTAMPTZ, paytr_merchant_oid TEXT UNIQUE, amount INT, currency TEXT DEFAULT 'USD', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now())`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS factory_ratings (id SERIAL PRIMARY KEY, factory_id INT NOT NULL REFERENCES factories(id) ON DELETE CASCADE, user_id TEXT NOT NULL, rating INT NOT NULL CHECK (rating BETWEEN 1 AND 5), created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now(), UNIQUE(factory_id, user_id))`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS factory_subscriptions (id SERIAL PRIMARY KEY, user_id TEXT NOT NULL, status TEXT DEFAULT 'pending', started_at TIMESTAMPTZ, ends_at TIMESTAMPTZ, paytr_merchant_oid TEXT UNIQUE, amount INT, currency TEXT DEFAULT 'USD', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now())`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factories (id SERIAL PRIMARY KEY, name TEXT NOT NULL, city TEXT DEFAULT '', category TEXT DEFAULT '', description TEXT DEFAULT '', moq INT DEFAULT 0, stock INT DEFAULT 0, capacity TEXT DEFAULT '', certs TEXT DEFAULT '', features TEXT DEFAULT '', import_countries TEXT DEFAULT '', employees TEXT DEFAULT '', factory_area TEXT DEFAULT '', years TEXT DEFAULT '', main_products TEXT DEFAULT '', videos JSONB DEFAULT '[]', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now())`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS hashtags TEXT DEFAULT ''`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS address TEXT DEFAULT ''`);
@@ -353,6 +353,13 @@ async function ensureFactoryTables() {
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS factory_area TEXT DEFAULT ''`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS years TEXT DEFAULT ''`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS main_products TEXT DEFAULT ''`);
+  // v118: user_id tip onarimi — users.id UUID, ama fabrika tablolari user_id'yi INT diye
+  // tanimlamisti; UUID'li kullaniciyla her user_id sorgusu 500 veriyordu. INT->TEXT
+  // donusumu kayipsizdir (her INT metne cevrilir); TEXT kolonda tekrar calismak no-op'tur.
+  // Her ALTER kendi try/catch'indedir: bir tablodaki hata digerlerini/rotayi bozmaz.
+  for (const t of ['factory_likes', 'factory_comments', 'factory_favorites', 'factory_messages', 'factory_quotes', 'factory_ratings', 'factory_subscriptions']) {
+    try { await pool.query(`ALTER TABLE ${t} ALTER COLUMN user_id TYPE TEXT USING user_id::text`); } catch (e) { /* tablo/sutun yoksa veya tip zaten TEXT ise yoksay */ }
+  }
 }
 
 const FACTORY_VIDEO_RE = /^\d+-\d+$/;
@@ -587,7 +594,7 @@ router.get('/factory/comments', asyncHandler(async (req, res) => {
   if (!FACTORY_VIDEO_RE.test(video)) return res.status(400).json({ error: 'invalid_video' });
   const { rows } = await pool.query(
     `SELECT c.id, c.body, c.created_at, COALESCE(NULLIF(u.nickname,''), NULLIF(u.name,''), split_part(u.email,'@',1), 'Misafir') AS name
-     FROM factory_comments c LEFT JOIN users u ON u.id = c.user_id
+     FROM factory_comments c LEFT JOIN users u ON u.id::text = c.user_id::text
      WHERE c.video_key = $1 ORDER BY c.created_at DESC, c.id DESC LIMIT 50`,
     [video]
   );
@@ -934,7 +941,7 @@ router.get('/factory/admin/subscriptions', requireAuth, requireAdmin, asyncHandl
   await ensureFactoryTables();
   const { rows } = await pool.query(
     `SELECT fs.id, fs.user_id, COALESCE(NULLIF(u.nickname,''), NULLIF(u.name,''), split_part(u.email,'@',1), '') AS name, u.email AS email, fs.status, fs.started_at, fs.ends_at, fs.amount, fs.currency
-     FROM factory_subscriptions fs LEFT JOIN users u ON u.id = fs.user_id
+     FROM factory_subscriptions fs LEFT JOIN users u ON u.id::text = fs.user_id::text
      ORDER BY fs.created_at DESC, fs.id DESC`
   );
   res.json(rows.map((r) => ({ id: r.id, user_id: r.user_id, name: r.name || '', email: r.email || null, status: r.status, started_at: r.started_at, ends_at: r.ends_at, amount: r.amount, currency: r.currency })));
@@ -945,7 +952,7 @@ router.get('/factory/admin/subscriptions', requireAuth, requireAdmin, asyncHandl
 // Tum /factory/* rotalari GET /:id ONCESINE kayitli — /:id bunlari yutmaz.
 // E-posta adresleri hicbir yanitta donulmez (isim/nickname yeterli).
 async function ensureFactoryMessagesTable() {
-  await pool.query(`CREATE TABLE IF NOT EXISTS factory_messages (id SERIAL PRIMARY KEY, user_id INT NOT NULL, body TEXT NOT NULL DEFAULT '', sender TEXT NOT NULL DEFAULT 'user', created_at TIMESTAMPTZ DEFAULT now())`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS factory_messages (id SERIAL PRIMARY KEY, user_id TEXT NOT NULL, body TEXT NOT NULL DEFAULT '', sender TEXT NOT NULL DEFAULT 'user', created_at TIMESTAMPTZ DEFAULT now())`);
   // Canli DB'deki tablo eski surumle olusmus olabilir — CREATE TABLE IF NOT EXISTS
   // eksik sutunu eklemez; SELECT m.body ... bu yuzden 500 (internal_error) atiyordu.
   // Tum sutunlar ADD COLUMN IF NOT EXISTS ile guvenceye alinir (products marketplace/warranty deseni).
@@ -953,6 +960,9 @@ async function ensureFactoryMessagesTable() {
   await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS sender TEXT NOT NULL DEFAULT 'user'`);
   await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS attachment_url TEXT`);
   await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'text'`);
+  // v118: user_id tip onarimi (users.id UUID) — mesaj rotalari ensureFactoryTables'i
+  // cagirmadigindan bu tablo icin donusum burada da calisir.
+  try { await pool.query(`ALTER TABLE factory_messages ALTER COLUMN user_id TYPE TEXT USING user_id::text`); } catch (e) { /* tip zaten TEXT ise yoksay */ }
 }
 
 // Mesaj eki (resim) dogrulama: http(s) URL veya /uploads/ yolu kabul edilir.
@@ -998,8 +1008,11 @@ router.get('/factory/messages', requireAuth, asyncHandler(async (req, res) => {
 
 // Teklif istekleri (Profil > Tekliflerim) — Teklif Al formu e-posta ile gonderilirken bir kopya da burada saklanir.
 async function ensureFactoryQuotesTable() {
-  await pool.query(`CREATE TABLE IF NOT EXISTS factory_quotes (id SERIAL PRIMARY KEY, user_id INT NOT NULL, factory TEXT NOT NULL DEFAULT '', name TEXT NOT NULL DEFAULT '', contact TEXT NOT NULL DEFAULT '', qty TEXT NOT NULL DEFAULT '', msg TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ DEFAULT now())`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS factory_quotes (id SERIAL PRIMARY KEY, user_id TEXT NOT NULL, factory TEXT NOT NULL DEFAULT '', name TEXT NOT NULL DEFAULT '', contact TEXT NOT NULL DEFAULT '', qty TEXT NOT NULL DEFAULT '', msg TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ DEFAULT now())`);
   await pool.query(`ALTER TABLE factory_quotes ADD COLUMN IF NOT EXISTS factory_id INT`);
+  // v118: user_id tip onarimi (users.id UUID) — teklif rotalari ensureFactoryTables'i
+  // cagirmadigindan bu tablo icin donusum burada da calisir.
+  try { await pool.query(`ALTER TABLE factory_quotes ALTER COLUMN user_id TYPE TEXT USING user_id::text`); } catch (e) { /* tip zaten TEXT ise yoksay */ }
 }
 
 // POST /api/products/factory/quotes — teklif istegi kaydet
@@ -1038,7 +1051,7 @@ router.get('/factory/admin/messages', requireAuth, requireAdmin, asyncHandler(as
   const { rows } = await pool.query(
     `SELECT m.id, m.user_id, m.body, m.sender, m.attachment_url, m.kind, m.created_at,
             COALESCE(NULLIF(u.nickname,''), NULLIF(u.name,''), split_part(u.email,'@',1), 'Misafir') AS name
-     FROM factory_messages m LEFT JOIN users u ON u.id = m.user_id
+     FROM factory_messages m LEFT JOIN users u ON u.id::text = m.user_id::text
      ORDER BY m.user_id ASC, m.created_at ASC, m.id ASC`
   );
   const byUser = new Map();
@@ -1051,14 +1064,14 @@ router.get('/factory/admin/messages', requireAuth, requireAdmin, asyncHandler(as
 
 // POST /api/products/factory/admin/messages/:id/reply {body?, attachment_url?, kind?} — admin cevap gonderir (sender='admin'); :id = user_id
 router.post('/factory/admin/messages/:id/reply', requireAuth, requireAdmin,
-  param('id').isInt({ min: 1 }),
+  param('id').isString().trim().isLength({ min: 1, max: 100 }),
   body('body').optional().trim().isLength({ max: 1000 }),
   body('attachment_url').optional().isString().isLength({ max: 2048 }),
   body('kind').optional().isIn(['text', 'image']),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     await ensureFactoryMessagesTable();
-    const userId = parseInt(req.params.id, 10);
+    const userId = String(req.params.id);
     const { rows: urows } = await pool.query('SELECT id FROM users WHERE id = $1', [userId]);
     if (!urows.length) return res.status(404).json({ error: 'user_not_found' });
     const text = (req.body.body || '').trim();
