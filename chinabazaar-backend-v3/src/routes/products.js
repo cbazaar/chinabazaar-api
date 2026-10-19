@@ -7,6 +7,10 @@
 //   TUS endpoint'idir (Cloudflare direct_upload); bu dosyada (products.js) islevsel
 //   degisiklik YOK — videos alan dogrulamasi (cleanFactoryVideos) fix10o'daki
 //   *.cloudflarestream.com / *.videodelivery.net jokerleriyle aynen gecerlidir.
+// fix10s: CBOs26.37-A — fabrika kimlik bilgisi degistirme rotasi (myfactory credentials):
+//   {username?, password?}; hedef cozum profile rotasiyla birebir (master -> factory_id
+//   ZORUNLU / fabrika -> token'daki fabrika); myfactory_password_hash bcrypt(12); updated_at her
+//   zaman guncellenir; yanit yalniz { username }, hash ASLA donulmez.
 // fix10e: H-B göç (transaction + doğrulama + DROP yoksa yapılmaz), H-E CBAI master
 // fix10h: CBOs26.4 — /myfactory/stats: gunluk seri (daily) + ulke dagilimi (countries); /factory/video-view: olay kaydi (ulke basliktan).
 // fix10i: CBOs26.5 — bildirimler: factory_messages/factory_quotes + seen_by_factory; GET/POST /myfactory/notifications[/read]; videos.description korunur.
@@ -1471,6 +1475,73 @@ router.put('/factory/myfactory/profile', requireFactoryOrMasterAuth, asyncHandle
   if (!rows.length) return res.status(404).json({ error: 'factory_not_found', message: 'Fabrika bulunamadı.' });
   if (req.isMaster) await logMasterAudit('factory_profile_update', 'factory', targetFactoryId); // fix10e H-E
   res.json(toFactoryMyFactory(rows[0]));
+}));
+
+// CBOs26.37-A (fix10s) — fabrika giris kimlik bilgisi degistirme rotasi (PUT, "credentials" ucu).
+// Gövde {username?, password?}. Düzenlenebilir: myfactory_username, myfactory_password_hash (şifre bcrypt(12) ile
+// hash'lenerek saklanır; hash ASLA yanıt dönmez). Hedef fabrika çözümü profile rotasıyla BİREBİR aynı:
+// master → gövde/query factory_id ZORUNLU (yoksa 400 factory_id_required; ikisi dolu ve farklıysa 400
+// factory_id_mismatch); fabrika → gövde/query'deki farklı factory_id 403, hedef = req.factoryId.
+// updated_at HER ZAMAN güncellenir (admin "son güncelleme"yi görür). Yanıt: { username }.
+router.put('/factory/myfactory/credentials', requireFactoryOrMasterAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const body = req.body || {};
+  // Hedef fabrika: master → gövde/query factory_id (ZORUNLU); fabrika → token'daki fabrika.
+  let targetFactoryId;
+  if (req.isMaster) {
+    const fromBody = body.factory_id;
+    const fromQuery = req.query.factory_id;
+    const hasBody = fromBody !== undefined && fromBody !== null && String(fromBody).trim() !== '';
+    const hasQuery = fromQuery !== undefined && fromQuery !== null && String(fromQuery).trim() !== '';
+    if (!hasBody && !hasQuery) return res.status(400).json({ error: 'factory_id_required', message: 'Master düzenlemesi için factory_id gerekli.' });
+    if (hasBody && hasQuery && Number(String(fromBody).trim()) !== Number(String(fromQuery).trim())) {
+      return res.status(400).json({ error: 'factory_id_mismatch', message: 'Gövde ve sorgudaki factory_id aynı olmalı.' });
+    }
+    targetFactoryId = Number(String(hasBody ? fromBody : fromQuery).trim());
+    if (!Number.isInteger(targetFactoryId) || targetFactoryId < 1) return res.status(400).json({ error: 'invalid_factory_id', message: 'Fabrika kimliği geçerli değil.' });
+  } else {
+    // Govdeden gelen id ASLA guvenilmez: token'daki fabrikadan farkliysa 403.
+    for (const key of ['id', 'factory_id']) {
+      if (body[key] !== undefined && body[key] !== null && body[key] !== '' && Number(body[key]) !== req.factoryId) {
+        return res.status(403).json({ error: 'forbidden', message: 'Yalnız kendi fabrika kaydınızı düzenleyebilirsiniz.' });
+      }
+    }
+    // Sorgudaki factory_id de token'daki fabrikadan farklıysa 403 (izolasyon).
+    const qf = req.query.factory_id;
+    if (qf !== undefined && qf !== null && String(qf).trim() !== '' && Number(String(qf).trim()) !== req.factoryId) {
+      return res.status(403).json({ error: 'forbidden', message: 'Yalnız kendi fabrika kaydınızı düzenleyebilirsiniz.' });
+    }
+    targetFactoryId = req.factoryId;
+  }
+  const hasUsername = body.username !== undefined;
+  const hasPassword = body.password !== undefined;
+  if (!hasUsername && !hasPassword) return res.status(400).json({ error: 'nothing_to_update', message: 'Güncellenecek bir alan gönderilmedi.' });
+  const sets = [];
+  const params = [targetFactoryId];
+  const bad = (code, message) => res.status(400).json({ error: code, message });
+  if (hasUsername) {
+    const clean = cleanMyFactoryUsername(body.username);
+    // null (geçersiz) veya '' (boş — fabrika kullanıcı adını silemez) → 400.
+    if (clean === null || clean === '') return bad('invalid_myfactory_username', 'Kullanıcı adı 3-50 karakter olmalı; harf, rakam, nokta, alt çizgi, tire.');
+    if (await myFactoryUsernameTaken(clean, targetFactoryId)) {
+      return res.status(409).json({ error: 'myfactory_username_taken', message: 'Bu kullanıcı adı başka bir fabrikada kullanılıyor.' });
+    }
+    params.push(clean);
+    sets.push(`myfactory_username = $${params.length}`);
+  }
+  if (hasPassword) {
+    const pw = body.password;
+    if (typeof pw !== 'string' || pw.length < 6 || pw.length > 100) {
+      return bad('invalid_myfactory_password', 'Şifre en az 6 karakter olmalı.');
+    }
+    params.push(await bcrypt.hash(pw, 12));
+    sets.push(`myfactory_password_hash = $${params.length}`);
+  }
+  sets.push('updated_at = now()');
+  const { rows } = await pool.query(`UPDATE factories SET ${sets.join(', ')} WHERE id = $1 RETURNING myfactory_username`, params);
+  if (!rows.length) return res.status(404).json({ error: 'factory_not_found', message: 'Fabrika bulunamadı.' });
+  if (req.isMaster) await logMasterAudit('factory_credentials_update', 'factory', targetFactoryId);
+  res.json({ username: rows[0].myfactory_username || null });
 }));
 
 // CBOs26.2 — GET /api/products/factory/myfactory/quotes — kendi fabrikasina gelen teklifler.
