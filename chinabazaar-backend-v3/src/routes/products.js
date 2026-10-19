@@ -626,6 +626,10 @@ async function ensureFactoryTables() {
   }
   // CBF backfill: kodu bos fabrikalara kod ata (idempotent, hatada akis bozulmaz).
   await backfillFactoryCbfCodes();
+  // CBOs26.33 (fix10r): fabrika ÖN KAYIT başvuruları — herkese açık formdan gelir, admin inceler.
+  await pool.query(`CREATE TABLE IF NOT EXISTS factory_applications (id SERIAL PRIMARY KEY, factory_name TEXT NOT NULL, contact_name TEXT NOT NULL, email TEXT NOT NULL, phone TEXT NOT NULL DEFAULT '', address TEXT NOT NULL DEFAULT '', city TEXT DEFAULT '', sector TEXT NOT NULL DEFAULT '', annual_revenue TEXT DEFAULT '', message TEXT DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', created_at TIMESTAMPTZ DEFAULT now())`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS factory_applications_email_idx ON factory_applications (email)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS factory_applications_status_idx ON factory_applications (status)`);
 }
 
 const FACTORY_VIDEO_RE = /^\d+-\d+$/;
@@ -652,6 +656,17 @@ const shopSpamLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: 'too_many_requests' },
   keyGenerator: (req) => 'shop-spam:' + (req.user && req.user.id ? String(req.user.id) : ipKeyGenerator(req.ip)), // fix10e M2
+});
+
+// CBOs26.33 (fix10r): herkese açık fabrika başvuru formu için nazik limit (IP başına saatte 10).
+// Normal başvuru akışını engellemez; botun tabloyu doldurmasını yavaşlatır.
+const factoryApplyLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'too_many_requests' },
+  keyGenerator: (req) => 'factory-apply:' + ipKeyGenerator(req.ip),
 });
 
 // SHOP SECURITY: gizli jeton karsilastirmasi icin zamanlama-saldirisina dayanikli esitlik.
@@ -1744,6 +1759,79 @@ router.get('/factory/quote-counts', asyncHandler(async (req, res) => {
   const counts = await factoryQuoteCountsMap(rows.map((r) => r.id));
   res.json({ counts });
 }));
+
+// CBOs26.33 (fix10r): fabrika ÖN KAYIT başvurusu (herkese açık).
+// POST /api/products/factory/apply — validasyon + aynı e-posta 24 saatte 1 başvuru.
+router.post('/factory/apply', factoryApplyLimiter,
+  body('factory_name').trim().isLength({ min: 2, max: 200 }),
+  body('contact_name').trim().isLength({ min: 2, max: 100 }),
+  body('email').trim().isEmail().isLength({ max: 200 }),
+  body('phone').trim().isLength({ min: 5, max: 30 }),
+  body('address').trim().isLength({ min: 5, max: 500 }),
+  body('sector').trim().isLength({ min: 1, max: 100 }),
+  body('city').optional().trim().isLength({ max: 100 }),
+  body('annual_revenue').optional().trim().isLength({ max: 100 }),
+  body('message').optional().trim().isLength({ max: 2000 }),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    await ensureFactoryTables();
+    const email = String(req.body.email).trim().toLowerCase();
+    const { rows: dup } = await pool.query(
+      `SELECT id FROM factory_applications WHERE LOWER(email)=LOWER($1) AND created_at > now() - INTERVAL '24 hours' LIMIT 1`,
+      [email]
+    );
+    if (dup.length) return res.status(409).json({ error: 'duplicate_application' });
+    const { rows } = await pool.query(
+      `INSERT INTO factory_applications (factory_name, contact_name, email, phone, address, city, sector, annual_revenue, message)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id, created_at`,
+      [
+        String(req.body.factory_name).trim(),
+        String(req.body.contact_name).trim(),
+        email,
+        String(req.body.phone).trim(),
+        String(req.body.address).trim(),
+        String(req.body.city || '').trim(),
+        String(req.body.sector).trim(),
+        String(req.body.annual_revenue || '').trim(),
+        String(req.body.message || '').trim(),
+      ]
+    );
+    res.json({ ok: true, id: rows[0].id });
+  })
+);
+
+// CBOs26.33 (fix10r): admin başvuru listesi.
+// GET /api/products/factory/admin/applications — ?status=pending|approved|rejected (opsiyonel).
+router.get('/factory/admin/applications', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const status = String(req.query.status || '').trim();
+  let q = `SELECT id, factory_name, contact_name, email, phone, address, city, sector, annual_revenue, message, status, created_at FROM factory_applications`;
+  const params = [];
+  if (status === 'pending' || status === 'approved' || status === 'rejected') {
+    q += ` WHERE status=$1`;
+    params.push(status);
+  }
+  q += ` ORDER BY created_at DESC LIMIT 200`;
+  const { rows } = await pool.query(q, params);
+  res.json({ items: rows });
+}));
+
+// CBOs26.33 (fix10r): admin başvuru durum güncelle.
+// POST /api/products/factory/admin/applications/:id/status — {status: 'approved'|'rejected'}.
+router.post('/factory/admin/applications/:id/status', requireAuth, requireAdmin,
+  param('id').isInt({ min: 1 }),
+  body('status').trim().isIn(['approved', 'rejected']),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    await ensureFactoryTables();
+    const { rows } = await pool.query(
+      `UPDATE factory_applications SET status=$1 WHERE id=$2 RETURNING id, status`,
+      [String(req.body.status).trim(), parseInt(req.params.id, 10)]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'application_not_found' });
+    res.json({ ok: true, id: rows[0].id, status: rows[0].status });
+  })
+);
 
 // fix10k (CBOs26.15): fabrika takip (follow). Giris gerekli (misafir 401 — requireAuth).
 // user_id HER ZAMAN req.user'dan (token); govdeden id alinmaz. Olmayan fabrika -> 404.
