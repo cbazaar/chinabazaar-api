@@ -2,6 +2,7 @@
 // JWT: { factory_id, role: 'factory' }, 7 gun. Sifre: auth.js ile AYNI bcryptjs hasher (cost 12).
 // Yasak alanlar (name, cbf_code, is_verified, is_active) My Factory profilinde sessizce yoksayilir.
 // fix10e: H-B göç (transaction + doğrulama + DROP yoksa yapılmaz), H-E CBAI master
+// fix10g: /myfactory/stats — toplamlar (total_videos, total_likes) + video başına like_count (factory_likes).
 // (sub+jti, 1 gün, denetim kaydı), L1 dummy hash 12 + uzunluk erken dönüşü yok,
 // L2 jenerik yanıtlar, L3 'cbai' rezerve, L4 şifre politikası, L7 SSRF engeli,
 // L8 videos/cover_image/socials konak allowlist, L9 CBF backfill kilit+transaction,
@@ -1408,6 +1409,7 @@ router.get('/factory/myfactory/quotes', requireFactoryOrMasterAuth, asyncHandler
 }));
 
 // CBOs26.2 — GET /api/products/factory/myfactory/stats — kendi fabrikasinin GERCEK istatistigi:
+// CBOs26.3 (fix10g): + toplamlar (total_videos, total_likes) + video basina like_count.
 // video basina izlenme + yorum sayisi, en cok izlenenler, yorum alan videolar. Uydurma sayi yok.
 router.get('/factory/myfactory/stats', requireFactoryOrMasterAuth, asyncHandler(async (req, res) => {
   await ensureFactoryTables();
@@ -1432,16 +1434,22 @@ router.get('/factory/myfactory/stats', requireFactoryOrMasterAuth, asyncHandler(
     const { rows } = await pool.query(`SELECT video_key, COUNT(*)::int AS cnt FROM factory_comments WHERE video_key ~ $1 GROUP BY video_key`, ['^' + fid + '-[0-9]+$']);
     for (const r of rows) commentMap[r.video_key] = r.cnt;
   }
+  const likeMap = {};
+  if (keys.length) {
+    const { rows } = await pool.query(`SELECT video_key, COUNT(*)::int AS cnt FROM factory_likes WHERE video_key ~ $1 GROUP BY video_key`, ['^' + fid + '-[0-9]+$']);
+    for (const r of rows) likeMap[r.video_key] = r.cnt;
+  }
   const perVideo = videos.map((v, i) => {
     const key = fid + '-' + i;
-    return { index: i, key, title: (v && v.title) || '', url: (v && v.url) || '', views: viewMap[key] || 0, comment_count: commentMap[key] || 0 };
+    return { index: i, key, title: (v && v.title) || '', url: (v && v.url) || '', views: viewMap[key] || 0, comment_count: commentMap[key] || 0, like_count: likeMap[key] || 0 };
   });
   const totalViews = perVideo.reduce((a, v) => a + v.views, 0);
   const totalComments = perVideo.reduce((a, v) => a + v.comment_count, 0);
+  const totalLikes = perVideo.reduce((a, v) => a + v.like_count, 0);
   const mostWatched = [...perVideo].sort((a, b) => b.views - a.views).slice(0, 5);
   const commented = perVideo.filter((v) => v.comment_count > 0).sort((a, b) => b.comment_count - a.comment_count);
   const qmap = await factoryQuoteCountsMap([fid]);
-  res.json({ factory_id: fid, total_views: totalViews, total_comments: totalComments, quote_count: qmap[fid] || 0, videos: perVideo, most_watched: mostWatched, commented_videos: commented });
+  res.json({ factory_id: fid, total_videos: videos.length, total_views: totalViews, total_comments: totalComments, total_likes: totalLikes, quote_count: qmap[fid] || 0, videos: perVideo, most_watched: mostWatched, commented_videos: commented });
 }));
 
 // CBOs26.2 — GET /api/products/factory/myfactory/messages — kendi fabrikasina yazilan musteri konusmalari (kullaniciya gore gruplu).
