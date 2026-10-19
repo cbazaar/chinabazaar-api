@@ -3,6 +3,7 @@
 // Yasak alanlar (name, cbf_code, is_verified, is_active) My Factory profilinde sessizce yoksayilir.
 // fix10e: H-B göç (transaction + doğrulama + DROP yoksa yapılmaz), H-E CBAI master
 // fix10h: CBOs26.4 — /myfactory/stats: gunluk seri (daily) + ulke dagilimi (countries); /factory/video-view: olay kaydi (ulke basliktan).
+// fix10i: CBOs26.5 — bildirimler: factory_messages/factory_quotes + seen_by_factory; GET/POST /myfactory/notifications[/read]; videos.description korunur.
 // fix10g: /myfactory/stats — toplamlar (total_videos, total_likes) + video başına like_count (factory_likes).
 // (sub+jti, 1 gün, denetim kaydı), L1 dummy hash 12 + uzunluk erken dönüşü yok,
 // L2 jenerik yanıtlar, L3 'cbai' rezerve, L4 şifre politikası, L7 SSRF engeli,
@@ -999,7 +1000,7 @@ function cleanFactoryVideos(v) {
     if (!it || typeof it !== 'object' || Array.isArray(it)) return null;
     if (typeof it.url !== 'string' || !isAllowedFactoryMediaUrl(it.url.trim()) || it.url.trim().length > 2048) return null; // fix10e L8: konak allowlist
     if (it.kind !== 'video' && it.kind !== 'canli') return null;
-    out.push({ title: typeof it.title === 'string' ? it.title.trim().slice(0, 200) : '', url: it.url.trim(), kind: it.kind });
+    out.push({ title: typeof it.title === 'string' ? it.title.trim().slice(0, 200) : '', description: typeof it.description === 'string' ? it.description.trim().slice(0, 2000) : '', url: it.url.trim(), kind: it.kind });
   }
   return out;
 }
@@ -1559,6 +1560,87 @@ router.post('/factory/myfactory/messages/:id/reply', requireFactoryOrMasterAuth,
       [userId, text, att.attachmentUrl, att.kind, att.name, att.size, att.mime, fid]
     );
     res.status(201).json({ message: rows[0] });
+  })
+);
+
+// CBOs26.5 (fix10i) — GET /api/products/factory/myfactory/notifications — okunmamis musteri mesajlari + gorulmemis teklifler.
+// Fabrika tokeni -> yalnizca kendi fabrikasi; master -> ?factory_id= zorunlu (quotes/stats deseni).
+// Uydurma bildirim yok: yalnizca GERCEK satirlar doner.
+router.get('/factory/myfactory/notifications', requireFactoryOrMasterAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryMessagesTable();
+  await ensureFactoryQuotesTable();
+  let fid;
+  if (req.isMaster) {
+    const q = req.query.factory_id;
+    if (q === undefined || q === null || String(q).trim() === '') return res.status(400).json({ error: 'factory_id_required', message: 'Master icin factory_id gerekli.' });
+    fid = Number(String(q).trim());
+    if (!Number.isInteger(fid) || fid < 1) return res.status(400).json({ error: 'invalid_factory_id' });
+  } else fid = req.factoryId;
+  const { rows: frows } = await pool.query('SELECT id, name FROM factories WHERE id = $1', [fid]);
+  if (!frows.length) return res.status(404).json({ error: 'factory_not_found' });
+  const fname = String(frows[0].name || '').trim().toLowerCase();
+  const { rows: msgs } = await pool.query(
+    `SELECT id, user_id, body, created_at FROM factory_messages WHERE factory_id = $1 AND sender = 'user' AND COALESCE(seen_by_factory, FALSE) = FALSE ORDER BY created_at DESC, id DESC`,
+    [fid]
+  );
+  const { rows: quotes } = await pool.query(
+    `SELECT id, name, contact, qty, msg, created_at FROM factory_quotes WHERE (factory_id = $1 OR (factory_id IS NULL AND factory <> '' AND LOWER(TRIM(factory)) = $2)) AND COALESCE(seen_by_factory, FALSE) = FALSE ORDER BY created_at DESC, id DESC`,
+    [fid, fname]
+  );
+  const items = [];
+  for (const m of msgs) items.push({ type: 'message', id: m.id, user_id: m.user_id, text: String(m.body || '').slice(0, 200), created_at: m.created_at });
+  for (const q of quotes) {
+    const parts = [q.name || ''];
+    if (q.msg) parts.push(String(q.msg));
+    if (q.qty) parts.push('Adet: ' + String(q.qty));
+    items.push({ type: 'quote', id: q.id, text: parts.filter(Boolean).join(' — ').slice(0, 200), created_at: q.created_at });
+  }
+  items.sort((a, b) => (new Date(b.created_at) - new Date(a.created_at)) || (b.id - a.id));
+  res.json({ unread_messages: msgs.length, new_quotes: quotes.length, total: msgs.length + quotes.length, items });
+}));
+
+// CBOs26.5 (fix10i) — POST /api/products/factory/myfactory/notifications/read — okundu isaretle.
+// {type:'messages'|'quotes'|'all', user_id?} — yalnizca kendi fabrikasinin satirlari isaretlenir.
+// Master -> govde veya sorguda factory_id zorunlu (reply deseni).
+router.post('/factory/myfactory/notifications/read', requireFactoryOrMasterAuth,
+  body('type').isIn(['messages', 'quotes', 'all']),
+  body('user_id').optional().isString().isLength({ max: 100 }),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    await ensureFactoryMessagesTable();
+    await ensureFactoryQuotesTable();
+    let fid;
+    if (req.isMaster) {
+      const fromBody = req.body.factory_id;
+      const fromQuery = req.query.factory_id;
+      const hasBody = fromBody !== undefined && fromBody !== null && String(fromBody).trim() !== '';
+      const hasQuery = fromQuery !== undefined && fromQuery !== null && String(fromQuery).trim() !== '';
+      if (!hasBody && !hasQuery) return res.status(400).json({ error: 'factory_id_required', message: 'Master icin factory_id gerekli.' });
+      if (hasBody && hasQuery && Number(String(fromBody).trim()) !== Number(String(fromQuery).trim())) return res.status(400).json({ error: 'factory_id_mismatch' });
+      fid = Number(String(hasBody ? fromBody : fromQuery).trim());
+      if (!Number.isInteger(fid) || fid < 1) return res.status(400).json({ error: 'invalid_factory_id' });
+    } else fid = req.factoryId;
+    const { rows: frows } = await pool.query('SELECT id, name FROM factories WHERE id = $1', [fid]);
+    if (!frows.length) return res.status(404).json({ error: 'factory_not_found' });
+    const fname = String(frows[0].name || '').trim().toLowerCase();
+    const type = req.body.type;
+    const userId = req.body.user_id ? String(req.body.user_id) : null;
+    let markedMessages = 0, markedQuotes = 0;
+    if (type === 'messages' || type === 'all') {
+      const params = [fid];
+      let sql = `UPDATE factory_messages SET seen_by_factory = TRUE WHERE factory_id = $1 AND sender = 'user' AND COALESCE(seen_by_factory, FALSE) = FALSE`;
+      if (userId) { params.push(userId); sql += ` AND user_id = $${params.length}`; }
+      const r = await pool.query(sql, params);
+      markedMessages = r.rowCount || 0;
+    }
+    if (type === 'quotes' || type === 'all') {
+      const r = await pool.query(
+        `UPDATE factory_quotes SET seen_by_factory = TRUE WHERE (factory_id = $1 OR (factory_id IS NULL AND factory <> '' AND LOWER(TRIM(factory)) = $2)) AND COALESCE(seen_by_factory, FALSE) = FALSE`,
+        [fid, fname]
+      );
+      markedQuotes = r.rowCount || 0;
+    }
+    res.json({ ok: true, marked_messages: markedMessages, marked_quotes: markedQuotes });
   })
 );
 
@@ -2129,6 +2211,8 @@ async function ensureFactoryMessagesTable() {
   try { await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS factory_id INT`); } catch (e) { /* yoksay */ }
   await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS attachment_url TEXT`);
   await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'text'`);
+  // CBOs26.5 (fix10i): fabrika tarafindan goruldu bayragi (bildirim zili icin).
+  await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS seen_by_factory BOOLEAN DEFAULT FALSE`);
 // fix6: dosya eki meta alanlari (PDF/Excel/resim) — her biri kendi try/catch'inde, e-posta deseni.
   try { await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS attachment_name TEXT`); } catch (e) { /* attachment_name eklenemezse akis bozulmaz */ }
   try { await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS attachment_size INT`); } catch (e) { /* attachment_size eklenemezse akis bozulmaz */ }
@@ -2258,6 +2342,8 @@ router.get('/factory/messages', requireAuth, asyncHandler(async (req, res) => {
 async function ensureFactoryQuotesTable() {
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_quotes (id SERIAL PRIMARY KEY, user_id TEXT NOT NULL, factory TEXT NOT NULL DEFAULT '', name TEXT NOT NULL DEFAULT '', contact TEXT NOT NULL DEFAULT '', qty TEXT NOT NULL DEFAULT '', msg TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ DEFAULT now())`);
   await pool.query(`ALTER TABLE factory_quotes ADD COLUMN IF NOT EXISTS factory_id INT`);
+  // CBOs26.5 (fix10i): fabrika tarafindan goruldu bayragi (bildirim zili icin).
+  await pool.query(`ALTER TABLE factory_quotes ADD COLUMN IF NOT EXISTS seen_by_factory BOOLEAN DEFAULT FALSE`);
   // v118: user_id tip onarimi (users.id UUID) — teklif rotalari ensureFactoryTables'i
   // cagirmadigindan bu tablo icin donusum burada da calisir.
   try { await pool.query(`ALTER TABLE factory_quotes ALTER COLUMN user_id TYPE TEXT USING user_id::text`); } catch (e) { /* tip zaten TEXT ise yoksay */ }
