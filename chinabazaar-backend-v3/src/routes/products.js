@@ -694,6 +694,10 @@ function isAllowedFactoryMediaUrl(u) {
   try { host = new URL(t).hostname.toLowerCase(); } catch { return false; }
   if (FACTORY_MEDIA_HOSTS.has(host)) return true;
   if (host.endsWith('.netlify.app')) return true;
+  // fix10o: Cloudflare Stream alt alan adları (customer-*.cloudflarestream.com,
+  // *.videodelivery.net) — CBCloud yüklemeleri bu konaklarda barınır; fix10e'de
+  // eksikti, Stream videolu fabrika kaydetmede invalid_videos veriyordu.
+  if (host.endsWith('.cloudflarestream.com') || host.endsWith('.videodelivery.net')) return true;
   return false;
 }
 // fix10e L8: sosyal ağ konak allowlist'i — her anahtar yalnızca kendi ağının
