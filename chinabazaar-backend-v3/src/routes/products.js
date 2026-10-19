@@ -1,6 +1,14 @@
 // fix10c — FAZ 1 — My Factory (fabrika girisi) [API /factory/myfactory/*, sutunlar myfactory_*; eski fabrika giris sutunlarindaki veri gocle tasinir]: fabrika kendi hesabiyla giris yapar, kendi kaydini duzenler.
 // JWT: { factory_id, role: 'factory' }, 7 gun. Sifre: auth.js ile AYNI bcryptjs hasher (cost 12).
 // Yasak alanlar (name, cbf_code, is_verified, is_active) My Factory profilinde sessizce yoksayilir.
+// fix10e: H-B göç (transaction + doğrulama + DROP yoksa yapılmaz), H-E CBAI master
+// (sub+jti, 1 gün, denetim kaydı), L1 dummy hash 12 + uzunluk erken dönüşü yok,
+// L2 jenerik yanıtlar, L3 'cbai' rezerve, L4 şifre politikası, L7 SSRF engeli,
+// L8 videos/cover_image/socials konak allowlist, L9 CBF backfill kilit+transaction,
+// L18 JWT HS256 allowlist, M1 fabrika girişi tanıtan limiti, M2 ipKeyGenerator,
+// M5 chat-upload (limit + sahiplik + süreli URL + mime/boyut çapraz kontrol),
+// M6 fabrika e-posta/telefon benzersizliği, M7 /factory/list iletişim gizleme,
+// SABAH-4: settings wa_app_secret + has_wa_app_secret (WhatsApp HMAC için).
 // Ürün kataloğu — ön yüz (video akış) sözleşmesine uygun JSON döner:
 // { id, name, tagline, description, price_cents, price_display, currency,
 //   sold_count, stock, category: {id, slug, name}, video_url, thumb_url }
@@ -15,12 +23,14 @@ const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cfg = require('../config');
-const { loginLimiter } = require('../middleware/rateLimit');
+const { loginLimiter, loginIdentifierLimiter } = require('../middleware/rateLimit');
 
 // Fabrika yoksa bile karsilastirma yapilir (zamanlama ile kullanici sayimini zorlastirmak icin).
-const MYFACTORY_DUMMY_HASH = bcrypt.hashSync('__chinabazaar_no_such_myfactory__', 10);
+const MYFACTORY_DUMMY_HASH = bcrypt.hashSync('__chinabazaar_no_such_myfactory__', 12); // fix10e L1: 10 -> 12
 
 const rateLimit = require('express-rate-limit');
+const { ipKeyGenerator } = require('express-rate-limit');
+const dns = require('dns');
 const fs = require('fs');
 const path = require('path');
 
@@ -36,7 +46,7 @@ const shopShareLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'too_many_requests' },
-  keyGenerator: (req) => 'shop-share:' + (req.user && req.user.id ? String(req.user.id) : req.ip),
+  keyGenerator: (req) => 'shop-share:' + (req.user && req.user.id ? String(req.user.id) : ipKeyGenerator(req.ip)), // fix10e M2
 });
 
 // v582: Pazaryerleri kolonlari (orders.js ensure deseniyle ayni)
@@ -416,33 +426,50 @@ async function resolveCbfCodeForName(name) {
 // Backfill (idempotent): cbf_code'u bos olan fabrikalara kod ata. Ayni normalize ada sahip
 // satirlar AYNI kodu alir; kodlar fabrika-id sirasina gore, mevcut max + 1'den baslayarak
 // verilir. Dolu kodlar ASLA uzerine yazilmaz; baska hicbir sutuna dokunulmaz.
+// fix10e L9: CBF backfill yarışı — eşzamanlı iki backfill aynı kodu iki
+// fabrikaya yazmasın diye: oturum danışma kilidi (pg_advisory_xact_lock) +
+// tek transaction içinde hesapla+yaz + benzersizlik çakışmasında en fazla
+// 3 kez tekrar deneme. Kod ataması atomiktir; yarım backfill olmaz.
 async function backfillFactoryCbfCodes() {
-  try {
-    const { rows: pending } = await pool.query(`SELECT COUNT(*)::int AS n FROM factories WHERE cbf_code IS NULL OR TRIM(cbf_code) = ''`);
-    if (!pending.length || !pending[0].n) return;
-    const { rows } = await pool.query(`SELECT id, name, cbf_code FROM factories ORDER BY id ASC`);
-    let max = 0;
-    for (const r of rows) max = Math.max(max, parseCbfCodeNumber(r.cbf_code));
-    const groups = new Map();
-    for (const r of rows) {
-      const key = normalizeFactoryNameKey(r.name);
-      const existing = (typeof r.cbf_code === 'string' ? r.cbf_code.trim() : '');
-      if (!key) {
-        // Adsiz satir: grup yapilmaz, her biri kendi kodunu alir.
-        if (!existing) { max += 1; await pool.query('UPDATE factories SET cbf_code = $1 WHERE id = $2', [formatCbfCode(max), r.id]); }
-        continue;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      // Danışma kilidi: aynı anda yalnızca bir backfill çalışır.
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext('cbf-backfill'))`);
+      const { rows: pending } = await client.query(`SELECT COUNT(*)::int AS n FROM factories WHERE cbf_code IS NULL OR TRIM(cbf_code) = ''`);
+      if (!pending.length || !pending[0].n) { await client.query('COMMIT'); return; }
+      const { rows } = await client.query(`SELECT id, name, cbf_code FROM factories ORDER BY id ASC`);
+      let max = 0;
+      for (const r of rows) max = Math.max(max, parseCbfCodeNumber(r.cbf_code));
+      const groups = new Map();
+      const nameless = [];
+      for (const r of rows) {
+        const key = normalizeFactoryNameKey(r.name);
+        const existing = (typeof r.cbf_code === 'string' ? r.cbf_code.trim() : '');
+        if (!key) {
+          if (!existing) nameless.push(r.id);
+          continue;
+        }
+        if (!groups.has(key)) groups.set(key, { code: '', fill: [] });
+        const g = groups.get(key);
+        if (existing) { if (!g.code) g.code = normalizeCbfCode(existing); }
+        else g.fill.push(r.id);
       }
-      if (!groups.has(key)) groups.set(key, { code: '', fill: [] });
-      const g = groups.get(key);
-      if (existing) { if (!g.code) g.code = normalizeCbfCode(existing); }
-      else g.fill.push(r.id);
-    }
-    for (const g of groups.values()) {
-      if (!g.fill.length) continue;
-      if (!g.code) { max += 1; g.code = formatCbfCode(max); }
-      for (const id of g.fill) await pool.query('UPDATE factories SET cbf_code = $1 WHERE id = $2', [g.code, id]);
-    }
-  } catch (e) { /* backfill hatasi akisi bozmaz */ }
+      for (const id of nameless) { max += 1; await client.query('UPDATE factories SET cbf_code = $1 WHERE id = $2', [formatCbfCode(max), id]); }
+      for (const g of groups.values()) {
+        if (!g.fill.length) continue;
+        if (!g.code) { max += 1; g.code = formatCbfCode(max); }
+        for (const id of g.fill) await client.query('UPDATE factories SET cbf_code = $1 WHERE id = $2 AND (cbf_code IS NULL OR TRIM(cbf_code) = \'\')', [g.code, id]);
+      }
+      await client.query('COMMIT');
+      return;
+    } catch (e) {
+      try { await client.query('ROLLBACK'); } catch (_) { /* yoksay */ }
+      if (e && e.code === '23505' && attempt < 2) continue; // çakışma: tekrar dene (taze max ile)
+      return; // diğer hatalar: backfill hatası akışı bozmaz
+    } finally { client.release(); }
+  }
 }
 
 // v615 (My Factory v3): fabrika video begeni/yorum + fabrika yonetimi (admin)
@@ -505,14 +532,58 @@ async function ensureFactoryTables() {
   // Eski sutun yoksa (yeni kurulum) kopyalama adimi sessizce atlanir; hicbir sorgu cokmez.
   try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS myfactory_username TEXT UNIQUE`); } catch (e) { /* myfactory_username kolonu eklenemezse akis bozulmaz */ }
   try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS myfactory_password_hash TEXT`); } catch (e) { /* myfactory_password_hash kolonu eklenemezse akis bozulmaz */ }
+  // fix10e H-B: eski fabrika giriş verisi göçü — transaction + doğrulama.
+  // 1) Kopyalama tek transaction içinde, satır satır: MEVCUT myfactory_*
+  // değeri ASLA eski değerle ezilmez (yalnız NULL olanlar doldurulur).
+  // Benzersizlik çakışması yaşayan satır atlanır (sonraki çağrıda tekrar
+  // denenir), diğer satırlar etkilenmez.
+  // 2) Doğrulama: eski sütunda veri kalmışsa (kopyalanamamış satır varsa)
+  // DROP YAPILMAZ — eski sütunlar bir sonraki çağrıda tekrar denemek için
+  // korunur. Yalnız her şey kopyalanmışsa DROP edilir.
   try {
     const { rows: _mfCols } = await pool.query(`SELECT column_name FROM information_schema.columns WHERE table_name = 'factories' AND column_name IN ('workshop_username', 'workshop_password_hash')`);
     const _mfHas = new Set(_mfCols.map((r) => r.column_name));
-    if (_mfHas.has('workshop_username')) { await pool.query(`UPDATE factories SET myfactory_username = workshop_username WHERE workshop_username IS NOT NULL AND (myfactory_username IS NULL OR myfactory_username <> workshop_username)`); }
-    if (_mfHas.has('workshop_password_hash')) { await pool.query(`UPDATE factories SET myfactory_password_hash = workshop_password_hash WHERE workshop_password_hash IS NOT NULL AND (myfactory_password_hash IS NULL OR myfactory_password_hash <> workshop_password_hash)`); }
-  } catch (e) { /* veri tasima hatasi akisi bozmaz — eski hesaplar bir sonraki cagrida tekrar denenir */ }
-  try { await pool.query(`ALTER TABLE factories DROP COLUMN IF EXISTS workshop_username`); } catch (e) { /* eski sutun yoksa / silinemezse akis bozulmaz */ }
-  try { await pool.query(`ALTER TABLE factories DROP COLUMN IF EXISTS workshop_password_hash`); } catch (e) { /* eski sutun yoksa / silinemezse akis bozulmaz */ }
+    if (_mfHas.size) {
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        if (_mfHas.has('workshop_username')) {
+          const { rows: _mfRows } = await client.query(`SELECT id, workshop_username FROM factories WHERE workshop_username IS NOT NULL AND myfactory_username IS NULL`);
+          for (const r of _mfRows) {
+            try {
+              await client.query(`UPDATE factories SET myfactory_username = $1 WHERE id = $2 AND myfactory_username IS NULL`, [r.workshop_username, r.id]);
+            } catch (e) { /* çakışma: bu satır atlanır, diğerleri devam eder */ }
+          }
+        }
+        if (_mfHas.has('workshop_password_hash')) {
+          const { rows: _mfRows } = await client.query(`SELECT id, workshop_password_hash FROM factories WHERE workshop_password_hash IS NOT NULL AND myfactory_password_hash IS NULL`);
+          for (const r of _mfRows) {
+            try {
+              await client.query(`UPDATE factories SET myfactory_password_hash = $1 WHERE id = $2 AND myfactory_password_hash IS NULL`, [r.workshop_password_hash, r.id]);
+            } catch (e) { /* bu satır atlanır, diğerleri devam eder */ }
+          }
+        }
+        await client.query('COMMIT');
+      } catch (e) {
+        try { await client.query('ROLLBACK'); } catch (_) { /* yoksay */ }
+      } finally { client.release(); }
+      // Doğrulama: kopyalanamamış eski veri kaldı mı?
+      let _mfRemaining = 0;
+      try {
+        const conds = [];
+        if (_mfHas.has('workshop_username')) conds.push(`(workshop_username IS NOT NULL AND myfactory_username IS NULL)`);
+        if (_mfHas.has('workshop_password_hash')) conds.push(`(workshop_password_hash IS NOT NULL AND myfactory_password_hash IS NULL)`);
+        if (conds.length) {
+          const { rows: _rem } = await pool.query(`SELECT COUNT(*)::int AS n FROM factories WHERE ${conds.join(' OR ')}`);
+          _mfRemaining = _rem[0] ? _rem[0].n : 0;
+        }
+      } catch (e) { _mfRemaining = 1; /* doğrulanamadı: DROP yapma */ }
+      if (!_mfRemaining) {
+        try { await pool.query(`ALTER TABLE factories DROP COLUMN IF EXISTS workshop_username`); } catch (e) { /* eski sutun yoksa / silinemezse akis bozulmaz */ }
+        try { await pool.query(`ALTER TABLE factories DROP COLUMN IF EXISTS workshop_password_hash`); } catch (e) { /* eski sutun yoksa / silinemezse akis bozulmaz */ }
+      }
+    }
+  } catch (e) { /* göç hatası akışı bozmaz — eski hesaplar bir sonraki çağrıda tekrar denenir, DROP yapılmaz */ }
   // Sutun daha once UNIQUE'siz olusmus olabilir — kucuk harfe duyarsiz benzersizlik icin ifade indexi (varsa yoksayilir).
   try { await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS factories_myfactory_username_uidx ON factories (LOWER(myfactory_username))`); } catch (e) { /* index kurulamazsa akis bozulmaz */ }
   // v118: user_id tip onarimi — users.id UUID, ama fabrika tablolari user_id'yi INT diye
@@ -537,7 +608,7 @@ const factorySpamLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'too_many_requests' },
-  keyGenerator: (req) => 'factory-spam:' + (req.user && req.user.id ? String(req.user.id) : req.ip),
+  keyGenerator: (req) => 'factory-spam:' + (req.user && req.user.id ? String(req.user.id) : ipKeyGenerator(req.ip)), // fix10e M2
 });
 
 // SHOP SECURITY: magaza yorum + paylasim icin nazik limit (fabrika deseniyle ayni).
@@ -549,16 +620,129 @@ const shopSpamLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'too_many_requests' },
-  keyGenerator: (req) => 'shop-spam:' + (req.user && req.user.id ? String(req.user.id) : req.ip),
+  keyGenerator: (req) => 'shop-spam:' + (req.user && req.user.id ? String(req.user.id) : ipKeyGenerator(req.ip)), // fix10e M2
 });
 
 // SHOP SECURITY: gizli jeton karsilastirmasi icin zamanlama-saldirisina dayanikli esitlik.
+// fix10e L1: uzunluk erken dönüşü YOK — iki değer de SHA-256 ile sabit
+// uzunluklu özetlere indirgenir, timingSafeEqual özetler üzerinde çalışır.
 function timingSafeEqualStr(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
-  const ab = Buffer.from(a);
-  const bb = Buffer.from(b);
-  if (ab.length !== bb.length) return false;
+  const ab = crypto.createHash('sha256').update(a).digest();
+  const bb = crypto.createHash('sha256').update(b).digest();
   return crypto.timingSafeEqual(ab, bb);
+}
+
+// fix10e L4: şifre politikası — en az 8 karakter + en az bir harf + en az bir rakam.
+function passwordStrong(pw) {
+  return typeof pw === 'string' && pw.length >= 8 && /[A-Za-z]/.test(pw) && /[0-9]/.test(pw);
+}
+
+// fix10e H-E: master işlem denetim kaydı — created_by ASLA null değil,
+// master işaretli 'cbai' yazılır. Hata ana akışı bozmaz.
+async function logMasterAudit(action, targetType, targetId) {
+  try {
+    await pool.query(`CREATE TABLE IF NOT EXISTS master_audit_log (id SERIAL PRIMARY KEY, action TEXT NOT NULL, target_type TEXT, target_id TEXT, created_by TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now())`);
+    await pool.query(`INSERT INTO master_audit_log (action, target_type, target_id, created_by) VALUES ($1, $2, $3, 'cbai')`, [action, targetType || null, targetId == null ? null : String(targetId)]);
+  } catch (e) { /* denetim kaydı ana akışı bozmaz */ }
+}
+
+// fix10e L8: fabrika medya URL konak allowlist'i — videos / cover_image yalnız
+// bu konaklardan kabul edilir (rastgele dış konak / javascript: / veri gömme yok).
+// İzinli: Cloudflare Stream + ChinaBazaar alanları + Netlify dağıtımları.
+const FACTORY_MEDIA_HOSTS = new Set([
+  'videodelivery.net', 'cloudflarestream.com',
+  'chinabazaar.com', 'www.chinabazaar.com',
+  'chinabazaar.shop', 'www.chinabazaar.shop',
+  'cbazaar.netlify.app', 'myfactor.netlify.app', 'cbcbcb.netlify.app',
+]);
+function isAllowedFactoryMediaUrl(u) {
+  if (typeof u !== 'string') return false;
+  const t = u.trim();
+  if (!/^https:\/\//i.test(t)) return false;
+  let host = '';
+  try { host = new URL(t).hostname.toLowerCase(); } catch { return false; }
+  if (FACTORY_MEDIA_HOSTS.has(host)) return true;
+  if (host.endsWith('.netlify.app')) return true;
+  return false;
+}
+// fix10e L8: sosyal ağ konak allowlist'i — her anahtar yalnızca kendi ağının
+// konaklarını kabul eder (örn. youtube alanına facebook.com yazılamaz).
+const FACTORY_SOCIAL_HOSTS = {
+  youtube: new Set(['youtube.com', 'www.youtube.com', 'youtu.be', 'm.youtube.com']),
+  facebook: new Set(['facebook.com', 'www.facebook.com', 'fb.com', 'www.fb.com']),
+  tiktok: new Set(['tiktok.com', 'www.tiktok.com']),
+  instagram: new Set(['instagram.com', 'www.instagram.com']),
+};
+function isAllowedFactorySocialUrl(key, u) {
+  if (typeof u !== 'string') return false;
+  const t = u.trim();
+  if (t === '') return true;
+  if (!/^https:\/\//i.test(t)) return false;
+  let host = '';
+  try { host = new URL(t).hostname.toLowerCase(); } catch { return false; }
+  const allowed = FACTORY_SOCIAL_HOSTS[key];
+  return !!allowed && allowed.has(host);
+}
+
+// fix10e M6: fabrika e-posta/telefon benzersizliği (kendi dışı).
+async function factoryContactTaken(field, value, excludeId) {
+  if (value === undefined || value === null || String(value).trim() === '') return false;
+  const v = String(value).trim();
+  let sql; let params;
+  if (field === 'email') {
+    sql = `SELECT id FROM factories WHERE LOWER(email) = LOWER($1)`;
+    params = [v];
+  } else {
+    sql = `SELECT id FROM factories WHERE phone = $1`;
+    params = [v];
+  }
+  if (excludeId !== undefined && excludeId !== null) { params.push(excludeId); sql += ` AND id <> $${params.length}`; }
+  const { rows } = await pool.query(sql, params);
+  return rows.length > 0;
+}
+
+// fix10e L7: SSRF — iç / özel ağ engeli. URL'deki konak DNS ile çözülür;
+// çözülen IP'lerden BİRİ bile özel/rezerve aralıktaysa URL reddedilir.
+// (DNS rebinding TOCTOU'ya karşı tam koruma değildir; derinlik katmanıdır.)
+function isPrivateIp(ip) {
+  if (!ip) return true;
+  if (ip.includes(':')) {
+    const l = ip.toLowerCase();
+    if (l === '::1' || l === '::' || l.startsWith('fe8') || l.startsWith('fe9') || l.startsWith('fea') || l.startsWith('feb') || l.startsWith('fc') || l.startsWith('fd') || l.startsWith('::ffff:')) {
+      if (l.startsWith('::ffff:')) return isPrivateIp(l.slice(7));
+      return true;
+    }
+    if (l.startsWith('ff')) return true; // multicast
+    return false;
+  }
+  const parts = ip.split('.').map((x) => parseInt(x, 10));
+  if (parts.length !== 4 || parts.some((x) => !Number.isInteger(x) || x < 0 || x > 255)) return true;
+  const [a, b] = parts;
+  if (a === 10) return true;
+  if (a === 127) return true;
+  if (a === 0) return true;
+  if (a === 169 && b === 254) return true;
+  if (a === 172 && b >= 16 && b <= 31) return true;
+  if (a === 192 && b === 168) return true;
+  if (a === 100 && b >= 64 && b <= 127) return true;
+  if (a >= 224) return true;
+  return false;
+}
+async function assertPublicUrl(rawUrl) {
+  let u;
+  try { u = new URL(String(rawUrl)); } catch { return false; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+  if (u.username || u.password) return false; // kimlik bilgili URL yok
+  const host = u.hostname;
+  if (!host || host === 'localhost') return false;
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return !isPrivateIp(host);
+  try {
+    const addrs = await dns.promises.lookup(host, { all: true });
+    if (!addrs.length) return false;
+    for (const a of addrs) { if (isPrivateIp(a.address)) return false; }
+    return true;
+  } catch { return false; }
 }
 
 // Goruntulenecek ad: nickname || name || e-posta on eki (e-posta adresinin tamami ASLA donulmez)
@@ -570,11 +754,32 @@ function factoryDisplayName(u) {
   return 'Misafir';
 }
 
-function toFactoryPublic(r) {
+// fix10e M7: herkese açık yanıtta (GET /factory/list) iletişim bilgileri
+// gösterilmez — opts.includeContact === false ise e-posta/telefon/adres/
+// WhatsApp/WeChat/kontak kişi çıkarılır. Admin/MyFactory serializer'ları
+// tam kaydı almaya devam eder (includeContact varsayılan true).
+function toFactoryPublic(r, opts) {
+  const includeContact = !opts || opts.includeContact !== false;
   let videos = r.videos;
   if (typeof videos === 'string') { try { videos = JSON.parse(videos); } catch { videos = []; } }
   if (!Array.isArray(videos)) videos = [];
+  const contactFields = includeContact ? {
+    address: r.address || '',
+    phone: r.phone || '',
+    contact: r.contact || '',
+    email: r.email || null,
+    wechat: r.wechat || '',
+    whatsapp: r.whatsapp || '',
+  } : {
+    address: '',
+    phone: '',
+    contact: '',
+    email: null,
+    wechat: '',
+    whatsapp: '',
+  };
   return {
+    ...contactFields,
     id: r.id,
     name: r.name,
     cbf_code: r.cbf_code || '',
@@ -595,12 +800,6 @@ function toFactoryPublic(r) {
     main_products: r.main_products || '',
     cover_image: r.cover_image || '',
     hashtags: r.hashtags || '',
-    address: r.address || '',
-    phone: r.phone || '',
-    contact: r.contact || '',
-    email: r.email || null,
-    wechat: r.wechat || '',
-    whatsapp: r.whatsapp || '',
     socials: parseFactorySocials(r.socials),
     tags: r.tags || '',
     videos,
@@ -700,6 +899,7 @@ function cleanMyFactoryUsername(v) {
   if (t === '') return '';
   if (t.length < 3 || t.length > 50) return null;
   if (!/^[A-Za-z0-9_.\-]+$/.test(t)) return null;
+  if (t.toLowerCase() === 'cbai') return null; // fix10e L3: 'cbai' rezerve
   return t;
 }
 
@@ -711,6 +911,7 @@ function cleanMyFactoryPassword(v) {
   if (typeof v !== 'string') return null;
   if (v === '') return '';
   if (v.length < 8 || v.length > 100) return null;
+  if (!passwordStrong(v)) return null; // fix10e L4: harf + rakam zorunlu
   return v;
 }
 // fix9: fabrika kapak gorseli — undefined => dokunma, bos string => '' (yok),
@@ -721,11 +922,12 @@ function cleanFactoryCoverImage(v) {
   const t = v.trim();
   if (t === '') return '';
   if (t.length > 2048) return null;
-  if (!/^https?:\/\//i.test(t)) return null;
+  if (!isAllowedFactoryMediaUrl(t)) return null; // fix10e L8: konak allowlist
   return t;
 }
 
-// v5: socials — obje veya JSON string; her URL bos veya http(s) ile baslamali, aksi halde null (400)
+// v5: socials — obje veya JSON string; her URL bos veya kendi ağının
+// konak allowlist'inde olmalı (fix10e L8), aksi halde null (400)
 function cleanFactorySocials(v) {
   if (v === undefined) return undefined;
   let o = v;
@@ -738,7 +940,7 @@ function cleanFactorySocials(v) {
     if (typeof val !== 'string') return null;
     const t = val.trim();
     if (t.length > 2048) return null;
-    if (t !== '' && !/^https?:\/\//i.test(t)) return null;
+    if (t !== '' && !isAllowedFactorySocialUrl(k, t)) return null;
     out[k] = t;
   }
   return out;
@@ -784,7 +986,7 @@ function cleanFactoryVideos(v) {
   const out = [];
   for (const it of v) {
     if (!it || typeof it !== 'object' || Array.isArray(it)) return null;
-    if (typeof it.url !== 'string' || !/^https?:\/\//i.test(it.url.trim()) || it.url.trim().length > 2048) return null;
+    if (typeof it.url !== 'string' || !isAllowedFactoryMediaUrl(it.url.trim()) || it.url.trim().length > 2048) return null; // fix10e L8: konak allowlist
     if (it.kind !== 'video' && it.kind !== 'canli') return null;
     out.push({ title: typeof it.title === 'string' ? it.title.trim().slice(0, 200) : '', url: it.url.trim(), kind: it.kind });
   }
@@ -950,7 +1152,7 @@ function requireFactoryAuth(req, res, next) {
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'unauthorized', message: 'Giriş gerekli. Lütfen ChinaBazaar My Factory hesabınızla giriş yapın.' });
   let payload;
-  try { payload = jwt.verify(token, cfg.jwtSecret); } catch { return res.status(401).json({ error: 'invalid_token', message: 'Oturumunuz geçersiz veya süresi dolmuş. Lütfen tekrar giriş yapın.' }); }
+  try { payload = jwt.verify(token, cfg.jwtSecret, { algorithms: cfg.jwtAlgorithms }); } catch { return res.status(401).json({ error: 'invalid_token', message: 'Oturumunuz geçersiz veya süresi dolmuş. Lütfen tekrar giriş yapın.' }); }
   if (!payload || payload.role !== 'factory' || !Number.isInteger(payload.factory_id)) return res.status(403).json({ error: 'forbidden', message: 'Bu işlem için fabrika hesabı gerekli.' });
   req.factoryId = payload.factory_id;
   next();
@@ -967,30 +1169,136 @@ function requireUserOrFactoryAuth(req, res, next) {
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'unauthorized', message: 'Giriş gerekli.' });
   let payload;
-  try { payload = jwt.verify(token, cfg.jwtSecret); } catch { return res.status(401).json({ error: 'invalid_token', message: 'Oturumunuz geçersiz veya süresi dolmuş. Lütfen tekrar giriş yapın.' }); }
+  try { payload = jwt.verify(token, cfg.jwtSecret, { algorithms: cfg.jwtAlgorithms }); } catch { return res.status(401).json({ error: 'invalid_token', message: 'Oturumunuz geçersiz veya süresi dolmuş. Lütfen tekrar giriş yapın.' }); }
   if (payload && payload.role === 'factory' && Number.isInteger(payload.factory_id)) { req.factoryId = payload.factory_id; return next(); }
-  if (payload && payload.sub) { req.user = { id: payload.sub, email: payload.email }; return next(); }
+  if (payload && payload.role === 'master' && payload.is_admin === true) { req.isMaster = true; req.user = { id: 'cbai', email: null, role: 'master' }; return next(); }
+  if (payload && payload.sub) { req.user = { id: payload.sub, email: payload.email, role: payload.role || 'user' }; return next(); }
   return res.status(401).json({ error: 'unauthorized', message: 'Giriş gerekli.' });
+}
+
+// fix10d — CBAI master + çoklu tanımlayıcılı giriş yardımcıları.
+// identifier "cbai" (büyük-küçük duyarsız) REZERVE: fabrika araması yapılmaz.
+function isCbaiIdentifier(v) {
+  return typeof v === 'string' && v.trim().toLowerCase() === 'cbai';
+}
+// CBAI master şifresi YALNIZCA Railway env'den okunur (kodda/DB'de/testte ASLA yok).
+function cbaiMasterConfigured() {
+  return !!(process.env.CBAI_MASTER_PASSWORD || '');
+}
+// Timing-safe karşılaştırma — uzunluk erken dönüşü YOK (fix10e L1):
+// iki değer de SHA-256 özetine indirgenir, karşılaştırma özetler üzerinde.
+function cbaiMasterPasswordOk(password) {
+  const expected = process.env.CBAI_MASTER_PASSWORD || '';
+  if (!expected || typeof password !== 'string' || !password) return false;
+  const a = crypto.createHash('sha256').update(password).digest();
+  const b = crypto.createHash('sha256').update(expected).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+// fix10e H-E: sub='cbai' + jti, süre 7 gün -> 1 gün, HS256 açık.
+function signMasterToken() {
+  return jwt.sign({ sub: 'cbai', role: 'master', is_admin: true, jti: crypto.randomUUID() }, cfg.jwtSecret, { expiresIn: '1d', algorithm: 'HS256' });
+}
+// CBF tanımlayıcı normalizasyonu: "CBF-001" / "cbf001" / "cbf-001" → "CBF-001".
+// Eşleşmezse '' (CBF koşulu sorguya eklenmez).
+function normalizeMyFactoryCbfIdentifier(v) {
+  if (typeof v !== 'string') return '';
+  const t = v.trim().toUpperCase().replace(/[\s-]/g, '');
+  const m = /^CBF(\d+)$/.exec(t);
+  if (!m) return '';
+  return 'CBF-' + String(parseInt(m[1], 10)).padStart(3, '0');
+}
+// Telefon varyantları: girilen + kayıtlı AYNI normalize edilir — önce ulusal numaraya
+// indirgenir (+90 / 90 / 0 önekleri soyulur), sonra TÜM önek biçimleri aday olur.
+function myFactoryPhoneCandidates(identifier) {
+  const raw = String(identifier || '').replace(/[\s\-().]/g, '');
+  if (!raw) return [];
+  let national = raw;
+  if (raw.startsWith('+90')) national = raw.slice(3);
+  else if (raw.startsWith('90') && raw.length >= 11) national = raw.slice(2);
+  else if (raw.startsWith('0')) national = raw.slice(1);
+  const out = new Set([national, '0' + national, '90' + national, '+90' + national, raw]);
+  return [...out];
+}
+
+// fix10d — fabrika VEYA CBAI master JWT'sini kabul eder (me + profile).
+// Fabrika: role 'factory' + tamsayi factory_id → req.factoryId.
+// Master: role 'master' + is_admin true → req.isMaster = true (factory_id YOK).
+// Token yok/bozuk/süresi dolmuş => 401; geçerli ama ne fabrika ne master => 403.
+function requireFactoryOrMasterAuth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'unauthorized', message: 'Giriş gerekli. Lütfen ChinaBazaar My Factory hesabınızla giriş yapın.' });
+  let payload;
+  try { payload = jwt.verify(token, cfg.jwtSecret, { algorithms: cfg.jwtAlgorithms }); } catch { return res.status(401).json({ error: 'invalid_token', message: 'Oturumunuz geçersiz veya süresi dolmuş. Lütfen tekrar giriş yapın.' }); }
+  if (payload && payload.role === 'master' && payload.is_admin === true) { req.isMaster = true; return next(); }
+  if (payload && payload.role === 'factory' && Number.isInteger(payload.factory_id)) { req.factoryId = payload.factory_id; return next(); }
+  return res.status(403).json({ error: 'forbidden', message: 'Bu işlem için fabrika hesabı gerekli.' });
 }
 
 // POST /api/products/factory/myfactory/login { username, password } → { token, factory }
 // Basarisiz giris (kullanici yok / sifre yanlis / sifre tanimli degil) => 401, ayirt edici bilgi verilmez.
-router.post('/factory/myfactory/login', loginLimiter, asyncHandler(async (req, res) => {
+// fix10d — çoklu tanımlayıcı: identifier = myfactory_username / e-posta / telefon / cbf_code
+// (CBF-001 veya cbf001 → normalize "CBF-001"). Tam bir fabrikaya çözümlenmeli; sıfır
+// veya birden fazla eşleşme (belirsiz/çakışma) → 401, ayırt edici bilgi verilmez.
+// fix10d — identifier "cbai" rezerve: fabrika araması yapılmaz, master akışı çalışır.
+// fix10e L2: env ayarlı değilse de jenerik 401 (master_not_configured yok).
+// fix10e M1: tanıtan-bazlı limit (loginIdentifierLimiter) + IP limiti aynen.
+router.post('/factory/myfactory/login', loginLimiter, loginIdentifierLimiter, asyncHandler(async (req, res) => {
   await ensureFactoryTables();
-  const username = typeof (req.body && req.body.username) === 'string' ? req.body.username.trim() : '';
+  const identifier = typeof (req.body && (req.body.identifier ?? req.body.username)) === 'string' ? String(req.body.identifier ?? req.body.username).trim() : '';
   const password = req.body && req.body.password;
-  if (!username || typeof password !== 'string' || !password) return res.status(401).json({ error: 'invalid_credentials', message: 'Kullanıcı adı veya şifre hatalı.' });
-  const { rows } = await pool.query(`SELECT * FROM factories WHERE LOWER(myfactory_username) = LOWER($1) LIMIT 1`, [username]);
-  const row = rows[0];
+  if (!identifier || typeof password !== 'string' || !password) return res.status(401).json({ error: 'invalid_credentials', message: 'Kullanıcı adı veya şifre hatalı.' });
+  // CBAI master (rezerve) — fabrika araması YAPILMAZ.
+  if (isCbaiIdentifier(identifier)) {
+    if (!cbaiMasterConfigured() || !cbaiMasterPasswordOk(password)) {
+      await bcrypt.compare(password, MYFACTORY_DUMMY_HASH);
+      return res.status(401).json({ error: 'invalid_credentials', message: 'Kullanıcı adı veya şifre hatalı.' });
+    }
+    await logMasterAudit('master_login', 'factory', null);
+    return res.json({ token: signMasterToken(), master: true });
+  }
+  const cbf = normalizeMyFactoryCbfIdentifier(identifier);
+  const phoneCands = myFactoryPhoneCandidates(identifier);
+  const conds = ['LOWER(myfactory_username) = LOWER($1)', 'LOWER(email) = LOWER($1)'];
+  const params = [identifier];
+  if (phoneCands.length) { params.push(phoneCands); conds.push(`REGEXP_REPLACE(COALESCE(phone, ''), '[\\s\\-().]', '', 'g') = ANY($${params.length})`); }
+  if (cbf) { params.push(cbf); conds.push(`UPPER(TRIM(cbf_code)) = $${params.length}`); }
+  const { rows } = await pool.query(`SELECT * FROM factories WHERE ${conds.join(' OR ')}`, params);
+  // Aynı satır birden çok tanımlayıcıyla eşleşmiş olabilir — fabrikaya göre tekilleştir.
+  const byId = new Map();
+  for (const r of rows) { if (!byId.has(r.id)) byId.set(r.id, r); }
+  const matched = [...byId.values()];
+  if (matched.length !== 1) { await bcrypt.compare(password, MYFACTORY_DUMMY_HASH); return res.status(401).json({ error: 'invalid_credentials', message: 'Kullanıcı adı veya şifre hatalı.' }); }
+  const row = matched[0];
   const ok = await bcrypt.compare(password, row && row.myfactory_password_hash ? row.myfactory_password_hash : MYFACTORY_DUMMY_HASH);
-  if (!row || !ok) return res.status(401).json({ error: 'invalid_credentials', message: 'Kullanıcı adı veya şifre hatalı.' });
-  const token = jwt.sign({ factory_id: row.id, role: 'factory' }, cfg.jwtSecret, { expiresIn: '7d' });
+  if (!ok) return res.status(401).json({ error: 'invalid_credentials', message: 'Kullanıcı adı veya şifre hatalı.' });
+  const token = jwt.sign({ factory_id: row.id, role: 'factory' }, cfg.jwtSecret, { expiresIn: '7d', algorithm: 'HS256' });
   res.json({ token, factory: toFactoryMyFactory(row) });
 }));
 
-// GET /api/products/factory/myfactory/me — kendi fabrikasinin TAM kaydi (hash ASLA yok).
-router.get('/factory/myfactory/me', requireFactoryAuth, asyncHandler(async (req, res) => {
+// GET /api/products/factory/myfactory/me — kendi fabrikasının TAM kaydı (hash ASLA yok).
+// fix10d — fabrika tokenı → kendi kaydı (?factory_id farklıysa 403, izolasyon).
+// Master tokenı → ?factory_id=X varsa o fabrikanın TAM kaydı; yoksa
+// {master:true, factories:[{id,name,cbf_code}]} (seçici için).
+router.get('/factory/myfactory/me', requireFactoryOrMasterAuth, asyncHandler(async (req, res) => {
   await ensureFactoryTables();
+  if (req.isMaster) {
+    const q = req.query.factory_id;
+    if (q !== undefined && q !== null && String(q).trim() !== '') {
+      const fid = Number(String(q).trim());
+      if (!Number.isInteger(fid) || fid < 1) return res.status(400).json({ error: 'invalid_factory_id', message: 'Fabrika kimliği geçerli değil.' });
+      const { rows } = await pool.query('SELECT * FROM factories WHERE id = $1', [fid]);
+      if (!rows.length) return res.status(404).json({ error: 'factory_not_found', message: 'Fabrika bulunamadı.' });
+      return res.json(toFactoryMyFactory(rows[0]));
+    }
+    const { rows } = await pool.query('SELECT id, name, cbf_code FROM factories ORDER BY id ASC');
+    return res.json({ master: true, factories: rows.map((r) => ({ id: r.id, name: r.name, cbf_code: r.cbf_code || '' })) });
+  }
+  // Fabrika tokenı: ?factory_id token'daki fabrikadan farklıysa 403 (izolasyon).
+  const q = req.query.factory_id;
+  if (q !== undefined && q !== null && String(q).trim() !== '' && Number(String(q).trim()) !== req.factoryId) {
+    return res.status(403).json({ error: 'forbidden', message: 'Yalnız kendi fabrika kaydınızı görebilirsiniz.' });
+  }
   const { rows } = await pool.query('SELECT * FROM factories WHERE id = $1', [req.factoryId]);
   if (!rows.length) return res.status(404).json({ error: 'factory_not_found', message: 'Fabrika bulunamadı.' });
   res.json(toFactoryMyFactory(rows[0]));
@@ -1001,17 +1309,40 @@ router.get('/factory/myfactory/me', requireFactoryAuth, asyncHandler(async (req,
 // address, phone, contact, wechat, whatsapp, email, import_countries, employees,
 // annual_revenue, factory_area, years, socials, cover_image, videos.
 // YASAK (sessizce yoksayilir): name, cbf_code, is_verified, is_active (+ moq/stock/capacity).
-router.put('/factory/myfactory/profile', requireFactoryAuth, asyncHandler(async (req, res) => {
+// fix10d — master: factory_id gövdede/query'de ZORUNLU (yoksa 400), master her fabrikayı
+// düzenler. Fabrika tokenı: yalnızca kendi fabrikası (gövdedeki/sorgudaki farklı factory_id → 403).
+router.put('/factory/myfactory/profile', requireFactoryOrMasterAuth, asyncHandler(async (req, res) => {
   await ensureFactoryTables();
   const body = req.body || {};
-  // Govdeden gelen id ASLA guvenilmez: token'daki fabrikadan farkliysa 403.
-  for (const key of ['id', 'factory_id']) {
-    if (body[key] !== undefined && body[key] !== null && body[key] !== '' && Number(body[key]) !== req.factoryId) {
+  // Hedef fabrika: master → gövde/query factory_id (ZORUNLU); fabrika → token'daki fabrika.
+  let targetFactoryId;
+  if (req.isMaster) {
+    const fromBody = body.factory_id;
+    const fromQuery = req.query.factory_id;
+    const hasBody = fromBody !== undefined && fromBody !== null && String(fromBody).trim() !== '';
+    const hasQuery = fromQuery !== undefined && fromQuery !== null && String(fromQuery).trim() !== '';
+    if (!hasBody && !hasQuery) return res.status(400).json({ error: 'factory_id_required', message: 'Master düzenlemesi için factory_id gerekli.' });
+    if (hasBody && hasQuery && Number(String(fromBody).trim()) !== Number(String(fromQuery).trim())) {
+      return res.status(400).json({ error: 'factory_id_mismatch', message: 'Gövde ve sorgudaki factory_id aynı olmalı.' });
+    }
+    targetFactoryId = Number(String(hasBody ? fromBody : fromQuery).trim());
+    if (!Number.isInteger(targetFactoryId) || targetFactoryId < 1) return res.status(400).json({ error: 'invalid_factory_id', message: 'Fabrika kimliği geçerli değil.' });
+  } else {
+    // Govdeden gelen id ASLA guvenilmez: token'daki fabrikadan farkliysa 403.
+    for (const key of ['id', 'factory_id']) {
+      if (body[key] !== undefined && body[key] !== null && body[key] !== '' && Number(body[key]) !== req.factoryId) {
+        return res.status(403).json({ error: 'forbidden', message: 'Yalnız kendi fabrika kaydınızı düzenleyebilirsiniz.' });
+      }
+    }
+    // Sorgudaki factory_id de token'daki fabrikadan farklıysa 403 (izolasyon).
+    const qf = req.query.factory_id;
+    if (qf !== undefined && qf !== null && String(qf).trim() !== '' && Number(String(qf).trim()) !== req.factoryId) {
       return res.status(403).json({ error: 'forbidden', message: 'Yalnız kendi fabrika kaydınızı düzenleyebilirsiniz.' });
     }
+    targetFactoryId = req.factoryId;
   }
   const sets = [];
-  const params = [req.factoryId];
+  const params = [targetFactoryId];
   const push = (col, val, cast) => { params.push(val); sets.push(`${col} = $${params.length}${cast || ''}`); };
   const bad = (code, message) => res.status(400).json({ error: code, message });
   // desc / description: ikisi de kabul edilir, desc onceliklidir.
@@ -1028,11 +1359,11 @@ router.put('/factory/myfactory/profile', requireFactoryAuth, asyncHandler(async 
   if (body.hashtags !== undefined) { const c = cleanFactoryHashtags(body.hashtags); if (c === null) return bad('invalid_hashtags', 'Etiketler geçerli değil.'); push('hashtags', c); }
   if (body.tags !== undefined) { const c = cleanFactoryTags(body.tags); if (c === null) return bad('invalid_tags', 'Etiketler geçerli değil.'); push('tags', c); }
   if (body.address !== undefined) { const c = cleanFactoryText(body.address, 500); if (c === null) return bad('invalid_address', 'Adres geçerli değil.'); push('address', c); }
-  if (body.phone !== undefined) { const c = cleanFactoryText(body.phone, 200); if (c === null) return bad('invalid_phone', 'Telefon geçerli değil.'); push('phone', c); }
+  if (body.phone !== undefined) { const c = cleanFactoryText(body.phone, 200); if (c === null) return bad('invalid_phone', 'Telefon geçerli değil.'); if (c !== '' && await factoryContactTaken('phone', c, targetFactoryId)) return res.status(409).json({ error: 'contact_in_use', message: 'Bu telefon başka bir fabrikada kullanılıyor.' }); push('phone', c); } // fix10e M6
   if (body.contact !== undefined) { const c = cleanFactoryText(body.contact, 200); if (c === null) return bad('invalid_contact', 'İlgili kişi geçerli değil.'); push('contact', c); }
   if (body.wechat !== undefined) { const c = cleanFactoryText(body.wechat, 200); if (c === null) return bad('invalid_wechat', 'WeChat geçerli değil.'); push('wechat', c); }
   if (body.whatsapp !== undefined) { const c = cleanFactoryText(body.whatsapp, 200); if (c === null) return bad('invalid_whatsapp', 'WhatsApp geçerli değil.'); push('whatsapp', c); }
-  if (body.email !== undefined) { const c = cleanFactoryEmail(body.email); if (c === null) return bad('invalid_email', 'E-posta adresi geçerli değil.'); push('email', c === '' ? null : c); }
+  if (body.email !== undefined) { const c = cleanFactoryEmail(body.email); if (c === null) return bad('invalid_email', 'E-posta adresi geçerli değil.'); if (c !== '' && await factoryContactTaken('email', c, targetFactoryId)) return res.status(409).json({ error: 'contact_in_use', message: 'Bu e-posta başka bir fabrikada kullanılıyor.' }); push('email', c === '' ? null : c); } // fix10e M6
   if (body.import_countries !== undefined) { const c = cleanFactoryTags(body.import_countries); if (c === null) return bad('invalid_import_countries', 'İthalat ülkeleri geçerli değil.'); push('import_countries', c); }
   if (body.employees !== undefined) { const c = cleanFactoryText(body.employees, 2000); if (c === null) return bad('invalid_employees', 'Çalışan sayısı geçerli değil.'); push('employees', c); }
   if (body.annual_revenue !== undefined) { const c = cleanFactoryText(body.annual_revenue, 2000); if (c === null) return bad('invalid_annual_revenue', 'Yıllık ciro geçerli değil.'); push('annual_revenue', c); }
@@ -1045,6 +1376,7 @@ router.put('/factory/myfactory/profile', requireFactoryAuth, asyncHandler(async 
   sets.push('updated_at = now()');
   const { rows } = await pool.query(`UPDATE factories SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params);
   if (!rows.length) return res.status(404).json({ error: 'factory_not_found', message: 'Fabrika bulunamadı.' });
+  if (req.isMaster) await logMasterAudit('factory_profile_update', 'factory', targetFactoryId); // fix10e H-E
   res.json(toFactoryMyFactory(rows[0]));
 }));
 
@@ -1077,7 +1409,7 @@ router.get('/factory/list', asyncHandler(async (req, res) => {
   const { rows } = await pool.query(`SELECT * FROM factories WHERE is_active IS NOT FALSE ORDER BY id ASC`);
   const rmap = await factoryRatingsMap(rows.map((r) => r.id));
   const qmap = await factoryQuoteCountsMap(rows.map((r) => r.id));
-  res.json(rows.map((r) => ({ ...toFactoryPublic(r), rating_avg: (rmap[r.id] && rmap[r.id].rating_avg !== undefined) ? rmap[r.id].rating_avg : null, rating_count: (rmap[r.id] && rmap[r.id].rating_count) || 0, quote_count: qmap[r.id] || 0 })));
+  res.json(rows.map((r) => ({ ...toFactoryPublic(r, { includeContact: false }), rating_avg: (rmap[r.id] && rmap[r.id].rating_avg !== undefined) ? rmap[r.id].rating_avg : null, rating_count: (rmap[r.id] && rmap[r.id].rating_count) || 0, quote_count: qmap[r.id] || 0 }))); // fix10e M7
 }));
 
 // GET /api/products/factory/quote-counts — her fabrikanin toplam teklif sayisi (herkese acik istatistik)
@@ -1161,13 +1493,7 @@ const factoryValidators = [
     return true;
   }),
   body('socials').optional().custom((v) => {
-    if (typeof v === 'string') { try { v = JSON.parse(v); } catch { throw new Error('invalid_socials'); } }
-    if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error('invalid_socials');
-    for (const k of ['youtube', 'facebook', 'tiktok', 'instagram']) {
-      const val = v[k];
-      if (val === undefined || val === null || val === '') continue;
-      if (typeof val !== 'string' || val.trim().length > 2048 || !/^https?:\/\//i.test(val.trim())) throw new Error('invalid_socials');
-    }
+    if (cleanFactorySocials(v) === null) throw new Error('invalid_socials'); // fix10e L8: konak allowlist
     return true;
   }),
 ];
@@ -1273,6 +1599,9 @@ router.post('/factory/admin', requireAuth, requireAdmin,
         if (req.body.tags !== undefined) mergePush('tags', tagsClean);
         // VERIFIED (CBF merge): body verirse guncelle, verilmezse degistirme.
         if (req.body.is_verified !== undefined) mergePush('is_verified', verifiedCreate);
+        // fix10e M6: e-posta/telefon benzersizliği (CBF merge — hedef fabrika dışı).
+        if (emailClean && await factoryContactTaken('email', emailClean, existingFactory.id)) return res.status(409).json({ error: 'contact_in_use', message: 'Bu e-posta başka bir fabrikada kullanılıyor.' });
+        if (phoneClean && await factoryContactTaken('phone', phoneClean, existingFactory.id)) return res.status(409).json({ error: 'contact_in_use', message: 'Bu telefon başka bir fabrikada kullanılıyor.' });
         // FAZ 1 — My Factory hesabi (CBF merge): kullanici adi cakisirsa 409; sifre bos degilse hash'lenir.
         if (myFactoryUsernameClean) {
           if (await myFactoryUsernameTaken(myFactoryUsernameClean, existingFactory.id)) return res.status(409).json({ error: 'myfactory_username_taken', message: 'Bu ChinaBazaar My Factory kullanıcı adı başka bir fabrikada kullanılıyor.' });
@@ -1302,6 +1631,9 @@ router.post('/factory/admin', requireAuth, requireAdmin,
     // CBF: body'de kod varsa normalize edip kullan; yoksa ayni isimde kod varsa onu tekrar kullan, yoksa siradaki kodu ata.
     let cbfCode = normalizeCbfCode(req.body.cbf_code);
     if (!cbfCode) cbfCode = await resolveCbfCodeForName(req.body.name);
+    // fix10e M6: e-posta/telefon benzersizliği (yeni kayıt).
+    if (emailClean && await factoryContactTaken('email', emailClean, null)) return res.status(409).json({ error: 'contact_in_use', message: 'Bu e-posta başka bir fabrikada kullanılıyor.' });
+    if (phoneClean && await factoryContactTaken('phone', phoneClean, null)) return res.status(409).json({ error: 'contact_in_use', message: 'Bu telefon başka bir fabrikada kullanılıyor.' });
     // FAZ 1 — My Factory hesabi (yeni kayit): kullanici adi cakisirsa 409.
     if (myFactoryUsernameClean) {
       if (await myFactoryUsernameTaken(myFactoryUsernameClean, null)) return res.status(409).json({ error: 'myfactory_username_taken', message: 'Bu ChinaBazaar My Factory kullanıcı adı başka bir fabrikada kullanılıyor.' });
@@ -1424,6 +1756,7 @@ router.put('/factory/admin/:id', requireAuth, requireAdmin,
     if (req.body.phone !== undefined) {
       const c = cleanFactoryText(req.body.phone, 200);
       if (c === null) return res.status(400).json({ error: 'invalid_phone' });
+      if (c !== '' && await factoryContactTaken('phone', c, id)) return res.status(409).json({ error: 'contact_in_use', message: 'Bu telefon başka bir fabrikada kullanılıyor.' }); // fix10e M6
       push('phone', c);
     }
     if (req.body.contact !== undefined) {
@@ -1444,6 +1777,7 @@ router.put('/factory/admin/:id', requireAuth, requireAdmin,
     if (req.body.email !== undefined) {
       const c = cleanFactoryEmail(req.body.email);
       if (c === null) return res.status(400).json({ error: 'invalid_email' });
+      if (c !== '' && await factoryContactTaken('email', c, id)) return res.status(409).json({ error: 'contact_in_use', message: 'Bu e-posta başka bir fabrikada kullanılıyor.' }); // fix10e M6
       push('email', c === '' ? null : c);
     }
     if (req.body.socials !== undefined) {
@@ -1617,6 +1951,10 @@ async function ensureFactoryMessagesTable() {
 // fix7: sohbet dosyalari Postgres'te saklanir (Railway diski gecici — her redeploy
 // yuklenen dosyalari siler, bu yuzden resimler bozuluyordu). token = tahmin edilemez URL anahtari.
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_chat_files (id SERIAL PRIMARY KEY, token TEXT NOT NULL UNIQUE, data BYTEA NOT NULL, mime TEXT NOT NULL, name TEXT, size INT, created_at TIMESTAMPTZ DEFAULT now())`);
+  // fix10e M5: sahiplik + süreli URL — yükleyen (kullanıcı id / factory:<id> /
+  // cbai:master) ve son kullanma (yüklemeden 7 gün sonra) saklanır.
+  try { await pool.query(`ALTER TABLE factory_chat_files ADD COLUMN IF NOT EXISTS uploaded_by TEXT`); } catch (e) { /* yoksay */ }
+  try { await pool.query(`ALTER TABLE factory_chat_files ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ`); } catch (e) { /* yoksay */ }
   // v118: user_id tip onarimi (users.id UUID) — mesaj rotalari ensureFactoryTables'i
   // cagirmadigindan bu tablo icin donusum burada da calisir.
   try { await pool.query(`ALTER TABLE factory_messages ALTER COLUMN user_id TYPE TEXT USING user_id::text`); } catch (e) { /* tip zaten TEXT ise yoksay */ }
@@ -1700,6 +2038,10 @@ router.post('/factory/messages', requireAuth, factorySpamLimiter,
     const text = (req.body.body || '').trim();
     const att = cleanChatAttachment(req.body);
     if (!att.ok) return res.status(att.status).json({ error: att.error });
+    // fix10e M5: sohbet dosyası eki başkasına ait olamaz.
+    if (att.attachmentUrl && att.attachmentUrl.startsWith('/api/products/factory/chat-file/')) {
+      if (!(await chatFileOwnedBy(att.attachmentUrl, req.user.id))) return res.status(403).json({ error: 'forbidden' });
+    }
     const { rows } = await pool.query(
       `INSERT INTO factory_messages (user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime) VALUES ($1, $2, 'user', $3, $4, $5, $6, $7) RETURNING id, user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, created_at`,
       [req.user.id, text, att.attachmentUrl, att.kind, att.name, att.size, att.mime]
@@ -1800,6 +2142,30 @@ router.post('/factory/admin/messages/:id/reply', requireAuth, requireAdmin,
   })
 );
 
+// fix10e M5: sohbet dosyası sahiplik doğrulaması — chat-file URL'si bir mesaja
+// eklenirken dosyanın o kullanıcıya ait olduğu doğrulanır. Eski satırlar
+// (uploaded_by NULL) geriye uyum için kabul edilir; başkasının dosyası 403.
+async function chatFileOwnedBy(url, ownerId) {
+  const m = /^\/api\/products\/factory\/chat-file\/(\d+)\/([a-f0-9]{32})$/i.exec(String(url || '').trim());
+  if (!m) return false;
+  const { rows } = await pool.query(`SELECT uploaded_by, expires_at FROM factory_chat_files WHERE id = $1 AND token = $2`, [parseInt(m[1], 10), m[2]]);
+  if (!rows.length) return false;
+  if (rows[0].expires_at && new Date(rows[0].expires_at).getTime() < Date.now()) return false;
+  if (!rows[0].uploaded_by) return true; // kayıt öncesi eski satır: geriye uyum
+  return String(rows[0].uploaded_by) === String(ownerId);
+}
+
+// fix10e M5: chat-upload hız limiti — aktör başına 15 dakikada 30 dosya
+// (kullanıcı id / fabrika id / IP; v8'de req.ip doğrudan kullanılmaz).
+const chatUploadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'too_many_requests' },
+  keyGenerator: (req) => 'chat-upload:' + (req.factoryId != null ? 'factory:' + req.factoryId : req.isMaster ? 'master' : req.user && req.user.id ? 'user:' + String(req.user.id) : ipKeyGenerator(req.ip)),
+});
+
 // POST /api/products/factory/chat-upload — CBAI sohbetine dosya yukle (giris yapmis kullanici)
 // fix10c: ChinaBazaar My Factory fabrika jetonu (role 'factory') de kabul edilir.
 // On yuz FormData ile gonderir (alan: `file`); ham dosya govdesi de kabul edilir.
@@ -1881,6 +2247,7 @@ function rawBodyParser(opts) {
 router.post(
   '/factory/chat-upload',
   requireUserOrFactoryAuth,
+  chatUploadLimiter,
   rawBodyParser({ type: '*/*', limit: '11mb' }),
   asyncHandler(async (req, res) => {
     const ct = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
@@ -1897,6 +2264,14 @@ router.post(
     }
     const mime = file.contentType;
     if (!CHAT_UPLOAD_MIME[mime]) return res.status(400).json({ error: 'unsupported_file_type' });
+    // fix10e M5: mime/boyut çapraz kontrolü — beyan edilen boyut (multipart
+    // Content-Length / gövde uzunluğu) gerçek arabellek uzunluğuyla aynı
+    // olmalı; uyuşmazlık reddedilir. (file.data.length gövdenin kendisidir;
+    // ayrıca Content-Length başlığı varsa onunla da karşılaştırılır.)
+    const declaredLen = parseInt(req.headers['content-length'] || '', 10);
+    if (Number.isInteger(declaredLen) && declaredLen >= 0 && String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase() !== 'multipart/form-data' && declaredLen !== file.data.length) {
+      return res.status(400).json({ error: 'invalid_file' });
+    }
     if (file.data.length > CHAT_UPLOAD_MAX) return res.status(400).json({ error: 'file_too_large' });
     if (!chatUploadMagicOk(file.data, mime)) return res.status(415).json({ error: 'invalid_file' });
     // Uzanti + MIME capraz dogrulama (multipart'ta dosya adi varsa): uzanti MIME ile eslesmeli.
@@ -1908,9 +2283,11 @@ router.post(
     await ensureFactoryMessagesTable();
     const displayName = sanitizeChatFilename(file.filename) || ('dosya.' + CHAT_UPLOAD_MIME[mime]);
     const token = crypto.randomBytes(16).toString('hex');
+    // fix10e M5: sahip + süre (7 gün) kaydedilir.
+    const ownerId = req.factoryId != null ? 'factory:' + req.factoryId : req.isMaster ? 'cbai:master' : (req.user && req.user.id ? String(req.user.id) : null);
     const { rows } = await pool.query(
-      `INSERT INTO factory_chat_files (token, data, mime, name, size) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-      [token, file.data, mime, displayName, file.data.length]
+      `INSERT INTO factory_chat_files (token, data, mime, name, size, uploaded_by, expires_at) VALUES ($1, $2, $3, $4, $5, $6, now() + interval '7 days') RETURNING id`,
+      [token, file.data, mime, displayName, file.data.length, ownerId]
     );
     const base = req.protocol + '://' + req.get('host');
     res.status(201).json({ ok: true, url: base + '/api/products/factory/chat-file/' + rows[0].id + '/' + token, filename: displayName, size: file.data.length, mime });
@@ -1926,9 +2303,16 @@ router.get('/factory/chat-file/:id/:token', asyncHandler(async (req, res) => {
   const id = parseInt(req.params.id, 10);
   const token = String(req.params.token || '');
   if (!Number.isInteger(id) || id <= 0 || !/^[a-f0-9]{32}$/i.test(token)) return res.status(404).json({ error: 'file_not_found' });
-  const { rows } = await pool.query(`SELECT data, mime, name, size FROM factory_chat_files WHERE id = $1 AND token = $2`, [id, token]);
+  const { rows } = await pool.query(`SELECT data, mime, name, size, expires_at FROM factory_chat_files WHERE id = $1 AND token = $2`, [id, token]);
   if (!rows.length) return res.status(404).json({ error: 'file_not_found' });
   const f = rows[0];
+  // fix10e M5: süreli URL — süresi dolmuş dosya 404 + satır temizlenir.
+  if (f.expires_at && new Date(f.expires_at).getTime() < Date.now()) {
+    try { await pool.query(`DELETE FROM factory_chat_files WHERE id = $1`, [id]); } catch (_) { /* yoksay */ }
+    return res.status(404).json({ error: 'file_not_found' });
+  }
+  // fix10e M5: saklanan boyut/gerçek boyut çapraz kontrolü — uyuşmazlıkta 404.
+  if (f.size != null && Buffer.isBuffer(f.data) && f.data.length !== Number(f.size)) return res.status(404).json({ error: 'file_not_found' });
   res.set('Content-Type', f.mime);
   res.set('Cache-Control', 'private, max-age=31536000');
   const safeName = sanitizeChatFilename(f.name) || 'dosya';
@@ -2161,6 +2545,7 @@ router.get('/settings', requireAuth, requireAdmin, asyncHandler(async (req, res)
     }
   });
   settings.has_wa_token = rows.some((r) => r.key === 'wa_token' && r.value);
+  settings.has_wa_app_secret = rows.some((r) => r.key === 'wa_app_secret' && r.value); // fix10e SABAH-4: App Secret yalnizca boolean doner
   ACC_PROGRAMS.forEach((p) => { settings[`has_acc_${p}_password`] = rows.some((r) => r.key === `acc_${p}_password` && r.value); });
   settings.has_ga_api_secret = rows.some((r) => r.key === 'ga_api_secret' && r.value);
   settings.has_sms_netgsm_usercode = rows.some((r) => r.key === 'sms_netgsm_usercode' && r.value);
@@ -2171,7 +2556,7 @@ router.get('/settings', requireAuth, requireAdmin, asyncHandler(async (req, res)
 router.put('/settings', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
   await ensureSettingsTable();
   const incoming = req.body && req.body.settings && typeof req.body.settings === 'object' ? req.body.settings : {};
-  const allowed = [...WA_PUBLIC_KEYS, 'wa_token', ...ACC_PUBLIC_KEYS, ...ACC_SECRET_KEYS, ...GA_PUBLIC_KEYS, ...GA_SECRET_KEYS, ...XML_PUBLIC_KEYS, ...XML_SECRET_KEYS, ...SEC_PUBLIC_KEYS, ...SMS_PUBLIC_KEYS, ...SMS_SECRET_KEYS, ...SOCIAL_PUBLIC_KEYS];
+  const allowed = [...WA_PUBLIC_KEYS, 'wa_token', 'wa_app_secret', ...ACC_PUBLIC_KEYS, ...ACC_SECRET_KEYS, ...GA_PUBLIC_KEYS, ...GA_SECRET_KEYS, ...XML_PUBLIC_KEYS, ...XML_SECRET_KEYS, ...SEC_PUBLIC_KEYS, ...SMS_PUBLIC_KEYS, ...SMS_SECRET_KEYS, ...SOCIAL_PUBLIC_KEYS]; // fix10e SABAH-4: wa_app_secret
   for (const [k, v] of Object.entries(incoming)) {
     if (!allowed.includes(k)) continue;
     if (typeof v !== 'string' && typeof v !== 'boolean') continue;
@@ -2231,6 +2616,9 @@ router.post('/settings/accounting/test', requireAuth, requireAdmin, asyncHandler
   const apiUrl = kv[`acc_${program}_api_url`];
   if (!apiUrl) return res.json({ ok: false, message: 'Eksik bilgi: API Adresi / Sunucu gerekli.' });
   if (!/^https?:\/\//i.test(apiUrl)) return res.json({ ok: false, message: 'API adresi http:// veya https:// ile başlamalı (örn. https://api.ornek.com).' });
+  // fix10e L7: SSRF — ic/ozel ag adresine istek gonderilmez (localhost,
+  // RFC1918, link-local, metadata 169.254.x.x, kimlik bilgili URL dahil).
+  if (!(await assertPublicUrl(apiUrl))) return res.json({ ok: false, message: 'API adresi herkese açık bir adres olmalı (iç ağ / özel IP adreslerine bağlantı engellendi).' });
   if (program === 'nebim') { const nebim = require('../services/nebim'); const t = await nebim.testConnection(); return res.json(t); }
   try {
     const ctrl = new AbortController();

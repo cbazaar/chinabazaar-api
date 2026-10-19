@@ -1,12 +1,19 @@
 // Kimlik doğrulama: kayıt + giriş (JWT)
+// fix10e: H-D admin-reset-password (limit + timing-safe admin_key + jenerik yanıt),
+// H-E CBAI master (sub+jti, 1 gün, denetim kaydı), L1 dummy hash cost 12 +
+// uzunluk erken dönüşü yok, L2 jenerik yanıtlar, L3 'cbai' rezerve,
+// L4 şifre politikası (min 8 + harf+rakam), L18 JWT HS256 allowlist,
+// M6 profil e-posta/telefon benzersizliği, M11 phone-send-code (kayıt +
+// cooldown), SABAH-4 forgot-password-sms jenerik yanıt, M2 ipKeyGenerator.
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const { body, validationResult } = require('express-validator');
 const asyncHandler = require('../middleware/asyncHandler');
 const { checkValidation } = require('../middleware/validate');
-const { loginLimiter, registerLimiter, strictLoginLimiter, loginIdentifierLimiter } = require('../middleware/rateLimit');
-const codeLimiter = require('express-rate-limit')({ windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: { error: 'too_many_requests' } });
-const nicknameCheckLimiter = require('express-rate-limit')({ windowMs: 60 * 1000, max: 60, standardHeaders: true, legacyHeaders: false, message: { error: 'too_many_requests' } });
+const { loginLimiter, registerLimiter, strictLoginLimiter, loginIdentifierLimiter, adminResetLimiter, ipKeyGenerator } = require('../middleware/rateLimit');
+const codeLimiter = require('express-rate-limit')({ windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: { error: 'too_many_requests' }, keyGenerator: (req) => 'code:' + ipKeyGenerator(req.ip) });
+const nicknameCheckLimiter = require('express-rate-limit')({ windowMs: 60 * 1000, max: 60, standardHeaders: true, legacyHeaders: false, message: { error: 'too_many_requests' }, keyGenerator: (req) => 'nick:' + ipKeyGenerator(req.ip) });
+const jwt = require('jsonwebtoken');
 const { signToken, requireAuth, optionalAuth } = require('../middleware/auth');
 const cfg = require('../config');
 const pool = require('../db');
@@ -22,7 +29,36 @@ function publicUser(row) {
 // ---- Giriş: tanıtan (identifier) yardımcıları ----
 // Kullanıcı yoksa bile bcrypt karşılaştırması yapılır (zamanlama ile kullanıcı
 // sayımını zorlaştırmak için); sahte hash başlangıçta bir kez üretilir.
-const DUMMY_HASH = bcrypt.hashSync('__chinabazaar_no_such_user__', 10);
+const DUMMY_HASH = bcrypt.hashSync('__chinabazaar_no_such_user__', 12); // fix10e L1: 10 -> 12
+
+// fix10e L1: uzunluk erken dönüşü YOK — iki değer de SHA-256 ile sabit
+// uzunluklu özetlere indirgenir, timingSafeEqual özetler üzerinde çalışır.
+// (Uzunluk farkı artık zamanlama ile ayırt edilemez.)
+function timingSafeEqualDigest(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const da = crypto.createHash('sha256').update(a).digest();
+  const db = crypto.createHash('sha256').update(b).digest();
+  return crypto.timingSafeEqual(da, db);
+}
+
+// fix10e L4: şifre politikası — en az 8 karakter + en az bir harf + en az bir rakam.
+function passwordStrong(pw) {
+  return typeof pw === 'string' && pw.length >= 8 && /[A-Za-z]/.test(pw) && /[0-9]/.test(pw);
+}
+
+// fix10e L3: 'cbai' rezerve — kullanıcı adı / nickname olarak alınamaz.
+function isCbaiNick(nick) {
+  return String(nick || '').trim().toLowerCase() === 'cbai';
+}
+
+// fix10e H-E: master işlem denetim kaydı — created_by ASLA null değil,
+// master işaretli 'cbai' yazılır. Tablo yoksa oluşturulur; hata akışı bozmaz.
+async function logMasterAudit(action, targetType, targetId) {
+  try {
+    await pool.query(`CREATE TABLE IF NOT EXISTS master_audit_log (id SERIAL PRIMARY KEY, action TEXT NOT NULL, target_type TEXT, target_id TEXT, created_by TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now())`);
+    await pool.query(`INSERT INTO master_audit_log (action, target_type, target_id, created_by) VALUES ($1, $2, $3, 'cbai')`, [action, targetType || null, targetId == null ? null : String(targetId)]);
+  } catch (e) { /* denetim kaydı ana akışı bozmaz */ }
+}
 // Telefon varyantları: kayıtlı numara hangi formatta yazılmış olursa olsun
 // eşleşsin diye boşluk/tire/parantez atılır; +90 ↔ 0 ↔ çıplak alan kodu
 // dönüşümleri denenir. Şifre ASLA loglanmaz, tanıtan şifreyle birlikte loglanmaz.
@@ -36,11 +72,32 @@ function phoneCandidates(identifier) {
   return [...out];
 }
 
+// ---- CBAI master (fix10d + fix10e H-E/L2) ----
+// Master şifresi YALNIZCA Railway env'den okunur (CBAI_MASTER_PASSWORD).
+// Şifre ASLA kodda/DB'de/test dosyasında/sohbette olmaz, ASLA loglanmaz.
+// fix10e H-E: jeton sub='cbai' + jti taşır, süre 7 gün -> 1 gün.
+function cbaiMasterConfigured() {
+  return !!(process.env.CBAI_MASTER_PASSWORD || '');
+}
+function cbaiMasterPasswordOk(password) {
+  const expected = process.env.CBAI_MASTER_PASSWORD || '';
+  if (!expected || typeof password !== 'string' || !password) return false;
+  return timingSafeEqualDigest(password, expected);
+}
+function signMasterToken() {
+  return jwt.sign({ sub: 'cbai', role: 'master', is_admin: true, jti: crypto.randomUUID() }, cfg.jwtSecret, { expiresIn: '1d', algorithm: 'HS256' });
+}
+// Admin kullanıcı şekli (panel login + /me): kullanıcı satırı YOK, is_admin:true.
+function masterPublicUser() {
+  return { id: 'cbai', email: 'cbai', name: 'CBAI', nickname: 'cbai', phone: null, is_admin: true, customer_code: null, master: true };
+}
+
 // ---- Kullanici adi korumasi ----
 // v563: Sabit rezerve liste KALDIRILDI — hicbir kullanici adi koddan rezerve degil.
 // Engel yalniz adminin Kullanici Adlari bolumunde ekledigi block kurallariyla olur.
 function normalizeNick(n){ return String(n||'').toLowerCase().replace(/[_.\s-]+/g,''); }
 async function isReserved(nick){
+  if (isCbaiNick(nick)) return true; // fix10e L3: 'cbai' rezerve
   const n = normalizeNick(nick);
   if(!n) return false;
   try{
@@ -79,7 +136,7 @@ router.post(
   '/register',
   registerLimiter,
   body('email').isEmail().normalizeEmail(),
-  body('password').isLength({ min: 8 }),
+  body('password').isLength({ min: 8 }).custom((v) => passwordStrong(v)), // fix10e L4
   body('name').trim().isLength({ min: 2, max: 100 }),
   body('phone').optional().matches(/^\+?[0-9][0-9\s\-().]{6,19}$/),
   body('admin_key').optional().isString().isLength({ max: 128 }),
@@ -88,8 +145,18 @@ router.post(
     if (!checkValidation(req, res)) return;
     const { email, password, name, phone, admin_key } = req.body;
     const source = req.body.source === 'myfactory' ? 'myfactory' : 'shop';
-    const makeAdmin = Boolean(cfg.adminSetupKey && admin_key && admin_key === cfg.adminSetupKey);
+    // fix10e H-D: admin_key kıyaslaması timing-safe (uzunluk erken dönüşü yok).
+    const makeAdmin = Boolean(cfg.adminSetupKey && admin_key && timingSafeEqualDigest(admin_key, cfg.adminSetupKey));
     const hash = await bcrypt.hash(password, 12);
+    // fix10e M6: telefon benzersizliği (normalizasyonlu; kendi dışı kontrol).
+    // Çakışma da jenerik 409 döner — hangi alanın çakıştığı söylenmez (L2).
+    if (phone) {
+      const taken = await pool.query(
+        `SELECT id FROM users WHERE REGEXP_REPLACE(COALESCE(phone, ''), '[\\s\\-().]', '', 'g') = ANY($1) LIMIT 1`,
+        [phoneCandidates(phone)]
+      );
+      if (taken.rows.length) return res.status(409).json({ error: 'conflict' });
+    }
     try {
       await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'shop'`);
       const { rows } = await pool.query(
@@ -100,7 +167,7 @@ router.post(
       const user = publicUser(rows[0]);
       res.status(201).json({ user, token: signToken(user) });
     } catch (err) {
-      if (err.code === '23505') return res.status(409).json({ error: 'email_in_use' });
+      if (err.code === '23505') return res.status(409).json({ error: 'conflict' }); // fix10e L2: jenerik (e-posta sayımı yok)
       throw err;
     }
   })
@@ -170,6 +237,17 @@ router.post(
     if (!validationResult(req).isEmpty() || !identifier || typeof password !== 'string' || !password) {
       return res.status(401).json(GENERIC);
     }
+    // fix10d — CBAI master (rezerve): identifier "cbai" ise DB'ye bakılmaz.
+    // fix10e L2: env ayarlı değilse de jenerik 401 (master_not_configured yok —
+    // ayar durumu sayım bilgisi sızdırmaz).
+    if (identifier.toLowerCase() === 'cbai') {
+      if (!cbaiMasterConfigured() || !cbaiMasterPasswordOk(password)) {
+        await bcrypt.compare(password, DUMMY_HASH);
+        return res.status(401).json(GENERIC);
+      }
+      await logMasterAudit('master_login', 'auth', null);
+      return res.json({ user: masterPublicUser(), token: signMasterToken(), master: true });
+    }
     const candidates = phoneCandidates(identifier);
     const { rows } = await pool.query(
       `SELECT * FROM users
@@ -191,21 +269,24 @@ router.post(
 );
 
 // POST /api/auth/admin-reset-password { email, admin_key, new_password } — kurulum anahtarıyla şifre sıfırla
+// fix10e H-D: hız limiti + admin_key timing-safe kıyaslama + kullanıcı yoksa
+// jenerik yanıt (404 sayım yok). fix10e L4: yeni şifre min 8 + harf+rakam.
 router.post(
   '/admin-reset-password',
+  adminResetLimiter,
   body('email').isEmail().normalizeEmail(),
   body('admin_key').notEmpty(),
-  body('new_password').isLength({ min: 6 }),
+  body('new_password').isLength({ min: 8 }).custom((v) => passwordStrong(v)),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     const { email, admin_key, new_password } = req.body;
-    if (!cfg.adminSetupKey || admin_key !== cfg.adminSetupKey) {
+    if (!cfg.adminSetupKey || !timingSafeEqualDigest(admin_key, cfg.adminSetupKey)) {
       return res.status(403).json({ error: 'invalid_setup_key' });
     }
     const { rows } = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     const row = rows[0];
-    if (!row) return res.status(404).json({ error: 'user_not_found' });
-    const hash = await bcrypt.hash(new_password, 10);
+    if (!row) return res.json({ ok: true }); // fix10e L2: jenerik (kullanıcı yokluğu söylenmez)
+    const hash = await bcrypt.hash(new_password, 12);
     await pool.query('UPDATE users SET password_hash = $1 WHERE email = $2', [hash, email]);
     const user = publicUser(row);
     res.json({ user, token: signToken(user) });
@@ -255,7 +336,7 @@ router.post(
   codeLimiter,
   body('email').isEmail().normalizeEmail(),
   body('code').matches(/^[0-9]{6}$/),
-  body('password').isLength({ min: 8 }),
+  body('password').isLength({ min: 8 }).custom((v) => passwordStrong(v)), // fix10e L4
   body('name').optional().trim().isLength({ min: 2, max: 100 }),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
@@ -284,7 +365,29 @@ router.post(
       const user = publicUser(row);
       return res.json({ user, token: signToken(user) });
     }
-    // POST /api/auth/login-with-code { email, code } — şifresiz e-posta koduyla giriş
+
+
+// Yeni kayıt
+    if (!name) return res.status(400).json({ error: 'name_required' });
+    const hash = await bcrypt.hash(password, 12);
+    try {
+      const { rows: nrows } = await pool.query(
+        `INSERT INTO users (email, password_hash, name, email_verified) VALUES ($1, $2, $3, TRUE)
+         RETURNING id, email, name, phone, is_admin`,
+        [email, hash, name]
+      );
+      const user = publicUser(nrows[0]);
+      res.status(201).json({ user, token: signToken(user) });
+    } catch (err) {
+      if (err.code === '23505') return res.status(409).json({ error: 'conflict' }); // fix10e L2: jenerik
+      throw err;
+    }
+  })
+);
+
+// fix10e: login-with-code rotasi canlida verify-code handler'inin ICINE gomuluydu —
+// hicbir zaman kayitli degildi (POST 404 donuyordu). Ust duzeye tasindi; davranis aynen.
+// POST /api/auth/login-with-code { email, code } — şifresiz e-posta koduyla giriş
 router.post(
   '/login-with-code',
   codeLimiter,
@@ -306,7 +409,7 @@ router.post(
     if (!ok) return res.status(400).json({ error: 'code_invalid' });
     await pool.query('UPDATE email_codes SET consumed_at = now() WHERE id = $1', [rec.id]);
     const { rows: urows } = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
-    if (!urows[0]) return res.status(404).json({ error: 'user_not_found' });
+    if (!urows[0]) return res.status(401).json({ error: 'invalid_credentials' }); // fix10e L2: jenerik (kullanıcı yokluğu söylenmez)
     const row = urows[0];
     if (row.is_blocked) return res.status(403).json({ error: 'user_blocked' });
     await pool.query('UPDATE users SET email_verified = TRUE WHERE id = $1', [row.id]);
@@ -315,29 +418,16 @@ router.post(
   })
 );
 
-// Yeni kayıt
-    if (!name) return res.status(400).json({ error: 'name_required' });
-    const hash = await bcrypt.hash(password, 12);
-    try {
-      const { rows: nrows } = await pool.query(
-        `INSERT INTO users (email, password_hash, name, email_verified) VALUES ($1, $2, $3, TRUE)
-         RETURNING id, email, name, phone, is_admin`,
-        [email, hash, name]
-      );
-      const user = publicUser(nrows[0]);
-      res.status(201).json({ user, token: signToken(user) });
-    } catch (err) {
-      if (err.code === '23505') return res.status(409).json({ error: 'email_in_use' });
-      throw err;
-    }
-  })
-);
-
 // GET /api/auth/me — giriş yapan kullanıcının profili (is_admin dahil)
 router.get(
   '/me',
   requireAuth,
   asyncHandler(async (req, res) => {
+    // fix10d — CBAI master: token'da kullanıcı satırı (sub) yok; panel boot()
+    // /me'yi is_admin ile kontrol ettiği için master jetonuna admin şekli döner.
+    if (req.user && req.user.role === 'master' && req.user.is_admin) return res.json(masterPublicUser());
+    // fix10e M4: fabrika jetonu kullanıcı profili değildir — 403 (çökme yok).
+    if (!req.user || !req.user.id) return res.status(403).json({ error: 'forbidden' });
     const { rows } = await pool.query(
       'SELECT id, email, name, nickname, phone, is_admin, customer_code FROM users WHERE id = $1',
       [req.user.id]
@@ -355,15 +445,17 @@ router.get(
   optionalAuth,
   asyncHandler(async (req, res) => {
     const nick = String(req.query.nickname || '').trim();
+    // fix10e L2: yalnızca { available } — neden/öneri yok (kullanıcı sayımı
+    // için kullanılabilecek ayrıntı sızdırılmaz; 'cbai' rezerve).
     if(!nick || nick.length < 2 || nick.length > 30 || !/^[\p{L}\p{N}_.-]+$/u.test(nick)){
-      return res.json({ available: false, reason: 'invalid' });
+      return res.json({ available: false });
     }
-    if(await isReserved(nick)) return res.json({ available: false, reason: 'reserved', suggestions: await nicknameSuggestions(nick) });
+    if(await isReserved(nick)) return res.json({ available: false });
     const { rows } = await pool.query('SELECT id, nickname FROM users WHERE LOWER(nickname) = LOWER($1)', [nick]);
     if(!rows.length) return res.json({ available: true });
     // Kendi adiysa musait say (gecerli token varsa optionalAuth req.user doldurur)
-    if(req.user && String(req.user.id) === String(rows[0].id)) return res.json({ available: true, mine: true });
-    return res.json({ available: false, reason: 'taken', suggestions: await nicknameSuggestions(nick) });
+    if(req.user && String(req.user.id) === String(rows[0].id)) return res.json({ available: true });
+    return res.json({ available: false });
   })
 );
 
@@ -373,26 +465,49 @@ router.patch(
   requireAuth,
   body('nickname').optional().trim().isLength({ min: 2, max: 30 }).matches(/^[\p{L}\p{N}_.-]+$/u),
   body('name').optional().trim().isLength({ min: 2, max: 100 }),
+  body('email').optional().isEmail().normalizeEmail(),
+  body('phone').optional().matches(/^\+?[0-9][0-9\s\-().]{6,19}$/),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
+    // fix10e M4: master/fabrika jetonuyla profil güncellenemez — 403 (çökme yok).
+    if (!req.user || !req.user.id || req.user.role === 'factory' || req.user.role === 'master') {
+      return res.status(403).json({ error: 'forbidden' });
+    }
     const nick = (req.body.nickname || '').trim();
     const name = (req.body.name || '').trim();
-    if (!nick && !name) return res.status(400).json({ error: 'nothing_to_update' });
-    if (nick && await isReserved(nick)) return res.status(400).json({ error: 'nickname_reserved' });
+    const email = (req.body.email || '').trim();
+    const phone = (req.body.phone || '').trim();
+    if (!nick && !name && !email && !phone) return res.status(400).json({ error: 'nothing_to_update' });
+    if (nick && await isReserved(nick)) return res.status(400).json({ error: 'nickname_reserved' }); // L3: 'cbai' isReserved içinde
+    // fix10e M6: e-posta/telefon benzersizliği (kendi dışı). Çakışma jenerik 409.
+    if (email) {
+      const { rows: ex } = await pool.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1) AND id <> $2 LIMIT 1', [email, req.user.id]);
+      if (ex.length) return res.status(409).json({ error: 'conflict' });
+    }
+    if (phone) {
+      const { rows: ex } = await pool.query(
+        `SELECT id FROM users WHERE REGEXP_REPLACE(COALESCE(phone, ''), '[\\s\\-().]', '', 'g') = ANY($1) AND id <> $2 LIMIT 1`,
+        [phoneCandidates(phone), req.user.id]
+      );
+      if (ex.length) return res.status(409).json({ error: 'conflict' });
+    }
     try {
       const sets = ['updated_at = now()'];
       const vals = [];
       let i = 1;
       if (nick) { sets.push('nickname = $' + (i++)); vals.push(nick); }
       if (name) { sets.push('name = $' + (i++)); vals.push(name); }
+      if (email) { sets.push('email = $' + (i++)); vals.push(email); }
+      if (phone) { sets.push('phone = $' + (i++)); vals.push(phone); }
       vals.push(req.user.id);
       const { rows } = await pool.query(
         'UPDATE users SET ' + sets.join(', ') + ' WHERE id = $' + i + ' RETURNING id, email, name, nickname, phone, is_admin',
         vals
       );
+      if (!rows.length) return res.status(404).json({ error: 'user_not_found' });
       res.json(publicUser(rows[0]));
     } catch (err) {
-      if (err.code === '23505') return res.status(409).json({ error: 'nickname_in_use' });
+      if (err.code === '23505') return res.status(409).json({ error: 'conflict' }); // fix10e L2: jenerik
       throw err;
     }
   })
@@ -409,9 +524,23 @@ router.post(
     if (!checkValidation(req, res)) return;
     let phone = String(req.body.phone || '').replace(/[\s\-().]/g, '');
     if (!phone.startsWith('+')) phone = '+' + phone;
-    const code = String(Math.floor(100000 + Math.random() * 900000));
-    const codeHash = await bcrypt.hash(code, 10);
     await pool.query(`CREATE TABLE IF NOT EXISTS phone_codes (id SERIAL PRIMARY KEY, phone TEXT NOT NULL, code_hash TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, attempts INT DEFAULT 0, consumed_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT now())`);
+    // fix10e M11: kayıt kontrolü — numara kayıtlı değilse SMS gönderilmez,
+    // yanıt jenerik { ok: true } (kayıt sayımı yok).
+    const { rows: ureg } = await pool.query(
+      `SELECT id FROM users WHERE REGEXP_REPLACE(COALESCE(phone, ''), '[\\s\\-().]', '', 'g') = ANY($1) LIMIT 1`,
+      [phoneCandidates(phone)]
+    );
+    if (!ureg.length) return res.json({ ok: true });
+    // fix10e M11: numara başına cooldown — 60 sn içinde tüketilmemiş kod
+    // varsa yeniden gönderilmez (SMS bombardımanı yok), yanıt yine { ok: true }.
+    const { rows: last } = await pool.query(
+      `SELECT created_at FROM phone_codes WHERE phone = $1 AND consumed_at IS NULL ORDER BY created_at DESC LIMIT 1`,
+      [phone]
+    );
+    if (last.length && (Date.now() - new Date(last[0].created_at).getTime()) < 60 * 1000) return res.json({ ok: true });
+    const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+    const codeHash = await bcrypt.hash(code, 10);
     await pool.query('UPDATE phone_codes SET consumed_at = now() WHERE phone = $1 AND consumed_at IS NULL', [phone]);
     await pool.query('INSERT INTO phone_codes (phone, code_hash, expires_at) VALUES ($1, $2, now() + interval \'5 minutes\')', [phone, codeHash]);
     const sms = require('../services/sms');
@@ -430,14 +559,24 @@ router.post(
     if (!checkValidation(req, res)) return;
     let phone = String(req.body.phone || '').replace(/[\s\-().]/g, '');
     if (!phone.startsWith('+')) phone = '+' + phone;
-    const { rows } = await pool.query('SELECT id FROM users WHERE phone = $1', [phone]);
-    if (!rows.length) return res.status(404).json({ error: 'phone_not_found' });
+    await pool.query(`CREATE TABLE IF NOT EXISTS phone_codes (id SERIAL PRIMARY KEY, phone TEXT NOT NULL, code_hash TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, attempts INT DEFAULT 0, consumed_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT now())`);
+    // fix10e SABAH-4 + M11: kayıtlı olmayan telefonda da jenerik { ok: true },
+    // SMS gönderilmez. Kayıtlı numarada 60 sn cooldown (yeniden gönderim yok).
+    const { rows } = await pool.query(
+      `SELECT id FROM users WHERE REGEXP_REPLACE(COALESCE(phone, ''), '[\\s\\-().]', '', 'g') = ANY($1) LIMIT 1`,
+      [phoneCandidates(phone)]
+    );
+    if (!rows.length) return res.json({ ok: true });
+    const { rows: last } = await pool.query(
+      `SELECT created_at FROM phone_codes WHERE phone = $1 AND consumed_at IS NULL ORDER BY created_at DESC LIMIT 1`,
+      [phone]
+    );
+    if (last.length && (Date.now() - new Date(last[0].created_at).getTime()) < 60 * 1000) return res.json({ ok: true });
     const sms = require('../services/sms');
     const cfg = await sms.getSmsSettings();
     if (cfg.notify.forgot === false) return res.status(503).json({ error: 'sms_disabled' });
-    const code = String(Math.floor(100000 + Math.random() * 900000));
+    const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
     const codeHash = await bcrypt.hash(code, 10);
-    await pool.query(`CREATE TABLE IF NOT EXISTS phone_codes (id SERIAL PRIMARY KEY, phone TEXT NOT NULL, code_hash TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, attempts INT DEFAULT 0, consumed_at TIMESTAMPTZ, created_at TIMESTAMPTZ DEFAULT now())`);
     await pool.query('UPDATE phone_codes SET consumed_at = now() WHERE phone = $1 AND consumed_at IS NULL', [phone]);
     await pool.query('INSERT INTO phone_codes (phone, code_hash, expires_at) VALUES ($1, $2, now() + interval \'5 minutes\')', [phone, codeHash]);
     const sent = await sms.sendSms(phone, 'ChinaBazaar sifre sifirlama kodunuz: ' + code + ' (5 dakika gecerli)');
@@ -452,7 +591,7 @@ router.post(
   loginLimiter,
   body('phone').matches(/^\+?[0-9][0-9\s\-().]{6,19}$/),
   body('code').isLength({ min: 4, max: 10 }),
-  body('new_password').isString().isLength({ min: 6, max: 100 }),
+  body('new_password').isString().isLength({ min: 8, max: 100 }).custom((v) => passwordStrong(v)), // fix10e L4
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     let { phone, code, new_password } = req.body;
@@ -474,7 +613,7 @@ router.post(
     await pool.query('UPDATE phone_codes SET consumed_at = now() WHERE id = $1', [rec.id]);
     const hash = await bcrypt.hash(String(new_password), 12);
     const { rows } = await pool.query('UPDATE users SET password_hash = $2 WHERE phone = $1 RETURNING id', [phone, hash]);
-    if (!rows.length) return res.status(404).json({ error: 'phone_not_found' });
+    if (!rows.length) return res.json({ ok: true }); // fix10e L2: jenerik (kullanıcı yokluğu söylenmez)
     res.json({ ok: true });
   })
 );

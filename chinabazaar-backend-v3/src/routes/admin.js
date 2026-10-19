@@ -1,5 +1,9 @@
 // fix10c — Admin yönetim API'leri [fabrika giris adi My Factory; Stream uclari aynen]: kullanıcılar + yorum moderasyonu.
 // Tüm route'lar requireAuth + requireAdmin gerektirir (fix10c: POST /stream-upload-url + POST /stream-download-url, ChinaBazaar My Factory fabrika jetonunu da kabul eder).
+// fix10e: H-C stream-upload-url (uid->fabrika kaydı + download-url sahiplik +
+// Cloudflare asset doğrulaması + rota hız limiti), L5 download sahiplik,
+// H-E CBAI master (sub+jti, 1 gün, denetim kaydı), L18 JWT HS256 allowlist,
+// M2 ipKeyGenerator.
 const express = require('express');
 const { param, body } = require('express-validator');
 const asyncHandler = require('../middleware/asyncHandler');
@@ -7,7 +11,35 @@ const { checkValidation } = require('../middleware/validate');
 const { requireAuth } = require('../middleware/auth');
 const { requireAdmin } = require('../middleware/admin');
 const jwt = require('jsonwebtoken');
+const rateLimit = require('express-rate-limit');
+const { ipKeyGenerator } = require('express-rate-limit');
 const appCfg = require('../config');
+
+// fix10e H-C: Stream uçları için rota hız limiti (IP + aktör bazlı; v8'de
+// req.ip doğrudan kullanılmaz — ipKeyGenerator zorunlu, M2).
+const streamLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'too_many_requests' },
+  keyGenerator: (req) => 'stream:' + (req.factoryId != null ? 'factory:' + req.factoryId : req.user && req.user.id ? 'user:' + String(req.user.id) : ipKeyGenerator(req.ip)),
+});
+
+// fix10e H-E: master işlem denetim kaydı — created_by ASLA null değil,
+// master işaretli 'cbai' yazılır. Hata ana akışı bozmaz.
+async function logMasterAudit(action, targetType, targetId) {
+  try {
+    await pool.query(`CREATE TABLE IF NOT EXISTS master_audit_log (id SERIAL PRIMARY KEY, action TEXT NOT NULL, target_type TEXT, target_id TEXT, created_by TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT now())`);
+    await pool.query(`INSERT INTO master_audit_log (action, target_type, target_id, created_by) VALUES ($1, $2, $3, 'cbai')`, [action, targetType || null, targetId == null ? null : String(targetId)]);
+  } catch (e) { /* denetim kaydı ana akışı bozmaz */ }
+}
+
+// fix10e H-C: Stream uid -> sahip kaydı tablosu (upload-url'da yazılır,
+// download-url'da sahiplik kontrolünde okunur).
+async function ensureStreamUploadsTable() {
+  await pool.query(`CREATE TABLE IF NOT EXISTS stream_uploads (uid TEXT PRIMARY KEY, factory_id INT, created_by TEXT, created_at TIMESTAMPTZ DEFAULT now())`);
+}
 const pool = require('../db');
 const fs = require('fs');
 const path = require('path');
@@ -25,12 +57,22 @@ function requireAdminOrFactory(req, res, next) {
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'unauthorized' });
   let payload;
-  try { payload = jwt.verify(token, appCfg.jwtSecret); } catch { return res.status(401).json({ error: 'invalid_token' }); }
+  try { payload = jwt.verify(token, appCfg.jwtSecret, { algorithms: appCfg.jwtAlgorithms }); } catch { return res.status(401).json({ error: 'invalid_token' }); }
+  // fix10e H-E: CBAI master jetonu (role 'master' + is_admin true) TÜM rotalarda
+  // geçer — master = tam yetki. Master'ın kullanıcı satırı yok; yetki
+  // req.isMaster'dadır (req.user yalnızca aşağı akışın req.user.id okuyan
+  // yerlerini kırmaması için boş tutulur).
+  if (payload && payload.role === 'master' && payload.is_admin === true) {
+    req.isMaster = true;
+    req.isAdmin = true;
+    req.user = { id: null, email: null, is_admin: true, role: 'master' };
+    return next();
+  }
   if (payload && payload.role === 'factory' && Number.isInteger(payload.factory_id)) {
     if (req.method === 'POST' && (req.path === '/stream-upload-url' || req.path === '/stream-download-url')) { req.factoryId = payload.factory_id; return next(); }
     return res.status(403).json({ error: 'forbidden' });
   }
-  if (payload && payload.sub) { req.user = { id: payload.sub, email: payload.email }; return requireAdmin(req, res, next); }
+  if (payload && payload.sub) { req.user = { id: payload.sub, email: payload.email, role: payload.role || 'user' }; return requireAdmin(req, res, next); }
   return res.status(401).json({ error: 'unauthorized' });
 }
 router.use(requireAdminOrFactory);
@@ -695,6 +737,7 @@ async function cfStreamCall(accountId, token, path, method, body) {
 // Admin yolunda govde zorunlu degildir (mevcut davranis aynen: '{}' gecer).
 router.post(
   '/stream-upload-url',
+  streamLimiter,
   asyncHandler(async (req, res) => {
     if (req.factoryId !== undefined) {
       const b = req.body || {};
@@ -724,6 +767,16 @@ router.post(
       console.error('stream-upload-url upstream status:', out.status, JSON.stringify((out.data && out.data.errors) || null));
       return res.status(502).json({ error: 'stream_upstream' });
     }
+    // fix10e H-C: uid -> sahip kaydı (download-url sahiplik kontrolü için).
+    // Fabrika: factory_id; admin: NULL + created_by kullanıcı id; master: 'cbai'.
+    try {
+      await ensureStreamUploadsTable();
+      await pool.query(
+        `INSERT INTO stream_uploads (uid, factory_id, created_by) VALUES ($1, $2, $3) ON CONFLICT (uid) DO NOTHING`,
+        [out.data.result.uid, req.factoryId !== undefined ? req.factoryId : null, req.isMaster ? 'cbai' : (req.user && req.user.id ? String(req.user.id) : null)]
+      );
+    } catch (e) { /* kayıt hatası upload-url akışını bozmaz; download tarafı fabrika videosu ile doğrular */ }
+    if (req.isMaster) await logMasterAudit('stream_upload_url', 'stream', out.data.result.uid);
     res.json({ uploadURL: out.data.result.uploadURL, uid: out.data.result.uid });
   })
 );
@@ -731,11 +784,51 @@ router.post(
 // POST /api/admin/stream-download-url {uid} — MP4 indirme adresi: {url, status} (fix10c: My Factory fabrika jetonu da kabul edilir)
 router.post(
   '/stream-download-url',
+  streamLimiter,
   asyncHandler(async (req, res) => {
     const uid = String((req.body && req.body.uid) || '').trim();
-    if (!uid) return res.status(400).json({ error: 'invalid_uid' });
+    if (!uid || !/^[a-f0-9]{32}$/i.test(uid)) return res.status(400).json({ error: 'invalid_uid' });
     const cfg = cfStreamCfg();
     if (!cfg) return res.status(503).json({ error: 'stream_not_configured' });
+    // fix10e H-C/L5: sahiplik kontrolü — fabrika jetonu yalnız KENDİ uid'ini
+    // indirebilir. Önce uid->fabrika kaydı; kayıt yoksa (kayıt öncesi eski
+    // uid) fabrikanın videos listesinde uid geçiyor mu diye bakılır; ikisi
+    // de tutmazsa 403. Admin/master tüm uid'lere erişir (denetim kayıtlı).
+    if (req.factoryId !== undefined) {
+      let owned = false;
+      try {
+        await ensureStreamUploadsTable();
+        const { rows } = await pool.query('SELECT factory_id FROM stream_uploads WHERE uid = $1', [uid]);
+        if (rows.length && rows[0].factory_id === req.factoryId) owned = true;
+        else if (!rows.length) {
+          const { rows: fr } = await pool.query('SELECT videos FROM factories WHERE id = $1', [req.factoryId]);
+          let vids = fr[0] ? fr[0].videos : null;
+          if (typeof vids === 'string') { try { vids = JSON.parse(vids); } catch (_) { vids = null; } }
+          if (Array.isArray(vids)) {
+            for (const v of vids) {
+              const url = v && typeof v.url === 'string' ? v.url : '';
+              if (url.includes(uid)) { owned = true; break; }
+            }
+          }
+        }
+      } catch (e) { /* sahiplik doğrulanamadı -> reddet */ }
+      if (!owned) return res.status(403).json({ error: 'forbidden' });
+    }
+    if (req.isMaster) await logMasterAudit('stream_download_url', 'stream', uid);
+    // fix10e H-C: Cloudflare asset doğrulaması — beyan edilen uid'in
+    // hesapta GERÇEKTEN var olduğu doğrulanır; yoksa 404 (uysal uid ile
+    // başkasının varlığı yoklanamaz, indirme URL'si üretilmez).
+    let asset;
+    try {
+      asset = await cfStreamCall(cfg.accountId, cfg.token, '/' + encodeURIComponent(uid), 'GET', undefined);
+    } catch (e) {
+      console.error('stream-download-url asset check error:', e.message);
+      return res.status(502).json({ error: 'stream_upstream' });
+    }
+    if (!asset.ok || !asset.data || !asset.data.result) {
+      if (asset.status === 404) return res.status(404).json({ error: 'asset_not_found' });
+      return res.status(502).json({ error: 'stream_upstream' });
+    }
     let out;
     try {
       out = await cfStreamCall(cfg.accountId, cfg.token, '/' + encodeURIComponent(uid) + '/downloads', 'POST', undefined);

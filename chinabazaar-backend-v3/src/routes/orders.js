@@ -1,3 +1,5 @@
+// fix10e (2026-10-19) — güvenlik düzeltmeleri: M9 stok, M10 TCKN şifreleme+maske,
+// M15 catch ReferenceError, M16 kalem max 50 + oluşturma limiti, L17 TCKN/VKN checksum + order_no.
 // Siparişler — stok kontrollü, transaction içinde oluşturulur
 const express = require('express');
 const { body, param } = require('express-validator');
@@ -8,6 +10,109 @@ const { requireAdmin } = require('../middleware/admin');
 const { STAGES, TERMINAL } = require('../orderStages');
 const cfg = require('../config');
 const pool = require('../db');
+
+// ---- fix10e: TCKN/VKN checksum + at-rest şifreleme + yanıtlarda maskeleme ----
+const crypto = require('crypto');
+const rateLimit = require('express-rate-limit');
+const { ipKeyGenerator } = require('express-rate-limit'); // fix10e: v8 keyGenerator IP doğrulaması (ERR_ERL_KEY_GEN_IPV6) için gerekli
+
+// TCKN algoritması (Nüfus): 11 hane; 1. hane 0 olamaz;
+// 10. hane = ((tek konumlar toplamı * 7) - çift konumlar toplamı) mod 10;
+// 11. hane = ilk 10 hanenin toplamı mod 10.
+function isValidTckn(v) {
+  const s = String(v || '');
+  if (!/^[1-9][0-9]{10}$/.test(s)) return false;
+  const d = s.split('').map(Number);
+  const odd = d[0] + d[2] + d[4] + d[6] + d[8];
+  const even = d[1] + d[3] + d[5] + d[7];
+  if ((((odd * 7 - even) % 10) + 10) % 10 !== d[9]) return false;
+  if (d.slice(0, 10).reduce((a, b) => a + b, 0) % 10 !== d[10]) return false;
+  return true;
+}
+
+// VKN algoritması (GİB): 10 hane; i=1..9 için tmp = (d_i + (10 - i)) mod 10
+// (0 ise 10); tmp = (tmp * 2^(10-i)) mod 9 (0 ise 9); toplam mod 10'un
+// 10'a tümleyeni 10. haneye eşit olmalı.
+function isValidVkn(v) {
+  const s = String(v || '');
+  if (!/^[0-9]{10}$/.test(s)) return false;
+  const d = s.split('').map(Number);
+  let total = 0;
+  for (let i = 0; i < 9; i++) {
+    let tmp = (d[i] + (10 - (i + 1))) % 10;
+    if (tmp === 0) tmp = 10;
+    tmp = (tmp * Math.pow(2, 10 - (i + 1))) % 9;
+    if (tmp === 0) tmp = 9;
+    total += tmp;
+  }
+  return ((10 - (total % 10)) % 10) === d[9];
+}
+
+// At-rest şifreleme: AES-256-GCM, anahtar TCKN_ENCRYPTION_KEY (64 hex = 32 bayt).
+// Anahtar tanımsızsa eski (şifresiz) davranış korunur ama bir kez uyarı
+// loglanır — dağıtımda anahtar Railway Variables'a tanımlanmalıdır.
+// Eski şifresiz satırlar okunurken de maskeleme aynen uygulanır.
+function getTcknKey() {
+  const hex = String(process.env.TCKN_ENCRYPTION_KEY || '').trim();
+  if (!/^[0-9a-fA-F]{64}$/.test(hex)) return null;
+  return Buffer.from(hex, 'hex');
+}
+let warnedTcknKey = false;
+function encryptSensitive(plain) {
+  const key = getTcknKey();
+  if (!key) {
+    if (!warnedTcknKey) {
+      warnedTcknKey = true;
+      console.warn('[fix10e] TCKN_ENCRYPTION_KEY yok — TCKN/VKN şifrelenmeden saklanıyor (yalnız geçiş modu; anahtar tanımlanmalı).');
+    }
+    return String(plain);
+  }
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const ct = Buffer.concat([cipher.update(String(plain), 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return 'enc:v1:' + iv.toString('base64') + ':' + tag.toString('base64') + ':' + ct.toString('base64');
+}
+function decryptSensitive(stored) {
+  try {
+    const s = String(stored || '');
+    if (!s.startsWith('enc:v1:')) return s; // eski şifresiz satır
+    const key = getTcknKey();
+    if (!key) return null;
+    const parts = s.split(':');
+    if (parts.length !== 5) return null;
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, Buffer.from(parts[2], 'base64'));
+    decipher.setAuthTag(Buffer.from(parts[3], 'base64'));
+    return Buffer.concat([decipher.update(Buffer.from(parts[4], 'base64')), decipher.final()]).toString('utf8');
+  } catch {
+    return null;
+  }
+}
+function maskTail(value, visible, totalLen) {
+  if (value == null) return null;
+  if (value === '') return '';
+  const plain = decryptSensitive(value);
+  if (plain == null || plain === '') return '*'.repeat(totalLen);
+  const tail = String(plain).slice(-visible);
+  return '*'.repeat(Math.max(totalLen - tail.length, 0)) + tail;
+}
+function maskTckn(stored) { return maskTail(stored, 2, 11); }
+function maskVkn(stored) { return maskTail(stored, 2, 10); }
+// Sipariş satırı yanıta çıkmadan önce TCKN/VKN maskelenir (tam değer asla dönülmez).
+function sanitizeOrderRow(order) {
+  if (!order) return order;
+  return { ...order, invoice_tckn: maskTckn(order.invoice_tckn), invoice_vkn: maskVkn(order.invoice_vkn) };
+}
+
+// fix10e (M16): sipariş oluşturma limiti — kullanıcı başına 15 dakikada 20.
+const orderCreateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'too_many_requests' },
+  keyGenerator: (req) => 'order-create:' + String((req.user && req.user.id) || (req.ip ? ipKeyGenerator(req.ip) : 'unknown')),
+});
 
 const router = express.Router();
 router.use(requireAuth);
@@ -47,9 +152,9 @@ function couponDiscountCents(coupon, subtotalCents) {
 }
 
 function nextOrderNo() {
-  // CB-2026-XXXXXX (6 haneli rastgele, benzersizlik DB constraint ile garanti)
-  const rand = Math.floor(100000 + Math.random() * 900000);
-  return `CB-${new Date().getFullYear()}-${rand}`;
+  // fix10e (L17): tahmin edilemez sipariş no — Math.random yerine CSPRNG (48 bit).
+  // Benzersizlik DB UNIQUE constraint ile garanti (çakışma ~imkânsız).
+  return `CB-${new Date().getFullYear()}-${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
 }
 
 // GET /api/orders — kendi siparişleri (created_at DESC).
@@ -65,13 +170,13 @@ router.get(
          LEFT JOIN users u ON u.id = o.user_id
          ORDER BY o.created_at DESC LIMIT 200`
       );
-      return res.json({ items: rows });
+      return res.json({ items: rows.map(sanitizeOrderRow) });
     }
     const { rows } = await pool.query(
       'SELECT * FROM orders WHERE user_id = $1 ORDER BY created_at DESC',
       [req.user.id]
     );
-    res.json({ items: rows });
+    res.json({ items: rows.map(sanitizeOrderRow) });
   })
 );
 
@@ -99,6 +204,7 @@ router.post(
 // POST /api/orders  { address_id, items: [{ product_id, qty }] }
 router.post(
   '/',
+  orderCreateLimiter,
   body('address_id').isUUID(),
   // v569: opsiyonel alanlarda null da "bos" sayilir (on yuz bos fatura alanini null gonderiyordu -> validation_failed)
   body('payment_method').optional({ nullable: true }).isIn(['card', 'transfer', 'qr']), // v448: QR odeme kabul ediliyor
@@ -112,7 +218,7 @@ router.post(
   body('invoice_email').optional({ nullable: true }).isString().trim().isLength({ min: 0, max: 200 }),
   body('invoice_postcode').optional({ nullable: true }).isString().trim().isLength({ min: 0, max: 10 }),
   body('coupon_code').optional({ nullable: true }).isString().trim().isLength({ min: 0, max: 64 }),
-  body('items').isArray({ min: 1 }),
+  body('items').isArray({ min: 1, max: 50 }), // fix10e (M16): en fazla 50 kalem
   body('items.*.product_id').isUUID(),
   body('items.*.qty').isInt({ min: 1, max: 99 }),
   body('items.*.variant_color').optional({ nullable: true }).isString().trim().isLength({ min: 0, max: 100 }),
@@ -132,6 +238,14 @@ router.post(
     const invoiceAddress = invoiceType === 'bireysel' ? String(req.body.invoice_address || '').trim().slice(0, 500) || null : null;
     const invoiceEmail = String(req.body.invoice_email || '').trim().slice(0, 200) || null;
     const invoicePostcode = String(req.body.invoice_postcode || '').replace(/\D/g, '').slice(0, 10) || null;
+    // fix10e (L17): TCKN/VKN yalnızca verildiyse checksum ile doğrulanır (TCKN zorunlu değil).
+    if (invoiceType === 'bireysel' && invoiceTckn && !isValidTckn(invoiceTckn)) {
+      return res.status(400).json({ error: 'invalid_tckn_checksum' });
+    }
+    if (invoiceType === 'kurumsal' && invoiceVkn && !isValidVkn(invoiceVkn)) {
+      return res.status(400).json({ error: 'invalid_vkn_checksum' });
+    }
+    let order = null; // fix10e (M15): catch bloğunda erişilebilir olmalı
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -166,6 +280,9 @@ router.post(
           await client.query('ROLLBACK');
           return res.status(409).json({ error: 'insufficient_stock', product_id: p.id, available: p.stock });
         }
+        // fix10e (M9): stok döngüde güncellenir — aynı ürün tekrarlı kalemde
+        // ikinci kez eski stokla kontrol edilemez (aksi halde stok eksiye düşer).
+        p.stock -= it.qty;
         // Kampanya fiyati varsa (0 < kampanya < normal fiyat) siparis kampanyali fiyattan kesilir
         let unitCents = (p.campaign_price_cents != null && p.campaign_price_cents > 0 && p.campaign_price_cents < p.price_cents) ? p.campaign_price_cents : p.price_cents;
         // v572: Varyant — renk/depolama secimi; depolama fiyat farki urunun storage listesinden SUNUCU tarafinda hesaplanir (on yuz fiyati guvenilmez)
@@ -212,6 +329,15 @@ router.post(
       const total = subtotal + shipping - discountCents;
 
       const orderNo = nextOrderNo();
+      // fix10e (M10): şifreli değer sığsın diye fatura kimlik sütunları TEXT olur.
+      await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS invoice_tckn TEXT`);
+      await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS invoice_vkn TEXT`);
+      await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS invoice_company TEXT`);
+      await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS invoice_tax_office TEXT`);
+      await client.query(`ALTER TABLE orders ALTER COLUMN invoice_tckn TYPE TEXT`);
+      await client.query(`ALTER TABLE orders ALTER COLUMN invoice_vkn TYPE TEXT`);
+      const invoiceTcknStored = invoiceTckn ? encryptSensitive(invoiceTckn) : null;
+      const invoiceVknStored = invoiceVkn ? encryptSensitive(invoiceVkn) : null;
       await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS coupon_code TEXT`);
       await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS invoice_full_name TEXT`);
       await client.query(`ALTER TABLE orders ADD COLUMN IF NOT EXISTS invoice_address TEXT`);
@@ -223,9 +349,9 @@ router.post(
       const { rows: orderRows } = await client.query(
         `INSERT INTO orders (user_id, order_no, status, subtotal_cents, shipping_cents, total_cents, currency, address_id, address_snapshot, payment_method, invoice_type, invoice_tckn, invoice_vkn, invoice_company, invoice_tax_office, invoice_full_name, invoice_address, invoice_email, invoice_postcode, coupon_code, discount_cents)
          VALUES ($1,$2,'pending',$3,$4,$5,'TRY',$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING *`,
-        [req.user.id, orderNo, subtotal, shipping, total, address_id, JSON.stringify(addr.rows[0]), paymentMethod, invoiceType, invoiceTckn, invoiceVkn, invoiceCompany, invoiceTaxOffice, invoiceFullName, invoiceAddress, invoiceEmail, invoicePostcode, couponCode, discountCents]
+        [req.user.id, orderNo, subtotal, shipping, total, address_id, JSON.stringify(addr.rows[0]), paymentMethod, invoiceType, invoiceTcknStored, invoiceVknStored, invoiceCompany, invoiceTaxOffice, invoiceFullName, invoiceAddress, invoiceEmail, invoicePostcode, couponCode, discountCents]
       );
-      const order = orderRows[0];
+      order = orderRows[0];
 
       for (const l of lines) {
         await client.query(
@@ -239,6 +365,9 @@ router.post(
       }
 
       await client.query('COMMIT');
+
+      // fix10e (M15): "sipariş alındı" SMS'i yalnızca COMMIT sonrası (başarılı siparişte).
+      notifyOrderSms(order.id, 'received').catch(() => {});
 
       // OTOMATİK FATURA OLUŞTUR
       try {
@@ -265,8 +394,8 @@ router.post(
       });
     } catch (err) {
       await client.query('ROLLBACK');
-      // v609: siparis alindi SMS'i (asla ana akisi bozmaz)
-      notifyOrderSms(order.id, 'received').catch(() => {});
+      // fix10e (M15): başarısız siparişte SMS gönderilmez; `order` artık
+      // try dışındaki `let` ile catch'te erişilebilir (ReferenceError yok).
       if (err.code === '23505') return res.status(409).json({ error: 'order_no_conflict_retry' });
       throw err;
     } finally {
@@ -296,7 +425,7 @@ router.get(
       [order.id]
     );
     res.json({
-      ...order,
+      ...sanitizeOrderRow(order),
       cargo: {
         company: order.cargo_company,
         tracking_number: order.tracking_number,
@@ -503,5 +632,8 @@ router.get(
     res.json({ ok: true, return: ret[0] || null });
   })
 );
+
+// fix10e: test kancası — üretim davranışını değiştirmez (yalnız birim testleri için).
+router.__fix10e = { isValidTckn, isValidVkn, encryptSensitive, decryptSensitive, maskTckn, maskVkn, sanitizeOrderRow, nextOrderNo };
 
 module.exports = router;

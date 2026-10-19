@@ -1,3 +1,6 @@
+// fix10e (2026-10-19) — güvenlik düzeltmeleri: H-F SELECT gölgeleme, M8 çift ödeme,
+// M16 ödeme başlatma limiti, L17 raw_response ham hata / tutar uyuşmazlığı / aktif
+// abonelik koruması / clientIp XFF, SABAH-4 isPaytrIp XFF.
 // PayTR ödeme akışı (iframe):
 //
 // 1) POST /api/payments/paytr/init  { order_id }  -> { iframeUrl, token }
@@ -27,13 +30,36 @@ const cfg = require('../config');
 const pool = require('../db');
 const paytr = require('../services/paytr');
 const crypto = require('crypto');
+const rateLimit = require('express-rate-limit');
+const { ipKeyGenerator } = require('express-rate-limit'); // fix10e: v8 keyGenerator IP doğrulaması (ERR_ERL_KEY_GEN_IPV6) için gerekli
+// fix10e (M16): ödeme başlatma limitleri — kullanıcı başına 15 dakika.
+const payInitLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'too_many_requests' },
+  keyGenerator: (req) => 'paytr-init:' + String((req.user && req.user.id) || (req.ip ? ipKeyGenerator(req.ip) : 'unknown')),
+});
+const factorySubLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'too_many_requests' },
+  keyGenerator: (req) => 'factory-sub:' + String((req.user && req.user.id) || (req.ip ? ipKeyGenerator(req.ip) : 'unknown')),
+});
+
 
 const router = express.Router();
 
 const PAYTR_IPS = new Set(['185.21.211.51', '185.21.211.52', '185.21.211.53', '185.21.211.54']);
 
 function isPaytrIp(req) {
-  const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket?.remoteAddress || '';
+  // fix10e (SABAH-4 / L17): X-Forwarded-For'un ilk girdisi istemci tarafından
+  // uydurulabilir — Express'in trust proxy: 1 ile hesapladığı req.ip kullanılır.
+  // Hash doğrulaması (verifyCallback) asıl kontrol olmaya devam eder.
+  const ip = String(req.ip || (req.socket && req.socket.remoteAddress) || '');
   const clean = ip.replace(/^::ffff:/, '');
   if (process.env.PAYTR_TEST_MODE === '1') return true;
   return PAYTR_IPS.has(clean);
@@ -67,11 +93,25 @@ router.post(
         await client.query('ROLLBACK');
         return res.send('OK'); // tekrar bildirimi
       }
-      // Tutar uyuşmazlığı → güvenlik nedeniyle başarısız say
+      // fix10e (M8): sipariş satırını da kilitle — yan etkiler (ödendi işareti
+      // + sold_count) sipariş başına en fazla 1 kez uygulanır. Aynı sipariş için
+      // ikinci bir PayTR akışı (farklı merchant_oid) başarı bildirirse parası
+      // alınmış ödeme 'success' yazılır ama yan etki tekrarlanmaz.
+      const { rows: orderRows } = await client.query(
+        'SELECT id, payment_status FROM orders WHERE id = $1 FOR UPDATE',
+        [payment.order_id]
+      );
+      const orderRow = orderRows[0];
+      if (!orderRow) {
+        await client.query('ROLLBACK');
+        return res.status(404).send('NOT_FOUND');
+      }
+      // Tutar uyuşmazlığı → başarısız say; ham hata yazılmaz, yeniden deneme
+      // engellenmez (yeni PayTR başlatma her zaman mümkün — retry edilebilir).
       if (String(payment.amount_cents) !== String(total_amount)) {
         await client.query(
           `UPDATE payments SET status='failed', raw_response=$1, updated_at=now() WHERE id=$2`,
-          [JSON.stringify({ merchant_oid, status, total_amount, amount_mismatch: true }), payment.id]
+          [JSON.stringify({ merchant_oid, status, total_amount, amount_mismatch: true, retryable: true }), payment.id]
         );
         await client.query('COMMIT');
         return res.send('OK');
@@ -79,18 +119,21 @@ router.post(
 
       await client.query(
         `UPDATE payments SET status=$1, raw_response=$2, updated_at=now() WHERE id=$3`,
-        [ok ? 'success' : 'failed', JSON.stringify({ merchant_oid, status, total_amount }), payment.id]
+        [ok ? 'success' : 'failed', JSON.stringify({ merchant_oid, status, total_amount, ...(ok && orderRow.payment_status === 'paid' ? { already_paid: true } : {}) }), payment.id]
       );
-      if (ok) {
-        await client.query(
-          `UPDATE orders SET payment_status='paid', status='pending', updated_at=now() WHERE id=$1`,
+      if (ok && orderRow.payment_status !== 'paid') {
+        // Koşullu güncelleme: yarışta yalnız bir callback öder + satar.
+        const { rowCount } = await client.query(
+          `UPDATE orders SET payment_status='paid', status='pending', updated_at=now() WHERE id=$1 AND payment_status='unpaid'`,
           [payment.order_id]
         );
-        await client.query(
-          `UPDATE products p SET sold_count = sold_count + oi.qty
-           FROM order_items oi WHERE oi.order_id=$1 AND oi.product_id=p.id`,
-          [payment.order_id]
-        );
+        if (rowCount === 1) {
+          await client.query(
+            `UPDATE products p SET sold_count = sold_count + oi.qty
+             FROM order_items oi WHERE oi.order_id=$1 AND oi.product_id=p.id`,
+            [payment.order_id]
+          );
+        }
       }
       await client.query('COMMIT');
       return res.send('OK');
@@ -194,8 +237,15 @@ router.post(
 router.post(
   '/factory-subscription/create',
   requireAuth,
+  factorySubLimiter,
   asyncHandler(async (req, res) => {
     await ensureFactorySubscriptionPlanColumn();
+    // fix10e (L17): aktif abonelik varken yeniden ödeme başlatılamaz.
+    const { rows: activeSub } = await pool.query(
+      `SELECT id, ends_at FROM factory_subscriptions WHERE user_id = $1 AND status = 'active' AND ends_at > now() ORDER BY ends_at DESC LIMIT 1`,
+      [req.user.id]
+    );
+    if (activeSub.length) return res.status(409).json({ error: 'subscription_already_active', ends_at: activeSub[0].ends_at });
     if (!paytr.isEnabled()) return res.status(503).json({ error: 'paytr_disabled' });
     const rawPlan = req.body && req.body.plan;
     if (rawPlan !== undefined && rawPlan !== 'monthly' && rawPlan !== 'yearly') {
@@ -328,27 +378,38 @@ router.post(
 router.use(requireAuth);
 
 function clientIp(req) {
-  const fwd = req.headers['x-forwarded-for'];
-  if (fwd) return String(fwd).split(',')[0].trim().slice(0, 45);
-  return (req.socket && req.socket.remoteAddress ? String(req.socket.remoteAddress) : '127.0.0.1').slice(0, 45);
+  // fix10e (L17): X-Forwarded-For'un ilk girdisi istemci tarafından uydurulabilir —
+  // Express'in trust proxy: 1 ile hesapladığı req.ip kullanılır.
+  return String(req.ip || (req.socket && req.socket.remoteAddress) || '127.0.0.1').slice(0, 45);
 }
 
 // POST /api/payments/paytr/init  { order_id }
 router.post(
   '/paytr/init',
+  payInitLimiter,
   body('order_id').isUUID(),
   asyncHandler(async (req, res) => {
     if (!paytr.isEnabled()) return res.status(503).json({ error: 'payment_not_configured' });
     const errors = validationResult(req);
     if (!errors.isEmpty()) return res.status(400).json({ error: 'validation_failed', details: errors.array() });
+    // fix10e (H-F): SELECT o.*, a.* gölgelemesi — addresses.id / created_at /
+    // updated_at, orders sütunlarının üzerine yazıyor; order.id adres id'si
+    // oluyordu (ödemeler yanlış siparişe bağlanır, kalemler bulunamazdı).
+    // Yalnız gerekli adres sütunları, çakışmasız takma adlarla alınır.
     const { rows } = await pool.query(
-      `SELECT o.*, a.* FROM orders o LEFT JOIN addresses a ON a.id = o.address_id
+      `SELECT o.*, a.full_name AS address_full_name, a.phone AS address_phone,
+              a.city AS address_city, a.district AS address_district,
+              a.neighborhood AS address_neighborhood, a.address_line AS address_address_line
+       FROM orders o LEFT JOIN addresses a ON a.id = o.address_id
        WHERE o.id = $1 AND o.user_id = $2`,
       [req.body.order_id, req.user.id]
     );
     const order = rows[0];
     if (!order) return res.status(404).json({ error: 'order_not_found' });
     if (order.status !== 'pending') return res.status(409).json({ error: 'order_not_payable', status: order.status });
+    // fix10e (M8): havale ile ödenmiş siparişe PayTR başlatılamaz
+    // (havalede status 'pending' kalır, payment_status 'paid' olur).
+    if (order.payment_status === 'paid') return res.status(409).json({ error: 'order_already_paid' });
 
     const { rows: items } = await pool.query(
       `SELECT oi.name, oi.qty, oi.price_cents, c.name AS category
@@ -370,9 +431,9 @@ router.post(
 
     const address = order.address_id
       ? {
-          full_name: order.full_name, phone: order.phone, city: order.city,
-          district: order.district, neighborhood: order.neighborhood,
-          address_line: order.address_line,
+          full_name: order.address_full_name, phone: order.address_phone, city: order.address_city,
+          district: order.address_district, neighborhood: order.address_neighborhood,
+          address_line: order.address_address_line,
         }
       : null;
 
@@ -397,7 +458,8 @@ router.post(
       await pool.query(
         `INSERT INTO payments (order_id, provider, status, conversation_id, amount_cents, currency, raw_response)
          VALUES ($1,'paytr','failed',$2,$3,$4,$5)`,
-        [order.id, merchantOid, order.total_cents, order.currency, JSON.stringify({ error: String((e && e.message) || e) })]
+        // fix10e (L17): ham hata (PayTR yanıtı / iç detay içerebilir) DB'ye yazılmaz.
+        [order.id, merchantOid, order.total_cents, order.currency, JSON.stringify({ error: 'paytr_init_failed' })]
       );
       return res.status(502).json({ error: 'paytr_init_failed' });
     }
@@ -420,8 +482,15 @@ router.post(
 // PayTR token her cagirida tazelenir. 5 USD = 500 minor birim.
 router.post(
   '/factory-subscription/create',
+  factorySubLimiter,
   asyncHandler(async (req, res) => {
     await ensureFactorySubscriptions();
+    // fix10e (L17): aktif abonelik varken yeniden ödeme başlatılamaz.
+    const { rows: activeSub } = await pool.query(
+      `SELECT id, ends_at FROM factory_subscriptions WHERE user_id = $1 AND status = 'active' AND ends_at > now() ORDER BY ends_at DESC LIMIT 1`,
+      [req.user.id]
+    );
+    if (activeSub.length) return res.status(409).json({ error: 'subscription_already_active', ends_at: activeSub[0].ends_at });
     if (!paytr.isEnabled()) return res.status(503).json({ error: 'paytr_disabled' });
     const { rows: users } = await pool.query('SELECT id, email, name, phone FROM users WHERE id = $1', [req.user.id]);
     const user = users[0];

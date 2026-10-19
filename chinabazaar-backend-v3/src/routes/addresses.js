@@ -1,3 +1,5 @@
+// fix10e (2026-10-19) — hafif denetim: doğrulamada üst uzunluk sınırları + adres oluşturma limiti.
+// IDOR zaten doğru (tüm sorgular user_id ile sınırlı) — değiştirilmedi.
 // Teslimat adresleri (Türkiye: il / ilçe / mahalle)
 const express = require('express');
 const { body, param } = require('express-validator');
@@ -5,6 +7,18 @@ const asyncHandler = require('../middleware/asyncHandler');
 const { checkValidation } = require('../middleware/validate');
 const { requireAuth } = require('../middleware/auth');
 const pool = require('../db');
+const rateLimit = require('express-rate-limit');
+const { ipKeyGenerator } = require('express-rate-limit'); // fix10e: v8 keyGenerator IP doğrulaması (ERR_ERL_KEY_GEN_IPV6) için gerekli
+
+// fix10e: adres oluşturma limiti — kullanıcı başına saatte 30 (spam / kötüye kullanım).
+const addressCreateLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'too_many_requests' },
+  keyGenerator: (req) => 'address-create:' + String((req.user && req.user.id) || (req.ip ? ipKeyGenerator(req.ip) : 'unknown')),
+});
 
 const router = express.Router();
 router.use(requireAuth);
@@ -13,10 +27,10 @@ const validators = [
   body('label').optional().trim().isLength({ max: 30 }),
   body('full_name').trim().isLength({ min: 2, max: 100 }),
   body('phone').matches(/^\+?[0-9][0-9\s\-().]{6,19}$/),
-  body('city').trim().notEmpty(),          // il
-  body('district').trim().notEmpty(),      // ilçe
-  body('neighborhood').optional().trim(),   // mahalle
-  body('address_line').trim().notEmpty(),   // sokak/cadde, bina, daire
+  body('city').trim().notEmpty().isLength({ max: 100 }),          // il
+  body('district').trim().notEmpty().isLength({ max: 100 }),      // ilçe
+  body('neighborhood').optional().trim().isLength({ max: 100 }),   // mahalle
+  body('address_line').trim().notEmpty().isLength({ max: 500 }),   // sokak/cadde, bina, daire
   body('postal_code').optional().trim().isLength({ max: 10 }),
   body('is_default').optional().isBoolean(),
 ];
@@ -36,6 +50,7 @@ router.get(
 // POST /api/addresses
 router.post(
   '/',
+  addressCreateLimiter,
   validators,
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
