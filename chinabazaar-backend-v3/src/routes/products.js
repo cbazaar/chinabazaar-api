@@ -1,6 +1,12 @@
 // fix10c — FAZ 1 — My Factory (fabrika girisi) [API /factory/myfactory/*, sutunlar myfactory_*; eski fabrika giris sutunlarindaki veri gocle tasinir]: fabrika kendi hesabiyla giris yapar, kendi kaydini duzenler.
 // JWT: { factory_id, role: 'factory' }, 7 gun. Sifre: auth.js ile AYNI bcryptjs hasher (cost 12).
 // Yasak alanlar (name, cbf_code, is_verified, is_active) My Factory profilinde sessizce yoksayilir.
+// fix10q: CBOs26.29 — Cin'den yukleme dayanikliligi. Video yuklemeleri TUS protokolü
+//   (tus-js-client, 5MB parca) ile parca parca yapilir; baglanti kopsa kaldigi yerden
+//   devam eder. /api/admin/stream-upload-url (admin.js)'den donen uploadURL dogrudan
+//   TUS endpoint'idir (Cloudflare direct_upload); bu dosyada (products.js) islevsel
+//   degisiklik YOK — videos alan dogrulamasi (cleanFactoryVideos) fix10o'daki
+//   *.cloudflarestream.com / *.videodelivery.net jokerleriyle aynen gecerlidir.
 // fix10e: H-B göç (transaction + doğrulama + DROP yoksa yapılmaz), H-E CBAI master
 // fix10h: CBOs26.4 — /myfactory/stats: gunluk seri (daily) + ulke dagilimi (countries); /factory/video-view: olay kaydi (ulke basliktan).
 // fix10i: CBOs26.5 — bildirimler: factory_messages/factory_quotes + seen_by_factory; GET/POST /myfactory/notifications[/read]; videos.description korunur.
