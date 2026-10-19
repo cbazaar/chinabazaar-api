@@ -2693,8 +2693,11 @@ router.post(
     const token = crypto.randomBytes(16).toString('hex');
     // fix10e M5: sahip + süre (7 gün) kaydedilir.
     const ownerId = req.factoryId != null ? 'factory:' + req.factoryId : req.isMaster ? 'cbai:master' : (req.user && req.user.id ? String(req.user.id) : null);
+    // fix10l (CBOs26.16): kapak yüklemesi SÜRESİZ — fabrika/master ?kind=cover ile yükler
+    // (kapak banner'ı 7 günde ölmemeli). Normal kullanıcılar kind=cover KULLANAMAZ (depolama şişmesin).
+    const isCover = String(req.query.kind || '').toLowerCase() === 'cover' && (req.factoryId != null || req.isMaster);
     const { rows } = await pool.query(
-      `INSERT INTO factory_chat_files (token, data, mime, name, size, uploaded_by, expires_at) VALUES ($1, $2, $3, $4, $5, $6, now() + interval '7 days') RETURNING id`,
+      `INSERT INTO factory_chat_files (token, data, mime, name, size, uploaded_by, expires_at) VALUES ($1, $2, $3, $4, $5, $6, ${isCover ? 'NULL' : "now() + interval '7 days'"}) RETURNING id`,
       [token, file.data, mime, displayName, file.data.length, ownerId]
     );
     const base = req.protocol + '://' + req.get('host');
