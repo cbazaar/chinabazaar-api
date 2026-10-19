@@ -2790,6 +2790,9 @@ router.get('/factory/chat-file/:id/:token', asyncHandler(async (req, res) => {
   if (f.size != null && Buffer.isBuffer(f.data) && f.data.length !== Number(f.size)) return res.status(404).json({ error: 'file_not_found' });
   res.set('Content-Type', f.mime);
   res.set('Cache-Control', 'private, max-age=31536000');
+  // fix10p: CORP cross-origin — kapak/sohbet görselleri myfactor.netlify.app
+  // (farklı origin) üzerinden <img> ile gömülüyor; same-origin tarayıcıda engeller.
+  res.set('Cross-Origin-Resource-Policy', 'cross-origin');
   const safeName = sanitizeChatFilename(f.name) || 'dosya';
   const asciiName = safeName.replace(/[^\x20-\x7e]/g, '_') || 'dosya';
   res.set('Content-Disposition', (req.query.download === '1' ? 'attachment' : 'inline') + '; filename="' + asciiName.replace(/"/g, '') + '"; filename*=UTF-8\'\'' + encodeURIComponent(safeName));
