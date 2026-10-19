@@ -1812,6 +1812,62 @@ router.get('/factory/feed', requireAuth, asyncHandler(async (req, res) => {
   res.json({ items: items.slice(offset, offset + limit), total: items.length, limit, offset });
 }));
 
+// fix10n (CBOs26.22): GET /api/products/factory/follows/mine — giris yapan kullanicinin takip ettigi fabrikalarin LISTESI.
+// Yanit: [{id, name, cbf_code, cover_image, followers}]. YALNIZCA kendi takipleri (user_id filtresi).
+// Siralama: takip zamani (created_at DESC, en yeni takip once) — uydurma tarih/sayi yok, YALNIZCA gercek veri.
+// Kapali (is_active=false) fabrikalar listeye girmez.
+// KONUM: /factory/:id tek-segment rotasindan once kayitli olmali (bu rota iki segmentli oldugu icin yutulmaz,
+// ancak diger /factory/* rotalariyla ayni blokta tutulur).
+router.get('/factory/follows/mine', requireAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const { rows } = await pool.query(
+    `SELECT f.id, f.name, f.cbf_code, f.cover_image
+     FROM factory_follows ff JOIN factories f ON f.id = ff.factory_id
+     WHERE ff.user_id = $1 AND f.is_active IS NOT FALSE
+     ORDER BY ff.created_at DESC, ff.id DESC`,
+    [req.user.id]
+  );
+  const fmap = await factoryFollowersMap(rows.map((r) => r.id));
+  res.json(rows.map((r) => ({
+    id: r.id,
+    name: r.name || '',
+    cbf_code: r.cbf_code || '',
+    cover_image: r.cover_image || '',
+    followers: fmap[r.id] || 0,
+  })));
+}));
+
+// fix10n (CBOs26.22): GET /api/products/factory/myfactory/followers — fabrikayi takip eden kullanicilarin LISTESI.
+// Yetki: fabrika jetonu -> YALNIZ kendi fabrikasinin takipcileri; master -> ?factory_id= ZORUNLU.
+// Yanit: [{user_id, nickname, name, followed_at}] — takip tarihine gore yeniden eskiye.
+// GIZLILIK: e-posta/telefon ASLA donulmez; yalnizca herkese acik profil bilgileri (nickname, name).
+router.get('/factory/myfactory/followers', requireFactoryOrMasterAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  let targetFactoryId;
+  if (req.isMaster) {
+    const qf = req.query.factory_id;
+    if (qf === undefined || qf === null || String(qf).trim() === '') return res.status(400).json({ error: 'factory_id_required', message: 'Master icin factory_id gerekli.' });
+    targetFactoryId = Number(String(qf).trim());
+    if (!Number.isInteger(targetFactoryId) || targetFactoryId < 1) return res.status(400).json({ error: 'invalid_factory_id', message: 'Fabrika kimligi gecerli degil.' });
+  } else {
+    targetFactoryId = req.factoryId;
+  }
+  const { rows } = await pool.query(
+    `SELECT ff.user_id AS user_id, u.nickname AS nickname, u.name AS name, ff.created_at AS followed_at
+     FROM factory_follows ff LEFT JOIN users u ON u.id::text = ff.user_id::text
+     WHERE ff.factory_id = $1
+     ORDER BY ff.created_at DESC, ff.id DESC`,
+    [targetFactoryId]
+  );
+  if (req.isMaster) await logMasterAudit('factory_followers_view', 'factory', targetFactoryId); // fix10e H-E deseni
+  res.json(rows.map((r) => ({
+    user_id: r.user_id,
+    nickname: r.nickname || '',
+    name: r.name || '',
+    followed_at: r.followed_at,
+  })));
+}));
+
 // GET /api/products/factory/admin/list — tum fabrikalar + created_at (admin)
 router.get('/factory/admin/list', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
   await ensureFactoryTables();
