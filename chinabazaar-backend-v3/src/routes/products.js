@@ -1,3 +1,6 @@
+// FAZ 1 — WorkShop (fabrika girisi): fabrika kendi hesabiyla giris yapar, kendi kaydini duzenler.
+// JWT: { factory_id, role: 'factory' }, 7 gun. Sifre: auth.js ile AYNI bcryptjs hasher (cost 12).
+// Yasak alanlar (name, cbf_code, is_verified, is_active) WorkShop profilinde sessizce yoksayilir.
 // Ürün kataloğu — ön yüz (video akış) sözleşmesine uygun JSON döner:
 // { id, name, tagline, description, price_cents, price_display, currency,
 //   sold_count, stock, category: {id, slug, name}, video_url, thumb_url }
@@ -9,6 +12,13 @@ const { requireAuth, optionalAuth } = require('../middleware/auth');
 const { requireAdmin } = require('../middleware/admin');
 const pool = require('../db');
 const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const cfg = require('../config');
+const { loginLimiter } = require('../middleware/rateLimit');
+
+// Fabrika yoksa bile karsilastirma yapilir (zamanlama ile kullanici sayimini zorlastirmak icin).
+const WORKSHOP_DUMMY_HASH = bcrypt.hashSync('__chinabazaar_no_such_workshop__', 10);
 
 const rateLimit = require('express-rate-limit');
 const fs = require('fs');
@@ -488,6 +498,11 @@ async function ensureFactoryTables() {
   try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT FALSE`); } catch (e) { /* is_verified kolonu eklenemezse akis bozulmaz */ }
   // FACTORY EMAIL (fix5): fabrika e-posta adresi (opsiyonel, max 254, e-posta bicimi). Her ALTER kendi try/catch'indedir.
   try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS email TEXT`); } catch (e) { /* email kolonu eklenemezse akis bozulmaz */ }
+  // FAZ 1 — WorkShop giris hesabi: fabrika bazli kullanici adi (benzersiz) + sifre hash'i.
+  try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS workshop_username TEXT UNIQUE`); } catch (e) { /* workshop_username kolonu eklenemezse akis bozulmaz */ }
+  try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS workshop_password_hash TEXT`); } catch (e) { /* workshop_password_hash kolonu eklenemezse akis bozulmaz */ }
+  // Sutun daha once UNIQUE'siz olusmus olabilir — kucuk harfe duyarsiz benzersizlik icin ifade indexi (varsa yoksayilir).
+  try { await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS factories_workshop_username_uidx ON factories (LOWER(workshop_username))`); } catch (e) { /* index kurulamazsa akis bozulmaz */ }
   // v118: user_id tip onarimi — users.id UUID, ama fabrika tablolari user_id'yi INT diye
   // tanimlamisti; UUID'li kullaniciyla her user_id sorgusu 500 veriyordu. INT->TEXT
   // donusumu kayipsizdir (her INT metne cevrilir); TEXT kolonda tekrar calismak no-op'tur.
@@ -609,7 +624,13 @@ async function factoryQuoteCountsMap(ids) {
 }
 
 function toFactoryAdmin(r) {
-  return { ...toFactoryPublic(r), is_active: r.is_active !== false, created_at: r.created_at, updated_at: r.updated_at };
+  // workshop_username: admin yonetimi icin doner. workshop_password_hash ASLA donulmez (hicbir serializer'da yok).
+  return { ...toFactoryPublic(r), workshop_username: r.workshop_username || null, is_active: r.is_active !== false, created_at: r.created_at, updated_at: r.updated_at };
+}
+
+// WorkShop me/login yaniti: TAM fabrika kaydi, workshop_username dahil, hash ASLA yok.
+function toFactoryWorkshop(r) {
+  return toFactoryAdmin(r);
 }
 
 // v5: fabrika sosyal aglari — {youtube, facebook, tiktok, instagram}; yalniz http(s) URL kabul edilir
@@ -657,6 +678,29 @@ function cleanFactoryEmail(v) {
   return t;
 }
 
+
+// FAZ 1 — WorkShop kullanici adi: undefined => dokunma, '' => yok (no-op), gecersiz => null (handler 400 doner).
+// 3-50 karakter, yalniz harf/rakam/._- . Karsilastirma kucuk harfe duyarsizdir (auth.js giris deseni).
+function cleanWorkshopUsername(v) {
+  if (v === undefined) return undefined;
+  if (typeof v !== 'string') return null;
+  const t = v.trim();
+  if (t === '') return '';
+  if (t.length < 3 || t.length > 50) return null;
+  if (!/^[A-Za-z0-9_.\-]+$/.test(t)) return null;
+  return t;
+}
+
+// FAZ 1 — WorkShop sifresi: undefined => dokunma, ''/null => koru (no-op), gecersiz => null (handler 400 doner).
+// 8-100 karakter. Sifre kirpilmez (auth.js ile ayni: ham hali hash'lenir).
+function cleanWorkshopPassword(v) {
+  if (v === undefined) return undefined;
+  if (v === null) return '';
+  if (typeof v !== 'string') return null;
+  if (v === '') return '';
+  if (v.length < 8 || v.length > 100) return null;
+  return v;
+}
 // fix9: fabrika kapak gorseli — undefined => dokunma, bos string => '' (yok),
 // gecersiz (string degil / 2048'den uzun / http(s) URL degil) => null (handler 400 doner)
 function cleanFactoryCoverImage(v) {
@@ -871,6 +915,127 @@ router.get('/factory/favorites', requireAuth, asyncHandler(async (req, res) => {
   res.json({ favorites: rows.map((r) => r.video_key) });
 }));
 
+
+// FAZ 1 — WorkShop rotalari: fabrika kendi hesabiyla giris yapar, kendi kaydini duzenler.
+// JWT: { factory_id, role: 'factory' }, 7 gun. factory_id HER ZAMAN token'dan alinir;
+// govdeden gelen id/factory_id ASLA guvenilmez, token'daki fabrikadan farkliysa 403 doner.
+// Yasak alanlar (name, cbf_code, is_verified, is_active) sessizce yoksayilir — degistirilmez.
+// Tum hata govdeleri Turkce ve dostcadir; ham hata/stack ASLA sizdirilmaz.
+
+// WorkShop kullanici adi baskasinda var mi? (kucuk harfe duyarsiz; excludeId haric tutulur)
+async function workshopUsernameTaken(username, excludeId) {
+  const params = [String(username)];
+  let sql = `SELECT id FROM factories WHERE LOWER(workshop_username) = LOWER($1)`;
+  if (excludeId !== undefined && excludeId !== null) { params.push(excludeId); sql += ` AND id <> $2`; }
+  const { rows } = await pool.query(sql, params);
+  return rows.length > 0;
+}
+
+// Fabrika JWT dogrulamasi: Bearer token + role === 'factory' + tamsayi factory_id.
+// Token yok/bozuk/suresi dolmus => 401; gecerli ama fabrika rolu degil => 403.
+function requireFactoryAuth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'unauthorized', message: 'Giriş gerekli. Lütfen ChinaBazaar WorkShop hesabınızla giriş yapın.' });
+  let payload;
+  try { payload = jwt.verify(token, cfg.jwtSecret); } catch { return res.status(401).json({ error: 'invalid_token', message: 'Oturumunuz geçersiz veya süresi dolmuş. Lütfen tekrar giriş yapın.' }); }
+  if (!payload || payload.role !== 'factory' || !Number.isInteger(payload.factory_id)) return res.status(403).json({ error: 'forbidden', message: 'Bu işlem için fabrika hesabı gerekli.' });
+  req.factoryId = payload.factory_id;
+  next();
+}
+
+// fix10b: chat-upload kullanici JWT'si VEYA ChinaBazaar WorkShop (fabrika) JWT'sini kabul eder.
+// Kullanici jetonu (sub) => req.user; fabrika jetonu (role 'factory') => req.factoryId.
+// Jeton yok/bozuk => 401; ne kullanici ne fabrika jetonu => 401. Admin erisimi aynen kalir
+// (yonetici jetonu bir kullanici jetonudur). Normal kullanici jetonu chat-upload'i kullanmaya
+// DEVAM EDER (CBAI sohbet dosya yukleme) — fix10b yalnizca fabrika erisimini EKLER,
+// mevcut hicbir erisimi kapatmaz.
+function requireUserOrFactoryAuth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'unauthorized', message: 'Giriş gerekli.' });
+  let payload;
+  try { payload = jwt.verify(token, cfg.jwtSecret); } catch { return res.status(401).json({ error: 'invalid_token', message: 'Oturumunuz geçersiz veya süresi dolmuş. Lütfen tekrar giriş yapın.' }); }
+  if (payload && payload.role === 'factory' && Number.isInteger(payload.factory_id)) { req.factoryId = payload.factory_id; return next(); }
+  if (payload && payload.sub) { req.user = { id: payload.sub, email: payload.email }; return next(); }
+  return res.status(401).json({ error: 'unauthorized', message: 'Giriş gerekli.' });
+}
+
+// POST /api/products/factory/workshop/login { username, password } → { token, factory }
+// Basarisiz giris (kullanici yok / sifre yanlis / sifre tanimli degil) => 401, ayirt edici bilgi verilmez.
+router.post('/factory/workshop/login', loginLimiter, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const username = typeof (req.body && req.body.username) === 'string' ? req.body.username.trim() : '';
+  const password = req.body && req.body.password;
+  if (!username || typeof password !== 'string' || !password) return res.status(401).json({ error: 'invalid_credentials', message: 'Kullanıcı adı veya şifre hatalı.' });
+  const { rows } = await pool.query(`SELECT * FROM factories WHERE LOWER(workshop_username) = LOWER($1) LIMIT 1`, [username]);
+  const row = rows[0];
+  const ok = await bcrypt.compare(password, row && row.workshop_password_hash ? row.workshop_password_hash : WORKSHOP_DUMMY_HASH);
+  if (!row || !ok) return res.status(401).json({ error: 'invalid_credentials', message: 'Kullanıcı adı veya şifre hatalı.' });
+  const token = jwt.sign({ factory_id: row.id, role: 'factory' }, cfg.jwtSecret, { expiresIn: '7d' });
+  res.json({ token, factory: toFactoryWorkshop(row) });
+}));
+
+// GET /api/products/factory/workshop/me — kendi fabrikasinin TAM kaydi (hash ASLA yok).
+router.get('/factory/workshop/me', requireFactoryAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const { rows } = await pool.query('SELECT * FROM factories WHERE id = $1', [req.factoryId]);
+  if (!rows.length) return res.status(404).json({ error: 'factory_not_found', message: 'Fabrika bulunamadı.' });
+  res.json(toFactoryWorkshop(rows[0]));
+}));
+
+// PUT /api/products/factory/workshop/profile — SADECE kendi fabrikasini gunceller.
+// Duzenlenebilir: desc, city, category, main_products, certs, features, hashtags, tags,
+// address, phone, contact, wechat, whatsapp, email, import_countries, employees,
+// annual_revenue, factory_area, years, socials, cover_image, videos.
+// YASAK (sessizce yoksayilir): name, cbf_code, is_verified, is_active (+ moq/stock/capacity).
+router.put('/factory/workshop/profile', requireFactoryAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const body = req.body || {};
+  // Govdeden gelen id ASLA guvenilmez: token'daki fabrikadan farkliysa 403.
+  for (const key of ['id', 'factory_id']) {
+    if (body[key] !== undefined && body[key] !== null && body[key] !== '' && Number(body[key]) !== req.factoryId) {
+      return res.status(403).json({ error: 'forbidden', message: 'Yalnız kendi fabrika kaydınızı düzenleyebilirsiniz.' });
+    }
+  }
+  const sets = [];
+  const params = [req.factoryId];
+  const push = (col, val, cast) => { params.push(val); sets.push(`${col} = $${params.length}${cast || ''}`); };
+  const bad = (code, message) => res.status(400).json({ error: code, message });
+  // desc / description: ikisi de kabul edilir, desc onceliklidir.
+  if (body.desc !== undefined || body.description !== undefined) {
+    const c = cleanFactoryText(body.desc !== undefined ? body.desc : body.description, 10000);
+    if (c === null) return bad('invalid_description', 'Açıklama geçerli değil.');
+    push('description', c);
+  }
+  if (body.city !== undefined) { const c = cleanFactoryText(body.city, 200); if (c === null) return bad('invalid_city', 'Şehir geçerli değil.'); push('city', c); }
+  if (body.category !== undefined) { const c = cleanFactoryText(body.category, 200); if (c === null) return bad('invalid_category', 'Kategori geçerli değil.'); push('category', c); }
+  if (body.main_products !== undefined) { const c = cleanFactoryTags(body.main_products); if (c === null) return bad('invalid_main_products', 'Ana ürünler geçerli değil.'); push('main_products', c); }
+  if (body.certs !== undefined) { const c = cleanFactoryTags(body.certs); if (c === null) return bad('invalid_certs', 'Sertifikalar geçerli değil.'); push('certs', c); }
+  if (body.features !== undefined) { const c = cleanFactoryTags(body.features); if (c === null) return bad('invalid_features', 'Özellikler geçerli değil.'); push('features', c); }
+  if (body.hashtags !== undefined) { const c = cleanFactoryHashtags(body.hashtags); if (c === null) return bad('invalid_hashtags', 'Etiketler geçerli değil.'); push('hashtags', c); }
+  if (body.tags !== undefined) { const c = cleanFactoryTags(body.tags); if (c === null) return bad('invalid_tags', 'Etiketler geçerli değil.'); push('tags', c); }
+  if (body.address !== undefined) { const c = cleanFactoryText(body.address, 500); if (c === null) return bad('invalid_address', 'Adres geçerli değil.'); push('address', c); }
+  if (body.phone !== undefined) { const c = cleanFactoryText(body.phone, 200); if (c === null) return bad('invalid_phone', 'Telefon geçerli değil.'); push('phone', c); }
+  if (body.contact !== undefined) { const c = cleanFactoryText(body.contact, 200); if (c === null) return bad('invalid_contact', 'İlgili kişi geçerli değil.'); push('contact', c); }
+  if (body.wechat !== undefined) { const c = cleanFactoryText(body.wechat, 200); if (c === null) return bad('invalid_wechat', 'WeChat geçerli değil.'); push('wechat', c); }
+  if (body.whatsapp !== undefined) { const c = cleanFactoryText(body.whatsapp, 200); if (c === null) return bad('invalid_whatsapp', 'WhatsApp geçerli değil.'); push('whatsapp', c); }
+  if (body.email !== undefined) { const c = cleanFactoryEmail(body.email); if (c === null) return bad('invalid_email', 'E-posta adresi geçerli değil.'); push('email', c === '' ? null : c); }
+  if (body.import_countries !== undefined) { const c = cleanFactoryTags(body.import_countries); if (c === null) return bad('invalid_import_countries', 'İthalat ülkeleri geçerli değil.'); push('import_countries', c); }
+  if (body.employees !== undefined) { const c = cleanFactoryText(body.employees, 2000); if (c === null) return bad('invalid_employees', 'Çalışan sayısı geçerli değil.'); push('employees', c); }
+  if (body.annual_revenue !== undefined) { const c = cleanFactoryText(body.annual_revenue, 2000); if (c === null) return bad('invalid_annual_revenue', 'Yıllık ciro geçerli değil.'); push('annual_revenue', c); }
+  if (body.factory_area !== undefined) { const c = cleanFactoryText(body.factory_area, 2000); if (c === null) return bad('invalid_factory_area', 'Fabrika alanı geçerli değil.'); push('factory_area', c); }
+  if (body.years !== undefined) { const c = cleanFactoryText(body.years, 2000); if (c === null) return bad('invalid_years', 'Deneyim yılı geçerli değil.'); push('years', c); }
+  if (body.socials !== undefined) { const c = cleanFactorySocials(body.socials); if (c === null) return bad('invalid_socials', 'Sosyal medya bağlantıları geçerli değil.'); push('socials', JSON.stringify(c), '::jsonb'); }
+  if (body.cover_image !== undefined) { const c = cleanFactoryCoverImage(body.cover_image); if (c === null) return bad('invalid_cover_image', 'Kapak görseli geçerli bir bağlantı olmalı.'); push('cover_image', c); }
+  if (body.videos !== undefined) { const c = cleanFactoryVideos(body.videos); if (c === null) return bad('invalid_videos', 'Videolar geçerli değil.'); push('videos', JSON.stringify(c), '::jsonb'); }
+  if (!sets.length) return bad('nothing_to_update', 'Güncellenecek bir alan gönderilmedi.');
+  sets.push('updated_at = now()');
+  const { rows } = await pool.query(`UPDATE factories SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params);
+  if (!rows.length) return res.status(404).json({ error: 'factory_not_found', message: 'Fabrika bulunamadı.' });
+  res.json(toFactoryWorkshop(rows[0]));
+}));
+
 // POST /api/products/factory/:id/rate — fabrika puanlama (1-5). Giris gerekli, abonelik gerekmez. Ayni kullanici tekrar puan verirse guncellenir.
 router.post('/factory/:id/rate', requireAuth, asyncHandler(async (req, res) => {
   await ensureFactoryTables();
@@ -973,6 +1138,16 @@ const factoryValidators = [
     if (Array.isArray(v) && v.every((x) => typeof x === 'string')) { if (v.join(', ').length > 2000) throw new Error('invalid_tags'); return true; }
     throw new Error('invalid_tags');
   }),
+  body('workshop_username').optional().custom((v) => {
+    if (v === '' || v === null) return true;
+    if (cleanWorkshopUsername(v) === null) throw new Error('invalid_workshop_username');
+    return true;
+  }),
+  body('workshop_password').optional().custom((v) => {
+    if (v === '' || v === null) return true;
+    if (cleanWorkshopPassword(v) === null) throw new Error('invalid_workshop_password');
+    return true;
+  }),
   body('socials').optional().custom((v) => {
     if (typeof v === 'string') { try { v = JSON.parse(v); } catch { throw new Error('invalid_socials'); } }
     if (!v || typeof v !== 'object' || Array.isArray(v)) throw new Error('invalid_socials');
@@ -992,6 +1167,14 @@ router.post('/factory/admin', requireAuth, requireAdmin,
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     await ensureFactoryTables();
+    // FAZ 1 — WorkShop hesabi (admin): kullanici adi benzersiz olmali (cakisma 409), sifre bos degilse hash'lenir.
+    // Benzersizlik kontrolu asagida yola gore yapilir (merge: hedef fabrika haric; yeni kayit: tum tablo).
+    const workshopUsernameClean = cleanWorkshopUsername(req.body.workshop_username);
+    if (workshopUsernameClean === null) return res.status(400).json({ error: 'invalid_workshop_username', message: 'ChinaBazaar WorkShop kullanıcı adı 3-50 karakter olmalı, yalnızca harf, rakam, nokta, alt çizgi ve tire içerebilir.' });
+    const workshopPasswordClean = cleanWorkshopPassword(req.body.workshop_password);
+    if (workshopPasswordClean === null) return res.status(400).json({ error: 'invalid_workshop_password', message: 'ChinaBazaar WorkShop şifresi en az 8 karakter olmalı.' });
+    let workshopPasswordHash;
+    if (workshopPasswordClean) workshopPasswordHash = await bcrypt.hash(workshopPasswordClean, 12);
     const videos = cleanFactoryVideos(req.body.videos);
     if (videos === null) return res.status(400).json({ error: 'invalid_videos' });
     const hashtagsClean = cleanFactoryHashtags(req.body.hashtags);
@@ -1078,6 +1261,12 @@ router.post('/factory/admin', requireAuth, requireAdmin,
         if (req.body.tags !== undefined) mergePush('tags', tagsClean);
         // VERIFIED (CBF merge): body verirse guncelle, verilmezse degistirme.
         if (req.body.is_verified !== undefined) mergePush('is_verified', verifiedCreate);
+        // FAZ 1 — WorkShop hesabi (CBF merge): kullanici adi cakisirsa 409; sifre bos degilse hash'lenir.
+        if (workshopUsernameClean) {
+          if (await workshopUsernameTaken(workshopUsernameClean, existingFactory.id)) return res.status(409).json({ error: 'workshop_username_taken', message: 'Bu ChinaBazaar WorkShop kullanıcı adı başka bir fabrikada kullanılıyor.' });
+          mergePush('workshop_username', workshopUsernameClean);
+        }
+        if (workshopPasswordHash) mergePush('workshop_password_hash', workshopPasswordHash);
         // Videolar — REPLACE degil APPEND: mevcut videolar korunur, yalniz yeni URL'ler eklenir.
         if (videos !== undefined) {
           let existingVideos = existingFactory.videos;
@@ -1101,6 +1290,10 @@ router.post('/factory/admin', requireAuth, requireAdmin,
     // CBF: body'de kod varsa normalize edip kullan; yoksa ayni isimde kod varsa onu tekrar kullan, yoksa siradaki kodu ata.
     let cbfCode = normalizeCbfCode(req.body.cbf_code);
     if (!cbfCode) cbfCode = await resolveCbfCodeForName(req.body.name);
+    // FAZ 1 — WorkShop hesabi (yeni kayit): kullanici adi cakisirsa 409.
+    if (workshopUsernameClean) {
+      if (await workshopUsernameTaken(workshopUsernameClean, null)) return res.status(409).json({ error: 'workshop_username_taken', message: 'Bu ChinaBazaar WorkShop kullanıcı adı başka bir fabrikada kullanılıyor.' });
+    }
     const { rows } = await pool.query(
       `INSERT INTO factories (name, city, category, description, moq, stock, capacity, certs, features, videos, hashtags, cbf_code, is_verified)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,$13) RETURNING *`,
@@ -1120,7 +1313,7 @@ router.post('/factory/admin', requireAuth, requireAdmin,
         verifiedCreate,
       ]
     );
-    if (addressClean !== undefined || phoneClean !== undefined || contactClean !== undefined || wechatClean !== undefined || whatsappClean !== undefined || emailClean !== undefined || socialsClean !== undefined || tagsClean !== undefined || importCountriesClean !== undefined || employeesClean !== undefined || annualRevenueClean !== undefined || coverImageClean !== undefined || factoryAreaClean !== undefined || yearsClean !== undefined || mainProductsClean !== undefined) {
+    if (addressClean !== undefined || phoneClean !== undefined || contactClean !== undefined || wechatClean !== undefined || whatsappClean !== undefined || emailClean !== undefined || socialsClean !== undefined || tagsClean !== undefined || importCountriesClean !== undefined || employeesClean !== undefined || annualRevenueClean !== undefined || coverImageClean !== undefined || factoryAreaClean !== undefined || yearsClean !== undefined || mainProductsClean !== undefined || workshopUsernameClean || workshopPasswordHash) {
       const updSets = [];
       const updParams = [rows[0].id];
       const updPush = (col, val, cast) => { updParams.push(val); updSets.push(`${col} = $${updParams.length}${cast || ''}`); };
@@ -1139,6 +1332,8 @@ router.post('/factory/admin', requireAuth, requireAdmin,
       if (factoryAreaClean !== undefined) updPush('factory_area', factoryAreaClean);
       if (yearsClean !== undefined) updPush('years', yearsClean);
       if (mainProductsClean !== undefined) updPush('main_products', mainProductsClean);
+      if (workshopUsernameClean) updPush('workshop_username', workshopUsernameClean);
+      if (workshopPasswordHash) updPush('workshop_password_hash', workshopPasswordHash);
       const upd = await pool.query(`UPDATE factories SET ${updSets.join(', ')} WHERE id = $1 RETURNING *`, updParams);
       if (upd.rows.length) rows[0] = upd.rows[0];
     }
@@ -1158,6 +1353,18 @@ router.put('/factory/admin/:id', requireAuth, requireAdmin,
     const params = [id];
     const push = (col, val, cast) => { params.push(val); sets.push(`${col} = $${params.length}${cast || ''}`); };
     if (req.body.name !== undefined) push('name', String(req.body.name).trim());
+    // FAZ 1 — WorkShop hesabi (admin override): kullanici adi cakisirsa 409; sifre bos degilse hash'lenir, bossa mevcut sifre korunur.
+    if (req.body.workshop_username !== undefined || req.body.workshop_password !== undefined) {
+      const workshopUsernameCleanPut = cleanWorkshopUsername(req.body.workshop_username);
+      if (workshopUsernameCleanPut === null) return res.status(400).json({ error: 'invalid_workshop_username', message: 'ChinaBazaar WorkShop kullanıcı adı 3-50 karakter olmalı, yalnızca harf, rakam, nokta, alt çizgi ve tire içerebilir.' });
+      const workshopPasswordCleanPut = cleanWorkshopPassword(req.body.workshop_password);
+      if (workshopPasswordCleanPut === null) return res.status(400).json({ error: 'invalid_workshop_password', message: 'ChinaBazaar WorkShop şifresi en az 8 karakter olmalı.' });
+      if (workshopUsernameCleanPut) {
+        if (await workshopUsernameTaken(workshopUsernameCleanPut, id)) return res.status(409).json({ error: 'workshop_username_taken', message: 'Bu ChinaBazaar WorkShop kullanıcı adı başka bir fabrikada kullanılıyor.' });
+        push('workshop_username', workshopUsernameCleanPut);
+      }
+      if (workshopPasswordCleanPut) push('workshop_password_hash', await bcrypt.hash(workshopPasswordCleanPut, 12));
+    }
     // CBF kilidi (UPDATE): gecerli kod SABIT'tir — farkli bir kodla degistirilemez.
     // Bozuk bicimli/eksik mevcut kod, gecerli bicimli kodla bir kez duzeltilebilir.
     if (req.body.cbf_code !== undefined) {
@@ -1582,6 +1789,7 @@ router.post('/factory/admin/messages/:id/reply', requireAuth, requireAdmin,
 );
 
 // POST /api/products/factory/chat-upload — CBAI sohbetine dosya yukle (giris yapmis kullanici)
+// fix10b: ChinaBazaar WorkShop fabrika jetonu (role 'factory') de kabul edilir.
 // On yuz FormData ile gonderir (alan: `file`); ham dosya govdesi de kabul edilir.
 // Multer pakette yok — multipart siniri (boundary) elle cozumlenir, yeni bagimlilik yok.
 // fix6: resim (jpg/png/webp/gif) + PDF + Excel (xls/xlsx), en fazla 10MB, sihirli bayt
@@ -1660,7 +1868,7 @@ function rawBodyParser(opts) {
 
 router.post(
   '/factory/chat-upload',
-  requireAuth,
+  requireUserOrFactoryAuth,
   rawBodyParser({ type: '*/*', limit: '11mb' }),
   asyncHandler(async (req, res) => {
     const ct = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();

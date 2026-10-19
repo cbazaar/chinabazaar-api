@@ -1,18 +1,39 @@
 // Admin yönetim API'leri: kullanıcılar + yorum moderasyonu.
-// Tüm route'lar requireAuth + requireAdmin gerektirir.
+// Tüm route'lar requireAuth + requireAdmin gerektirir (fix10b: POST /stream-upload-url + POST /stream-download-url, ChinaBazaar WorkShop fabrika jetonunu da kabul eder).
 const express = require('express');
 const { param, body } = require('express-validator');
 const asyncHandler = require('../middleware/asyncHandler');
 const { checkValidation } = require('../middleware/validate');
 const { requireAuth } = require('../middleware/auth');
 const { requireAdmin } = require('../middleware/admin');
+const jwt = require('jsonwebtoken');
+const appCfg = require('../config');
 const pool = require('../db');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
 const router = express.Router();
-router.use(requireAuth, requireAdmin);
+// fix10b: Tum route'lar requireAuth + requireAdmin gerektirir — TEK ISTISNA:
+// POST /stream-upload-url + POST /stream-download-url, ChinaBazaar WorkShop fabrika
+// jetonunu (role 'factory') de kabul eder (WorkShop video yukleme: Cloudflare Stream).
+// Fabrika jetonu baska hicbir admin rotasinda calismaz (403) — /upload-video DAHIL.
+// Normal kullanici jetonu Stream uclarinda 403 almaya DEVAM EDER (yalnizca admin + fabrika).
+// Jetonsuz/bozuk => 401. Diger tum rotalarda davranis aynen.
+function requireAdminOrFactory(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'unauthorized' });
+  let payload;
+  try { payload = jwt.verify(token, appCfg.jwtSecret); } catch { return res.status(401).json({ error: 'invalid_token' }); }
+  if (payload && payload.role === 'factory' && Number.isInteger(payload.factory_id)) {
+    if (req.method === 'POST' && (req.path === '/stream-upload-url' || req.path === '/stream-download-url')) { req.factoryId = payload.factory_id; return next(); }
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  if (payload && payload.sub) { req.user = { id: payload.sub, email: payload.email }; return requireAdmin(req, res, next); }
+  return res.status(401).json({ error: 'unauthorized' });
+}
+router.use(requireAdminOrFactory);
 
 // GET /api/admin/users — kayıtlı profiller (?source=myfactory|shop filtresi)
 router.get(
@@ -669,9 +690,27 @@ async function cfStreamCall(accountId, token, path, method, body) {
 }
 
 // POST /api/admin/stream-upload-url — Cloudflare direct_upload: {uploadURL, uid}
+// fix10b: ChinaBazaar WorkShop fabrika jetonu da kabul edilir. Fabrika yolunda govde
+// { filename, size, mime } ZORUNLU ve backend tarafinda dogrulanir (MP4/WebM/MOV, <=200MB).
+// Admin yolunda govde zorunlu degildir (mevcut davranis aynen: '{}' gecer).
 router.post(
   '/stream-upload-url',
-  asyncHandler(async (_req, res) => {
+  asyncHandler(async (req, res) => {
+    if (req.factoryId !== undefined) {
+      const b = req.body || {};
+      const filename = typeof b.filename === 'string' ? b.filename.trim() : '';
+      const mime = typeof b.mime === 'string' ? b.mime.trim().toLowerCase() : '';
+      const size = b.size;
+      const extMatch = /\.([A-Za-z0-9]+)$/.exec(filename);
+      const ext = extMatch ? extMatch[1].toLowerCase() : '';
+      const STREAM_EXT_MIME = { mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime' };
+      if (!ext || !STREAM_EXT_MIME[ext] || STREAM_EXT_MIME[ext] !== mime) {
+        return res.status(400).json({ error: 'invalid_video_format', message: 'Yalnızca MP4, WebM veya MOV video yükleyebilirsiniz.' });
+      }
+      if (typeof size !== 'number' || !Number.isFinite(size) || size <= 0 || size > 200 * 1024 * 1024) {
+        return res.status(400).json({ error: 'file_too_large', message: 'Video 200 MB’dan büyük olamaz.' });
+      }
+    }
     const cfg = cfStreamCfg();
     if (!cfg) return res.status(503).json({ error: 'stream_not_configured' });
     let out;
@@ -689,7 +728,7 @@ router.post(
   })
 );
 
-// POST /api/admin/stream-download-url {uid} — MP4 indirme adresi: {url, status}
+// POST /api/admin/stream-download-url {uid} — MP4 indirme adresi: {url, status} (fix10b: WorkShop fabrika jetonu da kabul edilir)
 router.post(
   '/stream-download-url',
   asyncHandler(async (req, res) => {
