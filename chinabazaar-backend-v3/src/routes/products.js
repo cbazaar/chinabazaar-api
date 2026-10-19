@@ -4,6 +4,8 @@
 // fix10e: H-B göç (transaction + doğrulama + DROP yoksa yapılmaz), H-E CBAI master
 // fix10h: CBOs26.4 — /myfactory/stats: gunluk seri (daily) + ulke dagilimi (countries); /factory/video-view: olay kaydi (ulke basliktan).
 // fix10i: CBOs26.5 — bildirimler: factory_messages/factory_quotes + seen_by_factory; GET/POST /myfactory/notifications[/read]; videos.description korunur.
+// fix10j: CBOs26.7 — /myfactory/stats: total_page_visitors; POST /factory/page-view (sayfa ziyareti olay+sayaç, video-view deseniyle).
+//   + KRİTİK DÜZELTME: stats handler'da fname tanımsızdı (fix10h'te gelen regresyon — stats 500 veriyordu); SELECT'e name eklendi + fname tanımlandı.
 // fix10g: /myfactory/stats — toplamlar (total_videos, total_likes) + video başına like_count (factory_likes).
 // (sub+jti, 1 gün, denetim kaydı), L1 dummy hash 12 + uzunluk erken dönüşü yok,
 // L2 jenerik yanıtlar, L3 'cbai' rezerve, L4 şifre politikası, L7 SSRF engeli,
@@ -500,6 +502,11 @@ async function ensureFactoryTables() {
   // gecmise donuk gun/ulke bilgisi tasimaz; olaylar bu surumden itibaren birikir. Eski izlenmeler yalnizca toplamda kalir.
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_video_view_events (id SERIAL PRIMARY KEY, video TEXT NOT NULL DEFAULT '', country TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ DEFAULT now())`);
   await pool.query(`CREATE INDEX IF NOT EXISTS factory_video_view_events_video_idx ON factory_video_view_events (video)`);
+  // CBOs26.7 (fix10j): SAYFA ZİYARETİ — fabrika sayfasının toplam ziyaretçisi (yalnızca kendi fabrikası). Video-view deseniyle:
+  // olay satırı + sayaç; olaylar bu sürümden itibaren birikir, öncesi 0 görünür. FK yok (taze DB'de factories sırası sorunu çıkmasın).
+  await pool.query(`CREATE TABLE IF NOT EXISTS factory_page_views (factory_id INT PRIMARY KEY, visits INT NOT NULL DEFAULT 0)`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS factory_page_view_events (id SERIAL PRIMARY KEY, factory_id INT NOT NULL DEFAULT 0, country TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ DEFAULT now())`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS factory_page_view_events_factory_idx ON factory_page_view_events (factory_id)`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_ratings (id SERIAL PRIMARY KEY, factory_id INT NOT NULL REFERENCES factories(id) ON DELETE CASCADE, user_id TEXT NOT NULL, rating INT NOT NULL CHECK (rating BETWEEN 1 AND 5), created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now(), UNIQUE(factory_id, user_id))`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_subscriptions (id SERIAL PRIMARY KEY, user_id TEXT NOT NULL, status TEXT DEFAULT 'pending', started_at TIMESTAMPTZ, ends_at TIMESTAMPTZ, paytr_merchant_oid TEXT UNIQUE, amount INT, currency TEXT DEFAULT 'USD', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now())`);
   // Abonelik/VIP: admin_grant tamamlayici abonelik icin plan/provider/expires_at.
@@ -1081,6 +1088,23 @@ router.post('/factory/video-view', asyncHandler(async (req, res) => {
   res.json({ video, views: rows[0].views });
 }));
 
+// CBOs26.7 (fix10j): POST /api/products/factory/page-view {factory_id} — fabrika sayfasi ziyareti +1 (herkese acik, kimlik yok).
+// Video-view deseniyle: sayaç + olay satiri. Oturum basina bir kez sayim icin istemci sessionStorage ile tek sefer gonderir;
+// sunucu her istegi sayar (tekrar gonderim istemci tarafinda engellenir). Bilinmeyen fabrika -> 404.
+router.post('/factory/page-view', asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const fid = Number(req.body && req.body.factory_id);
+  if (!Number.isInteger(fid) || fid < 1) return res.status(400).json({ error: 'invalid_factory_id' });
+  const { rows: f } = await pool.query('SELECT id FROM factories WHERE id = $1', [fid]);
+  if (!f.length) return res.status(404).json({ error: 'factory_not_found' });
+  const { rows } = await pool.query(
+    `INSERT INTO factory_page_views (factory_id, visits) VALUES ($1, 1) ON CONFLICT (factory_id) DO UPDATE SET visits = factory_page_views.visits + 1 RETURNING visits`,
+    [fid]
+  );
+  try { await pool.query(`INSERT INTO factory_page_view_events (factory_id, country) VALUES ($1, $2)`, [fid, factoryViewCountry(req)]); } catch (e) { /* olay kaydi sayaci bozmaz */ }
+  res.json({ factory_id: fid, visits: rows[0].visits });
+}));
+
 // GET /api/products/factory/comments?video=F-V — en yeni 50 yorum (herkese acik)
 router.get('/factory/comments', asyncHandler(async (req, res) => {
   await ensureFactoryTables();
@@ -1446,8 +1470,10 @@ router.get('/factory/myfactory/stats', requireFactoryOrMasterAuth, asyncHandler(
     fid = Number(String(q).trim());
     if (!Number.isInteger(fid) || fid < 1) return res.status(400).json({ error: 'invalid_factory_id' });
   } else fid = req.factoryId;
-  const { rows: frows } = await pool.query('SELECT id, videos FROM factories WHERE id = $1', [fid]);
+  const { rows: frows } = await pool.query('SELECT id, name, videos FROM factories WHERE id = $1', [fid]);
   if (!frows.length) return res.status(404).json({ error: 'factory_not_found' });
+  // CBOs26.7 (fix10j): fname tanimsizdi (stats 500) — artik SELECT'te name var + burada tanimli.
+  const fname = String(frows[0].name || '').trim().toLowerCase();
   const videos = Array.isArray(frows[0].videos) ? frows[0].videos : [];
   const keys = videos.map((v, i) => fid + '-' + i);
   const viewMap = {};
@@ -1489,7 +1515,10 @@ router.get('/factory/myfactory/stats', requireFactoryOrMasterAuth, asyncHandler(
   const daily = mergeDailySeries(days, viewRows, likeRows, commentRows, quoteRows);
   let countries = [];
   if (keys.length) { try { const r = await pool.query(`SELECT country, COUNT(*)::int AS views FROM factory_video_view_events WHERE video = ANY($1) AND country <> '' GROUP BY country ORDER BY views DESC LIMIT 20`, [keys]); countries = r.rows; } catch (e) { countries = []; } }
-  res.json({ factory_id: fid, total_videos: videos.length, total_views: totalViews, total_comments: totalComments, total_likes: totalLikes, quote_count: qmap[fid] || 0, videos: perVideo, most_watched: mostWatched, commented_videos: commented, daily: daily, countries: countries });
+  // CBOs26.7 (fix10j): toplam site ziyaretcisi (yalnizca bu fabrika). Tablo yoksa (eski DB) 0 — akis bozulmaz.
+  let totalPageVisitors = 0;
+  try { const { rows: pv } = await pool.query('SELECT visits FROM factory_page_views WHERE factory_id = $1', [fid]); totalPageVisitors = (pv[0] && pv[0].visits) || 0; } catch (e) { totalPageVisitors = 0; }
+  res.json({ factory_id: fid, total_videos: videos.length, total_views: totalViews, total_comments: totalComments, total_likes: totalLikes, total_page_visitors: totalPageVisitors, quote_count: qmap[fid] || 0, videos: perVideo, most_watched: mostWatched, commented_videos: commented, daily: daily, countries: countries });
 }));
 
 // CBOs26.2 — GET /api/products/factory/myfactory/messages — kendi fabrikasina yazilan musteri konusmalari (kullaniciya gore gruplu).
