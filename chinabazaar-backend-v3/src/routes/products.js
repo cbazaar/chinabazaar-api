@@ -660,6 +660,11 @@ function isAllowedFactoryMediaUrl(u) {
   if (typeof u !== 'string') return false;
   const t = u.trim();
   if (!/^https:\/\//i.test(t)) return false;
+  // CBOs26.2: chat-upload dondurdugu sohbet dosyasi URL'i (kendi API konagimizdaki
+  // /api/products/factory/chat-file/<id>/<32hex> yolu) kapak olarak kabul edilir.
+  // Jeton tahmin edilemez; baska konakta bu yol olu bir baglantidir, guvenlik acigi degildir.
+  // (fix10e'de bu eksikti: fabrika chat-upload ile yukledigi kapagi kaydedemiyordu — 400.)
+  if (/^https:\/\/[^/]+\/api\/products\/factory\/chat-file\/\d+\/[a-f0-9]{32}$/i.test(t)) return true;
   let host = '';
   try { host = new URL(t).hostname.toLowerCase(); } catch { return false; }
   if (FACTORY_MEDIA_HOSTS.has(host)) return true;
@@ -1380,6 +1385,136 @@ router.put('/factory/myfactory/profile', requireFactoryOrMasterAuth, asyncHandle
   res.json(toFactoryMyFactory(rows[0]));
 }));
 
+// CBOs26.2 — GET /api/products/factory/myfactory/quotes — kendi fabrikasina gelen teklifler.
+// Fabrika tokeni -> yalnizca kendi fabrikasi; master -> ?factory_id= zorunlu.
+// Eski teklifler (factory_id NULL) fabrika adiyla eslesirse dahil edilir (quote-counts deseni).
+router.get('/factory/myfactory/quotes', requireFactoryOrMasterAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryQuotesTable();
+  let fid;
+  if (req.isMaster) {
+    const q = req.query.factory_id;
+    if (q === undefined || q === null || String(q).trim() === '') return res.status(400).json({ error: 'factory_id_required', message: 'Master icin factory_id gerekli.' });
+    fid = Number(String(q).trim());
+    if (!Number.isInteger(fid) || fid < 1) return res.status(400).json({ error: 'invalid_factory_id' });
+  } else fid = req.factoryId;
+  const { rows: frows } = await pool.query('SELECT id, name FROM factories WHERE id = $1', [fid]);
+  if (!frows.length) return res.status(404).json({ error: 'factory_not_found' });
+  const fname = String(frows[0].name || '').trim().toLowerCase();
+  const { rows } = await pool.query(
+    `SELECT id, factory, factory_id, name, contact, qty, msg, created_at FROM factory_quotes WHERE factory_id = $1 OR (factory_id IS NULL AND factory <> '' AND LOWER(TRIM(factory)) = $2) ORDER BY created_at DESC, id DESC`,
+    [fid, fname]
+  );
+  res.json({ quotes: rows });
+}));
+
+// CBOs26.2 — GET /api/products/factory/myfactory/stats — kendi fabrikasinin GERCEK istatistigi:
+// video basina izlenme + yorum sayisi, en cok izlenenler, yorum alan videolar. Uydurma sayi yok.
+router.get('/factory/myfactory/stats', requireFactoryOrMasterAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  let fid;
+  if (req.isMaster) {
+    const q = req.query.factory_id;
+    if (q === undefined || q === null || String(q).trim() === '') return res.status(400).json({ error: 'factory_id_required', message: 'Master icin factory_id gerekli.' });
+    fid = Number(String(q).trim());
+    if (!Number.isInteger(fid) || fid < 1) return res.status(400).json({ error: 'invalid_factory_id' });
+  } else fid = req.factoryId;
+  const { rows: frows } = await pool.query('SELECT id, videos FROM factories WHERE id = $1', [fid]);
+  if (!frows.length) return res.status(404).json({ error: 'factory_not_found' });
+  const videos = Array.isArray(frows[0].videos) ? frows[0].videos : [];
+  const keys = videos.map((v, i) => fid + '-' + i);
+  const viewMap = {};
+  if (keys.length) {
+    const { rows } = await pool.query('SELECT video, views FROM factory_video_views WHERE video = ANY($1)', [keys]);
+    for (const r of rows) viewMap[r.video] = r.views;
+  }
+  const commentMap = {};
+  if (keys.length) {
+    const { rows } = await pool.query(`SELECT video_key, COUNT(*)::int AS cnt FROM factory_comments WHERE video_key ~ $1 GROUP BY video_key`, ['^' + fid + '-[0-9]+$']);
+    for (const r of rows) commentMap[r.video_key] = r.cnt;
+  }
+  const perVideo = videos.map((v, i) => {
+    const key = fid + '-' + i;
+    return { index: i, key, title: (v && v.title) || '', url: (v && v.url) || '', views: viewMap[key] || 0, comment_count: commentMap[key] || 0 };
+  });
+  const totalViews = perVideo.reduce((a, v) => a + v.views, 0);
+  const totalComments = perVideo.reduce((a, v) => a + v.comment_count, 0);
+  const mostWatched = [...perVideo].sort((a, b) => b.views - a.views).slice(0, 5);
+  const commented = perVideo.filter((v) => v.comment_count > 0).sort((a, b) => b.comment_count - a.comment_count);
+  const qmap = await factoryQuoteCountsMap([fid]);
+  res.json({ factory_id: fid, total_views: totalViews, total_comments: totalComments, quote_count: qmap[fid] || 0, videos: perVideo, most_watched: mostWatched, commented_videos: commented });
+}));
+
+// CBOs26.2 — GET /api/products/factory/myfactory/messages — kendi fabrikasina yazilan musteri konusmalari (kullaniciya gore gruplu).
+// Fabrika tokeni -> yalnizca kendi fabrikasi (factory_id = token). Eski/global mesajlar (factory_id NULL) hicbir fabrikaya gosterilmez.
+// Master -> ?factory_id= zorunlu.
+router.get('/factory/myfactory/messages', requireFactoryOrMasterAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryMessagesTable();
+  let fid;
+  if (req.isMaster) {
+    const q = req.query.factory_id;
+    if (q === undefined || q === null || String(q).trim() === '') return res.status(400).json({ error: 'factory_id_required', message: 'Master icin factory_id gerekli.' });
+    fid = Number(String(q).trim());
+    if (!Number.isInteger(fid) || fid < 1) return res.status(400).json({ error: 'invalid_factory_id' });
+  } else fid = req.factoryId;
+  const { rows } = await pool.query(
+    `SELECT m.id, m.user_id, m.body, m.sender, m.attachment_url, m.kind, m.attachment_name, m.attachment_size, m.attachment_mime, m.factory_id, m.created_at,
+            COALESCE(NULLIF(u.nickname,''), NULLIF(u.name,''), split_part(u.email,'@',1), 'Misafir') AS name
+     FROM factory_messages m LEFT JOIN users u ON u.id::text = m.user_id::text
+     WHERE m.factory_id = $1 ORDER BY m.user_id ASC, m.created_at ASC, m.id ASC`,
+    [fid]
+  );
+  const byUser = new Map();
+  for (const r of rows) {
+    if (!byUser.has(r.user_id)) byUser.set(r.user_id, { user_id: r.user_id, name: r.name || 'Misafir', messages: [] });
+    byUser.get(r.user_id).messages.push({ id: r.id, body: r.body, sender: r.sender, attachment_url: r.attachment_url || null, kind: r.kind || 'text', attachment_name: r.attachment_name || null, attachment_size: r.attachment_size ?? null, attachment_mime: r.attachment_mime || null, factory_id: r.factory_id, created_at: r.created_at });
+  }
+  res.json({ conversations: [...byUser.values()] });
+}));
+
+// CBOs26.2 — POST /api/products/factory/myfactory/messages/:id/reply — fabrika musteriye cevap verir (sender='factory'); :id = user_id.
+// Yalniz bu fabrikaya yazmis musteriye cevap verilebilir (konusma yoksa 404 — rastgele kullaniciya yazilmaz).
+router.post('/factory/myfactory/messages/:id/reply', requireFactoryOrMasterAuth,
+  param('id').isString().trim().isLength({ min: 1, max: 100 }),
+  body('body').optional().trim().isLength({ max: 1000 }),
+  body('attachment_url').optional().isString().isLength({ max: 2048 }),
+  body('kind').optional().isIn(['text', 'image', 'file', 'video']),
+  body('attachment_name').optional().isString().isLength({ max: 200 }),
+  body('attachment_size').optional().isInt({ min: 0, max: 10485760 }),
+  body('attachment_mime').optional().isString().isLength({ max: 100 }),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    await ensureFactoryMessagesTable();
+    let fid;
+    if (req.isMaster) {
+      const fromBody = req.body.factory_id;
+      const fromQuery = req.query.factory_id;
+      const hasBody = fromBody !== undefined && fromBody !== null && String(fromBody).trim() !== '';
+      const hasQuery = fromQuery !== undefined && fromQuery !== null && String(fromQuery).trim() !== '';
+      if (!hasBody && !hasQuery) return res.status(400).json({ error: 'factory_id_required', message: 'Master icin factory_id gerekli.' });
+      if (hasBody && hasQuery && Number(String(fromBody).trim()) !== Number(String(fromQuery).trim())) return res.status(400).json({ error: 'factory_id_mismatch' });
+      fid = Number(String(hasBody ? fromBody : fromQuery).trim());
+      if (!Number.isInteger(fid) || fid < 1) return res.status(400).json({ error: 'invalid_factory_id' });
+    } else fid = req.factoryId;
+    const userId = String(req.params.id);
+    const { rows: conv } = await pool.query('SELECT id FROM factory_messages WHERE factory_id = $1 AND user_id = $2 LIMIT 1', [fid, userId]);
+    if (!conv.length) return res.status(404).json({ error: 'conversation_not_found' });
+    const text = (req.body.body || '').trim();
+    const att = cleanChatAttachment(req.body);
+    if (!att.ok) return res.status(att.status).json({ error: att.error });
+    // fix10e M5: sohbet dosyasi eki baskasina ait olamaz (fabrika dosyasi: 'factory:<id>'; master dosyasi: 'cbai:master').
+    if (att.attachmentUrl && att.attachmentUrl.startsWith('/api/products/factory/chat-file/')) {
+      const own = await chatFileOwnedBy(att.attachmentUrl, req.isMaster ? 'cbai:master' : 'factory:' + fid);
+      const factoryOwn = req.isMaster ? await chatFileOwnedBy(att.attachmentUrl, 'factory:' + fid) : false;
+      if (!own && !factoryOwn) return res.status(403).json({ error: 'forbidden' });
+    }
+    const { rows } = await pool.query(
+      `INSERT INTO factory_messages (user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, factory_id) VALUES ($1, $2, 'factory', $3, $4, $5, $6, $7, $8) RETURNING id, user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, factory_id, created_at`,
+      [userId, text, att.attachmentUrl, att.kind, att.name, att.size, att.mime, fid]
+    );
+    res.status(201).json({ message: rows[0] });
+  })
+);
+
 // POST /api/products/factory/:id/rate — fabrika puanlama (1-5). Giris gerekli, abonelik gerekmez. Ayni kullanici tekrar puan verirse guncellenir.
 router.post('/factory/:id/rate', requireAuth, asyncHandler(async (req, res) => {
   await ensureFactoryTables();
@@ -1942,6 +2077,9 @@ async function ensureFactoryMessagesTable() {
   // Tum sutunlar ADD COLUMN IF NOT EXISTS ile guvenceye alinir (products marketplace/warranty deseni).
   await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS body TEXT NOT NULL DEFAULT ''`);
   await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS sender TEXT NOT NULL DEFAULT 'user'`);
+  // CBOs26.2: mesajin hangi fabrikaya ait oldugu (fabrika paneli sohbeti icin).
+  // NULL = eski/global mesaj (yalniz admin gorur, hicbir fabrika gormez).
+  try { await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS factory_id INT`); } catch (e) { /* yoksay */ }
   await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS attachment_url TEXT`);
   await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'text'`);
 // fix6: dosya eki meta alanlari (PDF/Excel/resim) — her biri kendi try/catch'inde, e-posta deseni.
@@ -2032,9 +2170,18 @@ router.post('/factory/messages', requireAuth, factorySpamLimiter,
   body('attachment_name').optional().isString().isLength({ max: 200 }),
   body('attachment_size').optional().isInt({ min: 0, max: 10485760 }),
   body('attachment_mime').optional().isString().isLength({ max: 100 }),
+  body('factory_id').optional().isInt({ min: 1 }),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     await ensureFactoryMessagesTable();
+    // CBOs26.2: fabrika kapsamli mesaj (fabrika sayfasindan gonderildiyse).
+    let msgFactoryId = null;
+    if (req.body.factory_id !== undefined && req.body.factory_id !== null && req.body.factory_id !== '') {
+      msgFactoryId = Number(req.body.factory_id);
+      if (!Number.isInteger(msgFactoryId) || msgFactoryId < 1) return res.status(400).json({ error: 'invalid_factory_id' });
+      const { rows: frows } = await pool.query('SELECT id FROM factories WHERE id = $1', [msgFactoryId]);
+      if (!frows.length) return res.status(400).json({ error: 'factory_not_found' });
+    }
     const text = (req.body.body || '').trim();
     const att = cleanChatAttachment(req.body);
     if (!att.ok) return res.status(att.status).json({ error: att.error });
@@ -2043,8 +2190,8 @@ router.post('/factory/messages', requireAuth, factorySpamLimiter,
       if (!(await chatFileOwnedBy(att.attachmentUrl, req.user.id))) return res.status(403).json({ error: 'forbidden' });
     }
     const { rows } = await pool.query(
-      `INSERT INTO factory_messages (user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime) VALUES ($1, $2, 'user', $3, $4, $5, $6, $7) RETURNING id, user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, created_at`,
-      [req.user.id, text, att.attachmentUrl, att.kind, att.name, att.size, att.mime]
+      `INSERT INTO factory_messages (user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, factory_id) VALUES ($1, $2, 'user', $3, $4, $5, $6, $7, $8) RETURNING id, user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, factory_id, created_at`,
+      [req.user.id, text, att.attachmentUrl, att.kind, att.name, att.size, att.mime, msgFactoryId]
     );
     res.status(201).json({ message: rows[0] });
   })
@@ -2054,7 +2201,7 @@ router.post('/factory/messages', requireAuth, factorySpamLimiter,
 router.get('/factory/messages', requireAuth, asyncHandler(async (req, res) => {
   await ensureFactoryMessagesTable();
   const { rows } = await pool.query(
-    `SELECT id, user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, created_at FROM factory_messages WHERE user_id=$1 ORDER BY created_at ASC, id ASC`,
+    `SELECT m.id, m.user_id, m.body, m.sender, m.attachment_url, m.kind, m.attachment_name, m.attachment_size, m.attachment_mime, m.factory_id, f.name AS factory_name, m.created_at FROM factory_messages m LEFT JOIN factories f ON f.id = m.factory_id WHERE m.user_id=$1 ORDER BY m.created_at ASC, m.id ASC`,
     [req.user.id]
   );
   res.json({ messages: rows });
