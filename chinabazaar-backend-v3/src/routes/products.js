@@ -2685,7 +2685,11 @@ router.post(
     // Uzanti + MIME capraz dogrulama (multipart'ta dosya adi varsa): uzanti MIME ile eslesmeli.
     if (file.filename) {
       const extMatch = /\.([A-Za-z0-9]+)$/.exec(file.filename.trim());
-      if (!extMatch || CHAT_UPLOAD_MIME[mime] !== extMatch[1].toLowerCase()) return res.status(400).json({ error: 'unsupported_file_type' });
+      // fix10m (CBOs26.19): .jpeg uzantısı image/jpeg için kabul edilir (jpg takma adı).
+      const extLower = extMatch ? extMatch[1].toLowerCase() : '';
+      const expectedExt = CHAT_UPLOAD_MIME[mime];
+      const extOk = !!extMatch && (expectedExt === extLower || (expectedExt === 'jpg' && extLower === 'jpeg'));
+      if (!extOk) return res.status(400).json({ error: 'unsupported_file_type' });
     }
     // fix7: dosya diske DEGIL Postgres'e yazilir (Railway diski her redeploy'da silinir).
     await ensureFactoryMessagesTable();
