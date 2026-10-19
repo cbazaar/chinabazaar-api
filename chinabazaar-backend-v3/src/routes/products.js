@@ -5,6 +5,10 @@
 // fix10h: CBOs26.4 — /myfactory/stats: gunluk seri (daily) + ulke dagilimi (countries); /factory/video-view: olay kaydi (ulke basliktan).
 // fix10i: CBOs26.5 — bildirimler: factory_messages/factory_quotes + seen_by_factory; GET/POST /myfactory/notifications[/read]; videos.description korunur.
 // fix10j: CBOs26.7 — /myfactory/stats: total_page_visitors; POST /factory/page-view (sayfa ziyareti olay+sayaç, video-view deseniyle).
+// fix10k: CBOs26.15 — fabrika takip (follow): factory_follows tablosu; POST /factory/:id/follow,
+//   DELETE /factory/:id/unfollow, GET /factory/:id/follow-status, GET /factory/feed (takip edilenlerin videolari);
+//   /factory/list + GET /factory/:id yanitlarina followers. GET /factory/:id (herkese acik tek fabrika) bu surumde eklendi
+//   (tabanda yoktu; madde 6 + "detay/listede" testi geregi).
 //   + KRİTİK DÜZELTME: stats handler'da fname tanımsızdı (fix10h'te gelen regresyon — stats 500 veriyordu); SELECT'e name eklendi + fname tanımlandı.
 // fix10g: /myfactory/stats — toplamlar (total_videos, total_likes) + video başına like_count (factory_likes).
 // (sub+jti, 1 gün, denetim kaydı), L1 dummy hash 12 + uzunluk erken dönüşü yok,
@@ -508,6 +512,13 @@ async function ensureFactoryTables() {
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_page_view_events (id SERIAL PRIMARY KEY, factory_id INT NOT NULL DEFAULT 0, country TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ DEFAULT now())`);
   await pool.query(`CREATE INDEX IF NOT EXISTS factory_page_view_events_factory_idx ON factory_page_view_events (factory_id)`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_ratings (id SERIAL PRIMARY KEY, factory_id INT NOT NULL REFERENCES factories(id) ON DELETE CASCADE, user_id TEXT NOT NULL, rating INT NOT NULL CHECK (rating BETWEEN 1 AND 5), created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now(), UNIQUE(factory_id, user_id))`);
+  // fix10k (CBOs26.15): fabrika takip — giris yapmis kullanici fabrikayi takip eder. user_id TEXT (likes/favorites deseni);
+  // factory silinince takipler CASCADE ile gider (ratings deseni). UNIQUE(user_id, factory_id) = idempotent follow.
+  await pool.query(`CREATE TABLE IF NOT EXISTS factory_follows (id SERIAL PRIMARY KEY, user_id TEXT NOT NULL, factory_id INT NOT NULL REFERENCES factories(id) ON DELETE CASCADE, created_at TIMESTAMPTZ DEFAULT now(), UNIQUE(user_id, factory_id))`);
+  // Tekrarli (user_id, factory_id) satirlari UNIQUE index'i kurmayi engeller — once tekillestir (v115 likes/favorites deseni).
+  await pool.query(`DELETE FROM factory_follows a USING factory_follows b WHERE a.id < b.id AND a.user_id = b.user_id AND a.factory_id = b.factory_id`);
+  try { await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS factory_follows_user_factory_uidx ON factory_follows (user_id, factory_id)`); } catch (e) { /* eski semada index kurulamazsa akis bozulmaz */ }
+  await pool.query(`CREATE INDEX IF NOT EXISTS factory_follows_factory_idx ON factory_follows (factory_id)`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_subscriptions (id SERIAL PRIMARY KEY, user_id TEXT NOT NULL, status TEXT DEFAULT 'pending', started_at TIMESTAMPTZ, ends_at TIMESTAMPTZ, paytr_merchant_oid TEXT UNIQUE, amount INT, currency TEXT DEFAULT 'USD', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now())`);
   // Abonelik/VIP: admin_grant tamamlayici abonelik icin plan/provider/expires_at.
   // Eski (odemeli) satirlarda yalniz ends_at dolu olabilir — /me ikisini COALESCE ile okur,
@@ -850,6 +861,16 @@ async function factoryQuoteCountsMap(ids) {
   for (const f of facs) nameToId[String(f.name || '').trim().toLowerCase()] = f.id;
   const { rows: legacy } = await pool.query(`SELECT LOWER(TRIM(factory)) AS fname, COUNT(*)::int AS cnt FROM factory_quotes WHERE factory_id IS NULL AND factory <> '' GROUP BY LOWER(TRIM(factory))`);
   for (const r of legacy) { const fid = nameToId[r.fname]; if (fid) map[fid] = (map[fid] || 0) + r.cnt; }
+  return map;
+}
+
+// fix10k (CBOs26.15): fabrika takipci sayilari — tek sorgu, N+1 yok. Takip yoksa 0 (ratings deseni).
+async function factoryFollowersMap(ids) {
+  const map = {};
+  const list = (ids || []).filter((x) => Number.isInteger(x));
+  if (!list.length) return map;
+  const { rows } = await pool.query('SELECT factory_id, COUNT(*)::int AS cnt FROM factory_follows WHERE factory_id = ANY($1) GROUP BY factory_id', [list]);
+  for (const r of rows) map[r.factory_id] = r.cnt;
   return map;
 }
 
@@ -1702,7 +1723,8 @@ router.get('/factory/list', asyncHandler(async (req, res) => {
   const { rows } = await pool.query(`SELECT * FROM factories WHERE is_active IS NOT FALSE ORDER BY id ASC`);
   const rmap = await factoryRatingsMap(rows.map((r) => r.id));
   const qmap = await factoryQuoteCountsMap(rows.map((r) => r.id));
-  res.json(rows.map((r) => ({ ...toFactoryPublic(r, { includeContact: false }), rating_avg: (rmap[r.id] && rmap[r.id].rating_avg !== undefined) ? rmap[r.id].rating_avg : null, rating_count: (rmap[r.id] && rmap[r.id].rating_count) || 0, quote_count: qmap[r.id] || 0 }))); // fix10e M7
+  const fmap = await factoryFollowersMap(rows.map((r) => r.id)); // fix10k: takipci sayisi
+  res.json(rows.map((r) => ({ ...toFactoryPublic(r, { includeContact: false }), rating_avg: (rmap[r.id] && rmap[r.id].rating_avg !== undefined) ? rmap[r.id].rating_avg : null, rating_count: (rmap[r.id] && rmap[r.id].rating_count) || 0, quote_count: qmap[r.id] || 0, followers: fmap[r.id] || 0 }))); // fix10e M7
 }));
 
 // GET /api/products/factory/quote-counts — her fabrikanin toplam teklif sayisi (herkese acik istatistik)
@@ -1711,6 +1733,83 @@ router.get('/factory/quote-counts', asyncHandler(async (req, res) => {
   const { rows } = await pool.query(`SELECT id FROM factories WHERE is_active IS NOT FALSE ORDER BY id ASC`);
   const counts = await factoryQuoteCountsMap(rows.map((r) => r.id));
   res.json({ counts });
+}));
+
+// fix10k (CBOs26.15): fabrika takip (follow). Giris gerekli (misafir 401 — requireAuth).
+// user_id HER ZAMAN req.user'dan (token); govdeden id alinmaz. Olmayan fabrika -> 404.
+// POST /api/products/factory/:id/follow — idempotent: zaten takip ediyorsa satir degismez, sayi ayni kalir.
+router.post('/factory/:id/follow', requireAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const fid = parseInt(req.params.id, 10);
+  if (!Number.isInteger(fid) || fid < 1) return res.status(400).json({ error: 'invalid_factory' });
+  const { rows: f } = await pool.query('SELECT id FROM factories WHERE id=$1', [fid]);
+  if (!f.length) return res.status(404).json({ error: 'factory_not_found' });
+  await pool.query('INSERT INTO factory_follows (user_id, factory_id) VALUES ($1,$2) ON CONFLICT DO NOTHING', [req.user.id, fid]);
+  const { rows: c } = await pool.query('SELECT COUNT(*)::int AS n FROM factory_follows WHERE factory_id=$1', [fid]);
+  res.json({ following: true, followers: c[0].n });
+}));
+
+// DELETE /api/products/factory/:id/unfollow — takipten cikar (takip etmiyorsa da ayni yanit, idempotent).
+router.delete('/factory/:id/unfollow', requireAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const fid = parseInt(req.params.id, 10);
+  if (!Number.isInteger(fid) || fid < 1) return res.status(400).json({ error: 'invalid_factory' });
+  const { rows: f } = await pool.query('SELECT id FROM factories WHERE id=$1', [fid]);
+  if (!f.length) return res.status(404).json({ error: 'factory_not_found' });
+  await pool.query('DELETE FROM factory_follows WHERE user_id=$1 AND factory_id=$2', [req.user.id, fid]);
+  const { rows: c } = await pool.query('SELECT COUNT(*)::int AS n FROM factory_follows WHERE factory_id=$1', [fid]);
+  res.json({ following: false, followers: c[0].n });
+}));
+
+// GET /api/products/factory/:id/follow-status — giris yapan kullanici takip ediyor mu + toplam takipci.
+router.get('/factory/:id/follow-status', requireAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const fid = parseInt(req.params.id, 10);
+  if (!Number.isInteger(fid) || fid < 1) return res.status(400).json({ error: 'invalid_factory' });
+  const { rows: f } = await pool.query('SELECT id FROM factories WHERE id=$1', [fid]);
+  if (!f.length) return res.status(404).json({ error: 'factory_not_found' });
+  const { rows: m } = await pool.query('SELECT 1 FROM factory_follows WHERE user_id=$1 AND factory_id=$2', [req.user.id, fid]);
+  const { rows: c } = await pool.query('SELECT COUNT(*)::int AS n FROM factory_follows WHERE factory_id=$1', [fid]);
+  res.json({ following: m.length > 0, followers: c[0].n });
+}));
+
+// GET /api/products/factory/feed — giris yapan kullanicinin takip ettigi fabrikalarin videolari.
+// Siralama: takip zamani (factory_follows.created_at DESC, en yeni takip once). Video basina zaman damgasi
+// yok (videos JSONB dizisi); fabrika ici sira kayitli dizi sirasidir — uydurma tarih/sayi uretilmez, YALNIZCA gercek veri.
+// Sayfali: ?limit (varsayilan 20, en fazla 50) & ?offset. Kapali (is_active=false) fabrikalar akisa girmez.
+router.get('/factory/feed', requireAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  let limit = parseInt(req.query.limit, 10);
+  if (!Number.isInteger(limit) || limit < 1) limit = 20;
+  limit = Math.min(limit, 50);
+  let offset = parseInt(req.query.offset, 10);
+  if (!Number.isInteger(offset) || offset < 0) offset = 0;
+  const { rows } = await pool.query(
+    `SELECT f.id, f.name, f.cbf_code, f.cover_image, f.videos
+     FROM factory_follows ff JOIN factories f ON f.id = ff.factory_id
+     WHERE ff.user_id = $1 AND f.is_active IS NOT FALSE
+     ORDER BY ff.created_at DESC, ff.id DESC`,
+    [req.user.id]
+  );
+  const items = [];
+  for (const r of rows) {
+    let videos = r.videos;
+    if (typeof videos === 'string') { try { videos = JSON.parse(videos); } catch { videos = []; } }
+    if (!Array.isArray(videos)) videos = [];
+    for (const v of videos) {
+      if (!v || typeof v !== 'object' || Array.isArray(v)) continue;
+      const url = typeof v.url === 'string' ? v.url : '';
+      if (!url) continue;
+      items.push({
+        factory_id: r.id,
+        factory_name: r.name,
+        cbf_code: r.cbf_code || '',
+        cover_image: r.cover_image || '',
+        video: { title: typeof v.title === 'string' ? v.title : '', description: typeof v.description === 'string' ? v.description : '', url },
+      });
+    }
+  }
+  res.json({ items: items.slice(offset, offset + limit), total: items.length, limit, offset });
 }));
 
 // GET /api/products/factory/admin/list — tum fabrikalar + created_at (admin)
@@ -2629,6 +2728,25 @@ router.get('/factory/chat-file/:id/:token', asyncHandler(async (req, res) => {
   res.set('Content-Disposition', (req.query.download === '1' ? 'attachment' : 'inline') + '; filename="' + asciiName.replace(/"/g, '') + '"; filename*=UTF-8\'\'' + encodeURIComponent(safeName));
   if (f.size) res.set('Content-Length', String(f.size));
   res.send(f.data);
+}));
+
+// fix10k (CBOs26.15): GET /api/products/factory/:id — tek fabrika (herkese acik).
+// Bu rota tabanda YOKTU; madde 6 ("detay/listede followers") + test geregi eklendi.
+// KONUM KRITIK: tum tek-segment GET /factory/* rotalarindan (/factory/list, /factory/messages,
+// /factory/quotes, /factory/feed, /factory/chat-file/:id/:token) SONRA kayitli — once kayitli olsaydi
+// bunlari yutar (ornegin /factory/messages -> id="messages" -> 400) ve mevcut davranis bozulurdu.
+// /factory/:id/<eylem> (iki segment) rotalari bundan etkilenmez.
+router.get('/factory/:id', asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const fid = parseInt(req.params.id, 10);
+  if (!Number.isInteger(fid) || fid < 1) return res.status(400).json({ error: 'invalid_factory' });
+  const { rows } = await pool.query('SELECT * FROM factories WHERE id=$1 AND is_active IS NOT FALSE', [fid]);
+  if (!rows.length) return res.status(404).json({ error: 'factory_not_found' });
+  const r = rows[0];
+  const rmap = await factoryRatingsMap([r.id]);
+  const qmap = await factoryQuoteCountsMap([r.id]);
+  const fmap = await factoryFollowersMap([r.id]);
+  res.json({ ...toFactoryPublic(r, { includeContact: false }), rating_avg: (rmap[r.id] && rmap[r.id].rating_avg !== undefined) ? rmap[r.id].rating_avg : null, rating_count: (rmap[r.id] && rmap[r.id].rating_count) || 0, quote_count: qmap[r.id] || 0, followers: fmap[r.id] || 0 });
 }));
 
 // GET /api/products/:id
