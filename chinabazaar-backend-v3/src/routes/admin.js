@@ -1,5 +1,5 @@
-// Admin yönetim API'leri: kullanıcılar + yorum moderasyonu.
-// Tüm route'lar requireAuth + requireAdmin gerektirir (fix10b: POST /stream-upload-url + POST /stream-download-url, ChinaBazaar WorkShop fabrika jetonunu da kabul eder).
+// fix10c — Admin yönetim API'leri [fabrika giris adi My Factory; Stream uclari aynen]: kullanıcılar + yorum moderasyonu.
+// Tüm route'lar requireAuth + requireAdmin gerektirir (fix10c: POST /stream-upload-url + POST /stream-download-url, ChinaBazaar My Factory fabrika jetonunu da kabul eder).
 const express = require('express');
 const { param, body } = require('express-validator');
 const asyncHandler = require('../middleware/asyncHandler');
@@ -14,9 +14,9 @@ const path = require('path');
 const crypto = require('crypto');
 
 const router = express.Router();
-// fix10b: Tum route'lar requireAuth + requireAdmin gerektirir — TEK ISTISNA:
-// POST /stream-upload-url + POST /stream-download-url, ChinaBazaar WorkShop fabrika
-// jetonunu (role 'factory') de kabul eder (WorkShop video yukleme: Cloudflare Stream).
+// fix10c: Tum route'lar requireAuth + requireAdmin gerektirir — TEK ISTISNA:
+// POST /stream-upload-url + POST /stream-download-url, ChinaBazaar My Factory fabrika
+// jetonunu (role 'factory') de kabul eder (My Factory video yukleme: Cloudflare Stream).
 // Fabrika jetonu baska hicbir admin rotasinda calismaz (403) — /upload-video DAHIL.
 // Normal kullanici jetonu Stream uclarinda 403 almaya DEVAM EDER (yalnizca admin + fabrika).
 // Jetonsuz/bozuk => 401. Diger tum rotalarda davranis aynen.
@@ -690,7 +690,7 @@ async function cfStreamCall(accountId, token, path, method, body) {
 }
 
 // POST /api/admin/stream-upload-url — Cloudflare direct_upload: {uploadURL, uid}
-// fix10b: ChinaBazaar WorkShop fabrika jetonu da kabul edilir. Fabrika yolunda govde
+// fix10c: ChinaBazaar My Factory fabrika jetonu da kabul edilir. Fabrika yolunda govde
 // { filename, size, mime } ZORUNLU ve backend tarafinda dogrulanir (MP4/WebM/MOV, <=200MB).
 // Admin yolunda govde zorunlu degildir (mevcut davranis aynen: '{}' gecer).
 router.post(
@@ -728,7 +728,7 @@ router.post(
   })
 );
 
-// POST /api/admin/stream-download-url {uid} — MP4 indirme adresi: {url, status} (fix10b: WorkShop fabrika jetonu da kabul edilir)
+// POST /api/admin/stream-download-url {uid} — MP4 indirme adresi: {url, status} (fix10c: My Factory fabrika jetonu da kabul edilir)
 router.post(
   '/stream-download-url',
   asyncHandler(async (req, res) => {

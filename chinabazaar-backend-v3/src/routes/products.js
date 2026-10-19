@@ -1,6 +1,6 @@
-// FAZ 1 — WorkShop (fabrika girisi): fabrika kendi hesabiyla giris yapar, kendi kaydini duzenler.
+// fix10c — FAZ 1 — My Factory (fabrika girisi) [API /factory/myfactory/*, sutunlar myfactory_*; eski fabrika giris sutunlarindaki veri gocle tasinir]: fabrika kendi hesabiyla giris yapar, kendi kaydini duzenler.
 // JWT: { factory_id, role: 'factory' }, 7 gun. Sifre: auth.js ile AYNI bcryptjs hasher (cost 12).
-// Yasak alanlar (name, cbf_code, is_verified, is_active) WorkShop profilinde sessizce yoksayilir.
+// Yasak alanlar (name, cbf_code, is_verified, is_active) My Factory profilinde sessizce yoksayilir.
 // Ürün kataloğu — ön yüz (video akış) sözleşmesine uygun JSON döner:
 // { id, name, tagline, description, price_cents, price_display, currency,
 //   sold_count, stock, category: {id, slug, name}, video_url, thumb_url }
@@ -18,7 +18,7 @@ const cfg = require('../config');
 const { loginLimiter } = require('../middleware/rateLimit');
 
 // Fabrika yoksa bile karsilastirma yapilir (zamanlama ile kullanici sayimini zorlastirmak icin).
-const WORKSHOP_DUMMY_HASH = bcrypt.hashSync('__chinabazaar_no_such_workshop__', 10);
+const MYFACTORY_DUMMY_HASH = bcrypt.hashSync('__chinabazaar_no_such_myfactory__', 10);
 
 const rateLimit = require('express-rate-limit');
 const fs = require('fs');
@@ -498,11 +498,23 @@ async function ensureFactoryTables() {
   try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT FALSE`); } catch (e) { /* is_verified kolonu eklenemezse akis bozulmaz */ }
   // FACTORY EMAIL (fix5): fabrika e-posta adresi (opsiyonel, max 254, e-posta bicimi). Her ALTER kendi try/catch'indedir.
   try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS email TEXT`); } catch (e) { /* email kolonu eklenemezse akis bozulmaz */ }
-  // FAZ 1 — WorkShop giris hesabi: fabrika bazli kullanici adi (benzersiz) + sifre hash'i.
-  try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS workshop_username TEXT UNIQUE`); } catch (e) { /* workshop_username kolonu eklenemezse akis bozulmaz */ }
-  try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS workshop_password_hash TEXT`); } catch (e) { /* workshop_password_hash kolonu eklenemezse akis bozulmaz */ }
+  // fix10c — My Factory giris hesabi: fabrika bazli kullanici adi (benzersiz) + sifre hash'i.
+  // SIRA KRITIK (canlida eski fabrika giris verisi olabilir — veri kaybi YOK):
+  // 1) yeni myfactory_* sutunlarini ekle, 2) eski sutunlarda veri varsa
+  // yeni sutunlara KOPYALA, 3) eski sutunlari temizle.
+  // Eski sutun yoksa (yeni kurulum) kopyalama adimi sessizce atlanir; hicbir sorgu cokmez.
+  try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS myfactory_username TEXT UNIQUE`); } catch (e) { /* myfactory_username kolonu eklenemezse akis bozulmaz */ }
+  try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS myfactory_password_hash TEXT`); } catch (e) { /* myfactory_password_hash kolonu eklenemezse akis bozulmaz */ }
+  try {
+    const { rows: _mfCols } = await pool.query(`SELECT column_name FROM information_schema.columns WHERE table_name = 'factories' AND column_name IN ('workshop_username', 'workshop_password_hash')`);
+    const _mfHas = new Set(_mfCols.map((r) => r.column_name));
+    if (_mfHas.has('workshop_username')) { await pool.query(`UPDATE factories SET myfactory_username = workshop_username WHERE workshop_username IS NOT NULL AND (myfactory_username IS NULL OR myfactory_username <> workshop_username)`); }
+    if (_mfHas.has('workshop_password_hash')) { await pool.query(`UPDATE factories SET myfactory_password_hash = workshop_password_hash WHERE workshop_password_hash IS NOT NULL AND (myfactory_password_hash IS NULL OR myfactory_password_hash <> workshop_password_hash)`); }
+  } catch (e) { /* veri tasima hatasi akisi bozmaz — eski hesaplar bir sonraki cagrida tekrar denenir */ }
+  try { await pool.query(`ALTER TABLE factories DROP COLUMN IF EXISTS workshop_username`); } catch (e) { /* eski sutun yoksa / silinemezse akis bozulmaz */ }
+  try { await pool.query(`ALTER TABLE factories DROP COLUMN IF EXISTS workshop_password_hash`); } catch (e) { /* eski sutun yoksa / silinemezse akis bozulmaz */ }
   // Sutun daha once UNIQUE'siz olusmus olabilir — kucuk harfe duyarsiz benzersizlik icin ifade indexi (varsa yoksayilir).
-  try { await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS factories_workshop_username_uidx ON factories (LOWER(workshop_username))`); } catch (e) { /* index kurulamazsa akis bozulmaz */ }
+  try { await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS factories_myfactory_username_uidx ON factories (LOWER(myfactory_username))`); } catch (e) { /* index kurulamazsa akis bozulmaz */ }
   // v118: user_id tip onarimi — users.id UUID, ama fabrika tablolari user_id'yi INT diye
   // tanimlamisti; UUID'li kullaniciyla her user_id sorgusu 500 veriyordu. INT->TEXT
   // donusumu kayipsizdir (her INT metne cevrilir); TEXT kolonda tekrar calismak no-op'tur.
@@ -624,12 +636,12 @@ async function factoryQuoteCountsMap(ids) {
 }
 
 function toFactoryAdmin(r) {
-  // workshop_username: admin yonetimi icin doner. workshop_password_hash ASLA donulmez (hicbir serializer'da yok).
-  return { ...toFactoryPublic(r), workshop_username: r.workshop_username || null, is_active: r.is_active !== false, created_at: r.created_at, updated_at: r.updated_at };
+  // myfactory_username: admin yonetimi icin doner. myfactory_password_hash ASLA donulmez (hicbir serializer'da yok).
+  return { ...toFactoryPublic(r), myfactory_username: r.myfactory_username || null, is_active: r.is_active !== false, created_at: r.created_at, updated_at: r.updated_at };
 }
 
-// WorkShop me/login yaniti: TAM fabrika kaydi, workshop_username dahil, hash ASLA yok.
-function toFactoryWorkshop(r) {
+// My Factory me/login yaniti: TAM fabrika kaydi, myfactory_username dahil, hash ASLA yok.
+function toFactoryMyFactory(r) {
   return toFactoryAdmin(r);
 }
 
@@ -679,9 +691,9 @@ function cleanFactoryEmail(v) {
 }
 
 
-// FAZ 1 — WorkShop kullanici adi: undefined => dokunma, '' => yok (no-op), gecersiz => null (handler 400 doner).
+// FAZ 1 — My Factory kullanici adi: undefined => dokunma, '' => yok (no-op), gecersiz => null (handler 400 doner).
 // 3-50 karakter, yalniz harf/rakam/._- . Karsilastirma kucuk harfe duyarsizdir (auth.js giris deseni).
-function cleanWorkshopUsername(v) {
+function cleanMyFactoryUsername(v) {
   if (v === undefined) return undefined;
   if (typeof v !== 'string') return null;
   const t = v.trim();
@@ -691,9 +703,9 @@ function cleanWorkshopUsername(v) {
   return t;
 }
 
-// FAZ 1 — WorkShop sifresi: undefined => dokunma, ''/null => koru (no-op), gecersiz => null (handler 400 doner).
+// FAZ 1 — My Factory sifresi: undefined => dokunma, ''/null => koru (no-op), gecersiz => null (handler 400 doner).
 // 8-100 karakter. Sifre kirpilmez (auth.js ile ayni: ham hali hash'lenir).
-function cleanWorkshopPassword(v) {
+function cleanMyFactoryPassword(v) {
   if (v === undefined) return undefined;
   if (v === null) return '';
   if (typeof v !== 'string') return null;
@@ -916,16 +928,16 @@ router.get('/factory/favorites', requireAuth, asyncHandler(async (req, res) => {
 }));
 
 
-// FAZ 1 — WorkShop rotalari: fabrika kendi hesabiyla giris yapar, kendi kaydini duzenler.
+// FAZ 1 — My Factory rotalari: fabrika kendi hesabiyla giris yapar, kendi kaydini duzenler.
 // JWT: { factory_id, role: 'factory' }, 7 gun. factory_id HER ZAMAN token'dan alinir;
 // govdeden gelen id/factory_id ASLA guvenilmez, token'daki fabrikadan farkliysa 403 doner.
 // Yasak alanlar (name, cbf_code, is_verified, is_active) sessizce yoksayilir — degistirilmez.
 // Tum hata govdeleri Turkce ve dostcadir; ham hata/stack ASLA sizdirilmaz.
 
-// WorkShop kullanici adi baskasinda var mi? (kucuk harfe duyarsiz; excludeId haric tutulur)
-async function workshopUsernameTaken(username, excludeId) {
+// My Factory kullanici adi baskasinda var mi? (kucuk harfe duyarsiz; excludeId haric tutulur)
+async function myFactoryUsernameTaken(username, excludeId) {
   const params = [String(username)];
-  let sql = `SELECT id FROM factories WHERE LOWER(workshop_username) = LOWER($1)`;
+  let sql = `SELECT id FROM factories WHERE LOWER(myfactory_username) = LOWER($1)`;
   if (excludeId !== undefined && excludeId !== null) { params.push(excludeId); sql += ` AND id <> $2`; }
   const { rows } = await pool.query(sql, params);
   return rows.length > 0;
@@ -936,7 +948,7 @@ async function workshopUsernameTaken(username, excludeId) {
 function requireFactoryAuth(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) return res.status(401).json({ error: 'unauthorized', message: 'Giriş gerekli. Lütfen ChinaBazaar WorkShop hesabınızla giriş yapın.' });
+  if (!token) return res.status(401).json({ error: 'unauthorized', message: 'Giriş gerekli. Lütfen ChinaBazaar My Factory hesabınızla giriş yapın.' });
   let payload;
   try { payload = jwt.verify(token, cfg.jwtSecret); } catch { return res.status(401).json({ error: 'invalid_token', message: 'Oturumunuz geçersiz veya süresi dolmuş. Lütfen tekrar giriş yapın.' }); }
   if (!payload || payload.role !== 'factory' || !Number.isInteger(payload.factory_id)) return res.status(403).json({ error: 'forbidden', message: 'Bu işlem için fabrika hesabı gerekli.' });
@@ -944,11 +956,11 @@ function requireFactoryAuth(req, res, next) {
   next();
 }
 
-// fix10b: chat-upload kullanici JWT'si VEYA ChinaBazaar WorkShop (fabrika) JWT'sini kabul eder.
+// fix10c: chat-upload kullanici JWT'si VEYA ChinaBazaar My Factory (fabrika) JWT'sini kabul eder.
 // Kullanici jetonu (sub) => req.user; fabrika jetonu (role 'factory') => req.factoryId.
 // Jeton yok/bozuk => 401; ne kullanici ne fabrika jetonu => 401. Admin erisimi aynen kalir
 // (yonetici jetonu bir kullanici jetonudur). Normal kullanici jetonu chat-upload'i kullanmaya
-// DEVAM EDER (CBAI sohbet dosya yukleme) — fix10b yalnizca fabrika erisimini EKLER,
+// DEVAM EDER (CBAI sohbet dosya yukleme) — fix10c yalnizca fabrika erisimini EKLER,
 // mevcut hicbir erisimi kapatmaz.
 function requireUserOrFactoryAuth(req, res, next) {
   const header = req.headers.authorization || '';
@@ -961,35 +973,35 @@ function requireUserOrFactoryAuth(req, res, next) {
   return res.status(401).json({ error: 'unauthorized', message: 'Giriş gerekli.' });
 }
 
-// POST /api/products/factory/workshop/login { username, password } → { token, factory }
+// POST /api/products/factory/myfactory/login { username, password } → { token, factory }
 // Basarisiz giris (kullanici yok / sifre yanlis / sifre tanimli degil) => 401, ayirt edici bilgi verilmez.
-router.post('/factory/workshop/login', loginLimiter, asyncHandler(async (req, res) => {
+router.post('/factory/myfactory/login', loginLimiter, asyncHandler(async (req, res) => {
   await ensureFactoryTables();
   const username = typeof (req.body && req.body.username) === 'string' ? req.body.username.trim() : '';
   const password = req.body && req.body.password;
   if (!username || typeof password !== 'string' || !password) return res.status(401).json({ error: 'invalid_credentials', message: 'Kullanıcı adı veya şifre hatalı.' });
-  const { rows } = await pool.query(`SELECT * FROM factories WHERE LOWER(workshop_username) = LOWER($1) LIMIT 1`, [username]);
+  const { rows } = await pool.query(`SELECT * FROM factories WHERE LOWER(myfactory_username) = LOWER($1) LIMIT 1`, [username]);
   const row = rows[0];
-  const ok = await bcrypt.compare(password, row && row.workshop_password_hash ? row.workshop_password_hash : WORKSHOP_DUMMY_HASH);
+  const ok = await bcrypt.compare(password, row && row.myfactory_password_hash ? row.myfactory_password_hash : MYFACTORY_DUMMY_HASH);
   if (!row || !ok) return res.status(401).json({ error: 'invalid_credentials', message: 'Kullanıcı adı veya şifre hatalı.' });
   const token = jwt.sign({ factory_id: row.id, role: 'factory' }, cfg.jwtSecret, { expiresIn: '7d' });
-  res.json({ token, factory: toFactoryWorkshop(row) });
+  res.json({ token, factory: toFactoryMyFactory(row) });
 }));
 
-// GET /api/products/factory/workshop/me — kendi fabrikasinin TAM kaydi (hash ASLA yok).
-router.get('/factory/workshop/me', requireFactoryAuth, asyncHandler(async (req, res) => {
+// GET /api/products/factory/myfactory/me — kendi fabrikasinin TAM kaydi (hash ASLA yok).
+router.get('/factory/myfactory/me', requireFactoryAuth, asyncHandler(async (req, res) => {
   await ensureFactoryTables();
   const { rows } = await pool.query('SELECT * FROM factories WHERE id = $1', [req.factoryId]);
   if (!rows.length) return res.status(404).json({ error: 'factory_not_found', message: 'Fabrika bulunamadı.' });
-  res.json(toFactoryWorkshop(rows[0]));
+  res.json(toFactoryMyFactory(rows[0]));
 }));
 
-// PUT /api/products/factory/workshop/profile — SADECE kendi fabrikasini gunceller.
+// PUT /api/products/factory/myfactory/profile — SADECE kendi fabrikasini gunceller.
 // Duzenlenebilir: desc, city, category, main_products, certs, features, hashtags, tags,
 // address, phone, contact, wechat, whatsapp, email, import_countries, employees,
 // annual_revenue, factory_area, years, socials, cover_image, videos.
 // YASAK (sessizce yoksayilir): name, cbf_code, is_verified, is_active (+ moq/stock/capacity).
-router.put('/factory/workshop/profile', requireFactoryAuth, asyncHandler(async (req, res) => {
+router.put('/factory/myfactory/profile', requireFactoryAuth, asyncHandler(async (req, res) => {
   await ensureFactoryTables();
   const body = req.body || {};
   // Govdeden gelen id ASLA guvenilmez: token'daki fabrikadan farkliysa 403.
@@ -1033,7 +1045,7 @@ router.put('/factory/workshop/profile', requireFactoryAuth, asyncHandler(async (
   sets.push('updated_at = now()');
   const { rows } = await pool.query(`UPDATE factories SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params);
   if (!rows.length) return res.status(404).json({ error: 'factory_not_found', message: 'Fabrika bulunamadı.' });
-  res.json(toFactoryWorkshop(rows[0]));
+  res.json(toFactoryMyFactory(rows[0]));
 }));
 
 // POST /api/products/factory/:id/rate — fabrika puanlama (1-5). Giris gerekli, abonelik gerekmez. Ayni kullanici tekrar puan verirse guncellenir.
@@ -1138,14 +1150,14 @@ const factoryValidators = [
     if (Array.isArray(v) && v.every((x) => typeof x === 'string')) { if (v.join(', ').length > 2000) throw new Error('invalid_tags'); return true; }
     throw new Error('invalid_tags');
   }),
-  body('workshop_username').optional().custom((v) => {
+  body('myfactory_username').optional().custom((v) => {
     if (v === '' || v === null) return true;
-    if (cleanWorkshopUsername(v) === null) throw new Error('invalid_workshop_username');
+    if (cleanMyFactoryUsername(v) === null) throw new Error('invalid_myfactory_username');
     return true;
   }),
-  body('workshop_password').optional().custom((v) => {
+  body('myfactory_password').optional().custom((v) => {
     if (v === '' || v === null) return true;
-    if (cleanWorkshopPassword(v) === null) throw new Error('invalid_workshop_password');
+    if (cleanMyFactoryPassword(v) === null) throw new Error('invalid_myfactory_password');
     return true;
   }),
   body('socials').optional().custom((v) => {
@@ -1167,14 +1179,14 @@ router.post('/factory/admin', requireAuth, requireAdmin,
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     await ensureFactoryTables();
-    // FAZ 1 — WorkShop hesabi (admin): kullanici adi benzersiz olmali (cakisma 409), sifre bos degilse hash'lenir.
+    // FAZ 1 — My Factory hesabi (admin): kullanici adi benzersiz olmali (cakisma 409), sifre bos degilse hash'lenir.
     // Benzersizlik kontrolu asagida yola gore yapilir (merge: hedef fabrika haric; yeni kayit: tum tablo).
-    const workshopUsernameClean = cleanWorkshopUsername(req.body.workshop_username);
-    if (workshopUsernameClean === null) return res.status(400).json({ error: 'invalid_workshop_username', message: 'ChinaBazaar WorkShop kullanıcı adı 3-50 karakter olmalı, yalnızca harf, rakam, nokta, alt çizgi ve tire içerebilir.' });
-    const workshopPasswordClean = cleanWorkshopPassword(req.body.workshop_password);
-    if (workshopPasswordClean === null) return res.status(400).json({ error: 'invalid_workshop_password', message: 'ChinaBazaar WorkShop şifresi en az 8 karakter olmalı.' });
-    let workshopPasswordHash;
-    if (workshopPasswordClean) workshopPasswordHash = await bcrypt.hash(workshopPasswordClean, 12);
+    const myFactoryUsernameClean = cleanMyFactoryUsername(req.body.myfactory_username);
+    if (myFactoryUsernameClean === null) return res.status(400).json({ error: 'invalid_myfactory_username', message: 'ChinaBazaar My Factory kullanıcı adı 3-50 karakter olmalı, yalnızca harf, rakam, nokta, alt çizgi ve tire içerebilir.' });
+    const myFactoryPasswordClean = cleanMyFactoryPassword(req.body.myfactory_password);
+    if (myFactoryPasswordClean === null) return res.status(400).json({ error: 'invalid_myfactory_password', message: 'ChinaBazaar My Factory şifresi en az 8 karakter olmalı.' });
+    let myFactoryPasswordHash;
+    if (myFactoryPasswordClean) myFactoryPasswordHash = await bcrypt.hash(myFactoryPasswordClean, 12);
     const videos = cleanFactoryVideos(req.body.videos);
     if (videos === null) return res.status(400).json({ error: 'invalid_videos' });
     const hashtagsClean = cleanFactoryHashtags(req.body.hashtags);
@@ -1261,12 +1273,12 @@ router.post('/factory/admin', requireAuth, requireAdmin,
         if (req.body.tags !== undefined) mergePush('tags', tagsClean);
         // VERIFIED (CBF merge): body verirse guncelle, verilmezse degistirme.
         if (req.body.is_verified !== undefined) mergePush('is_verified', verifiedCreate);
-        // FAZ 1 — WorkShop hesabi (CBF merge): kullanici adi cakisirsa 409; sifre bos degilse hash'lenir.
-        if (workshopUsernameClean) {
-          if (await workshopUsernameTaken(workshopUsernameClean, existingFactory.id)) return res.status(409).json({ error: 'workshop_username_taken', message: 'Bu ChinaBazaar WorkShop kullanıcı adı başka bir fabrikada kullanılıyor.' });
-          mergePush('workshop_username', workshopUsernameClean);
+        // FAZ 1 — My Factory hesabi (CBF merge): kullanici adi cakisirsa 409; sifre bos degilse hash'lenir.
+        if (myFactoryUsernameClean) {
+          if (await myFactoryUsernameTaken(myFactoryUsernameClean, existingFactory.id)) return res.status(409).json({ error: 'myfactory_username_taken', message: 'Bu ChinaBazaar My Factory kullanıcı adı başka bir fabrikada kullanılıyor.' });
+          mergePush('myfactory_username', myFactoryUsernameClean);
         }
-        if (workshopPasswordHash) mergePush('workshop_password_hash', workshopPasswordHash);
+        if (myFactoryPasswordHash) mergePush('myfactory_password_hash', myFactoryPasswordHash);
         // Videolar — REPLACE degil APPEND: mevcut videolar korunur, yalniz yeni URL'ler eklenir.
         if (videos !== undefined) {
           let existingVideos = existingFactory.videos;
@@ -1290,9 +1302,9 @@ router.post('/factory/admin', requireAuth, requireAdmin,
     // CBF: body'de kod varsa normalize edip kullan; yoksa ayni isimde kod varsa onu tekrar kullan, yoksa siradaki kodu ata.
     let cbfCode = normalizeCbfCode(req.body.cbf_code);
     if (!cbfCode) cbfCode = await resolveCbfCodeForName(req.body.name);
-    // FAZ 1 — WorkShop hesabi (yeni kayit): kullanici adi cakisirsa 409.
-    if (workshopUsernameClean) {
-      if (await workshopUsernameTaken(workshopUsernameClean, null)) return res.status(409).json({ error: 'workshop_username_taken', message: 'Bu ChinaBazaar WorkShop kullanıcı adı başka bir fabrikada kullanılıyor.' });
+    // FAZ 1 — My Factory hesabi (yeni kayit): kullanici adi cakisirsa 409.
+    if (myFactoryUsernameClean) {
+      if (await myFactoryUsernameTaken(myFactoryUsernameClean, null)) return res.status(409).json({ error: 'myfactory_username_taken', message: 'Bu ChinaBazaar My Factory kullanıcı adı başka bir fabrikada kullanılıyor.' });
     }
     const { rows } = await pool.query(
       `INSERT INTO factories (name, city, category, description, moq, stock, capacity, certs, features, videos, hashtags, cbf_code, is_verified)
@@ -1313,7 +1325,7 @@ router.post('/factory/admin', requireAuth, requireAdmin,
         verifiedCreate,
       ]
     );
-    if (addressClean !== undefined || phoneClean !== undefined || contactClean !== undefined || wechatClean !== undefined || whatsappClean !== undefined || emailClean !== undefined || socialsClean !== undefined || tagsClean !== undefined || importCountriesClean !== undefined || employeesClean !== undefined || annualRevenueClean !== undefined || coverImageClean !== undefined || factoryAreaClean !== undefined || yearsClean !== undefined || mainProductsClean !== undefined || workshopUsernameClean || workshopPasswordHash) {
+    if (addressClean !== undefined || phoneClean !== undefined || contactClean !== undefined || wechatClean !== undefined || whatsappClean !== undefined || emailClean !== undefined || socialsClean !== undefined || tagsClean !== undefined || importCountriesClean !== undefined || employeesClean !== undefined || annualRevenueClean !== undefined || coverImageClean !== undefined || factoryAreaClean !== undefined || yearsClean !== undefined || mainProductsClean !== undefined || myFactoryUsernameClean || myFactoryPasswordHash) {
       const updSets = [];
       const updParams = [rows[0].id];
       const updPush = (col, val, cast) => { updParams.push(val); updSets.push(`${col} = $${updParams.length}${cast || ''}`); };
@@ -1332,8 +1344,8 @@ router.post('/factory/admin', requireAuth, requireAdmin,
       if (factoryAreaClean !== undefined) updPush('factory_area', factoryAreaClean);
       if (yearsClean !== undefined) updPush('years', yearsClean);
       if (mainProductsClean !== undefined) updPush('main_products', mainProductsClean);
-      if (workshopUsernameClean) updPush('workshop_username', workshopUsernameClean);
-      if (workshopPasswordHash) updPush('workshop_password_hash', workshopPasswordHash);
+      if (myFactoryUsernameClean) updPush('myfactory_username', myFactoryUsernameClean);
+      if (myFactoryPasswordHash) updPush('myfactory_password_hash', myFactoryPasswordHash);
       const upd = await pool.query(`UPDATE factories SET ${updSets.join(', ')} WHERE id = $1 RETURNING *`, updParams);
       if (upd.rows.length) rows[0] = upd.rows[0];
     }
@@ -1353,17 +1365,17 @@ router.put('/factory/admin/:id', requireAuth, requireAdmin,
     const params = [id];
     const push = (col, val, cast) => { params.push(val); sets.push(`${col} = $${params.length}${cast || ''}`); };
     if (req.body.name !== undefined) push('name', String(req.body.name).trim());
-    // FAZ 1 — WorkShop hesabi (admin override): kullanici adi cakisirsa 409; sifre bos degilse hash'lenir, bossa mevcut sifre korunur.
-    if (req.body.workshop_username !== undefined || req.body.workshop_password !== undefined) {
-      const workshopUsernameCleanPut = cleanWorkshopUsername(req.body.workshop_username);
-      if (workshopUsernameCleanPut === null) return res.status(400).json({ error: 'invalid_workshop_username', message: 'ChinaBazaar WorkShop kullanıcı adı 3-50 karakter olmalı, yalnızca harf, rakam, nokta, alt çizgi ve tire içerebilir.' });
-      const workshopPasswordCleanPut = cleanWorkshopPassword(req.body.workshop_password);
-      if (workshopPasswordCleanPut === null) return res.status(400).json({ error: 'invalid_workshop_password', message: 'ChinaBazaar WorkShop şifresi en az 8 karakter olmalı.' });
-      if (workshopUsernameCleanPut) {
-        if (await workshopUsernameTaken(workshopUsernameCleanPut, id)) return res.status(409).json({ error: 'workshop_username_taken', message: 'Bu ChinaBazaar WorkShop kullanıcı adı başka bir fabrikada kullanılıyor.' });
-        push('workshop_username', workshopUsernameCleanPut);
+    // FAZ 1 — My Factory hesabi (admin override): kullanici adi cakisirsa 409; sifre bos degilse hash'lenir, bossa mevcut sifre korunur.
+    if (req.body.myfactory_username !== undefined || req.body.myfactory_password !== undefined) {
+      const myFactoryUsernameCleanPut = cleanMyFactoryUsername(req.body.myfactory_username);
+      if (myFactoryUsernameCleanPut === null) return res.status(400).json({ error: 'invalid_myfactory_username', message: 'ChinaBazaar My Factory kullanıcı adı 3-50 karakter olmalı, yalnızca harf, rakam, nokta, alt çizgi ve tire içerebilir.' });
+      const myFactoryPasswordCleanPut = cleanMyFactoryPassword(req.body.myfactory_password);
+      if (myFactoryPasswordCleanPut === null) return res.status(400).json({ error: 'invalid_myfactory_password', message: 'ChinaBazaar My Factory şifresi en az 8 karakter olmalı.' });
+      if (myFactoryUsernameCleanPut) {
+        if (await myFactoryUsernameTaken(myFactoryUsernameCleanPut, id)) return res.status(409).json({ error: 'myfactory_username_taken', message: 'Bu ChinaBazaar My Factory kullanıcı adı başka bir fabrikada kullanılıyor.' });
+        push('myfactory_username', myFactoryUsernameCleanPut);
       }
-      if (workshopPasswordCleanPut) push('workshop_password_hash', await bcrypt.hash(workshopPasswordCleanPut, 12));
+      if (myFactoryPasswordCleanPut) push('myfactory_password_hash', await bcrypt.hash(myFactoryPasswordCleanPut, 12));
     }
     // CBF kilidi (UPDATE): gecerli kod SABIT'tir — farkli bir kodla degistirilemez.
     // Bozuk bicimli/eksik mevcut kod, gecerli bicimli kodla bir kez duzeltilebilir.
@@ -1789,7 +1801,7 @@ router.post('/factory/admin/messages/:id/reply', requireAuth, requireAdmin,
 );
 
 // POST /api/products/factory/chat-upload — CBAI sohbetine dosya yukle (giris yapmis kullanici)
-// fix10b: ChinaBazaar WorkShop fabrika jetonu (role 'factory') de kabul edilir.
+// fix10c: ChinaBazaar My Factory fabrika jetonu (role 'factory') de kabul edilir.
 // On yuz FormData ile gonderir (alan: `file`); ham dosya govdesi de kabul edilir.
 // Multer pakette yok — multipart siniri (boundary) elle cozumlenir, yeni bagimlilik yok.
 // fix6: resim (jpg/png/webp/gif) + PDF + Excel (xls/xlsx), en fazla 10MB, sihirli bayt
