@@ -2,6 +2,7 @@
 // JWT: { factory_id, role: 'factory' }, 7 gun. Sifre: auth.js ile AYNI bcryptjs hasher (cost 12).
 // Yasak alanlar (name, cbf_code, is_verified, is_active) My Factory profilinde sessizce yoksayilir.
 // fix10e: H-B göç (transaction + doğrulama + DROP yoksa yapılmaz), H-E CBAI master
+// fix10h: CBOs26.4 — /myfactory/stats: gunluk seri (daily) + ulke dagilimi (countries); /factory/video-view: olay kaydi (ulke basliktan).
 // fix10g: /myfactory/stats — toplamlar (total_videos, total_likes) + video başına like_count (factory_likes).
 // (sub+jti, 1 gün, denetim kaydı), L1 dummy hash 12 + uzunluk erken dönüşü yok,
 // L2 jenerik yanıtlar, L3 'cbai' rezerve, L4 şifre politikası, L7 SSRF engeli,
@@ -494,6 +495,10 @@ async function ensureFactoryTables() {
   try { await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS factory_likes_user_video_uidx ON factory_likes (user_id, video_key)`); } catch (e) { /* eski şemada index kurulamazsa akış bozulmaz */ }
   try { await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS factory_favorites_user_video_uidx ON factory_favorites (user_id, video_key)`); } catch (e) { /* eski şemada index kurulamazsa akış bozulmaz */ }
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_video_views (video TEXT PRIMARY KEY, views INT NOT NULL DEFAULT 0)`);
+  // CBOs26.4 (fix10h): izlenme OLAYLARI — gunluk grafik + ulke dagilimi icin. Toplam sayac (factory_video_views)
+  // gecmise donuk gun/ulke bilgisi tasimaz; olaylar bu surumden itibaren birikir. Eski izlenmeler yalnizca toplamda kalir.
+  await pool.query(`CREATE TABLE IF NOT EXISTS factory_video_view_events (id SERIAL PRIMARY KEY, video TEXT NOT NULL DEFAULT '', country TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ DEFAULT now())`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS factory_video_view_events_video_idx ON factory_video_view_events (video)`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_ratings (id SERIAL PRIMARY KEY, factory_id INT NOT NULL REFERENCES factories(id) ON DELETE CASCADE, user_id TEXT NOT NULL, rating INT NOT NULL CHECK (rating BETWEEN 1 AND 5), created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now(), UNIQUE(factory_id, user_id))`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_subscriptions (id SERIAL PRIMARY KEY, user_id TEXT NOT NULL, status TEXT DEFAULT 'pending', started_at TIMESTAMPTZ, ends_at TIMESTAMPTZ, paytr_merchant_oid TEXT UNIQUE, amount INT, currency TEXT DEFAULT 'USD', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now())`);
   // Abonelik/VIP: admin_grant tamamlayici abonelik icin plan/provider/expires_at.
@@ -1051,6 +1056,15 @@ router.get('/factory/video-views', asyncHandler(async (req, res) => {
   res.json({ views: out });
 }));
 
+// CBOs26.4 (fix10h): ulke kodu yalnizca CDN/proxy basliklarindan okunur (CF-IPCountry, X-Country, X-Geo-Country,
+// X-Appengine-Country). Baslik yoksa bos doner — IP->ulke eslemesi icin harici GeoIP servisi kullanilmaz, ulke UYDURULMAZ.
+function factoryViewCountry(req) {
+  const h = (req && req.headers) || {};
+  const raw = h['cf-ipcountry'] || h['x-country'] || h['x-geo-country'] || h['x-appengine-country'] || '';
+  const code = String(raw).trim().toUpperCase();
+  return /^[A-Z]{2}$/.test(code) ? code : '';
+}
+
 // POST /api/products/factory/video-view {video} — izlenme +1 (herkese acik, kimlik yok)
 router.post('/factory/video-view', asyncHandler(async (req, res) => {
   await ensureFactoryTables();
@@ -1061,6 +1075,8 @@ router.post('/factory/video-view', asyncHandler(async (req, res) => {
     `INSERT INTO factory_video_views (video, views) VALUES ($1, 1) ON CONFLICT (video) DO UPDATE SET views = factory_video_views.views + 1 RETURNING views`,
     [video]
   );
+  // CBOs26.4: olay satiri (gunluk grafik + ulke). Olay yazimi sayaci ASLA bozmaz — hata olursa sessizce yoksayilir.
+  try { await pool.query(`INSERT INTO factory_video_view_events (video, country) VALUES ($1, $2)`, [video, factoryViewCountry(req)]); } catch (e) { /* olay kaydi sayaci bozmaz */ }
   res.json({ video, views: rows[0].views });
 }));
 
@@ -1408,6 +1424,15 @@ router.get('/factory/myfactory/quotes', requireFactoryOrMasterAuth, asyncHandler
   res.json({ quotes: rows });
 }));
 
+// CBOs26.4 (fix10h): gunluk seri birlestirme — SAF fonksiyon (test edilebilir). rows: [{day:'YYYY-MM-DD', cnt}]
+// days: son 30 gunluk 'YYYY-MM-DD' listesi (bugun dahil). Eksik gunler 0 ile doldurulur; gecmis verisi olmayan
+// gunler 0 doner (uydurma yok).
+function mergeDailySeries(days, viewRows, likeRows, commentRows, quoteRows) {
+  const byDay = function (rows) { const m = {}; (rows || []).forEach(function (r) { if (r && r.day) m[String(r.day)] = Number(r.cnt) || 0; }); return m; };
+  const v = byDay(viewRows), l = byDay(likeRows), c = byDay(commentRows), q = byDay(quoteRows);
+  return days.map(function (d) { return { date: d, views: v[d] || 0, likes: l[d] || 0, comments: c[d] || 0, quotes: q[d] || 0 }; });
+}
+
 // CBOs26.2 — GET /api/products/factory/myfactory/stats — kendi fabrikasinin GERCEK istatistigi:
 // CBOs26.3 (fix10g): + toplamlar (total_videos, total_likes) + video basina like_count.
 // video basina izlenme + yorum sayisi, en cok izlenenler, yorum alan videolar. Uydurma sayi yok.
@@ -1449,7 +1474,21 @@ router.get('/factory/myfactory/stats', requireFactoryOrMasterAuth, asyncHandler(
   const mostWatched = [...perVideo].sort((a, b) => b.views - a.views).slice(0, 5);
   const commented = perVideo.filter((v) => v.comment_count > 0).sort((a, b) => b.comment_count - a.comment_count);
   const qmap = await factoryQuoteCountsMap([fid]);
-  res.json({ factory_id: fid, total_videos: videos.length, total_views: totalViews, total_comments: totalComments, total_likes: totalLikes, quote_count: qmap[fid] || 0, videos: perVideo, most_watched: mostWatched, commented_videos: commented });
+  // CBOs26.4 (fix10h): gunluk seri (son 30 gun) + ulke dagilimi — yalnizca GERCEK satirlar. Izlenme olaylari bu
+  // surumden itibaren birikir; onceki izlenmelerin gun/ulke kirilimi yoktur (seride 0 gorunur).
+  const days = [];
+  for (let i = 29; i >= 0; i--) { const d = new Date(); d.setUTCDate(d.getUTCDate() - i); days.push(d.toISOString().slice(0, 10)); }
+  const since = days[0] + 'T00:00:00Z';
+  const daySql = `SELECT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS day, COUNT(*)::int AS cnt FROM %TABLE% WHERE %WHERE% AND created_at >= $1 GROUP BY day`;
+  let viewRows = [];
+  if (keys.length) { try { const r = await pool.query(daySql.replace('%TABLE%', 'factory_video_view_events').replace('%WHERE%', 'video = ANY($2)'), [since, keys]); viewRows = r.rows; } catch (e) { viewRows = []; } }
+  const likeRows = (await pool.query(daySql.replace('%TABLE%', 'factory_likes').replace('%WHERE%', 'video_key ~ $2'), [since, '^' + fid + '-[0-9]+$'])).rows;
+  const commentRows = (await pool.query(daySql.replace('%TABLE%', 'factory_comments').replace('%WHERE%', 'video_key ~ $2'), [since, '^' + fid + '-[0-9]+$'])).rows;
+  const quoteRows = (await pool.query(daySql.replace('%TABLE%', 'factory_quotes').replace('%WHERE%', '(factory_id = $2 OR (factory_id IS NULL AND factory <> \'\' AND LOWER(TRIM(factory)) = $3))'), [since, fid, fname])).rows;
+  const daily = mergeDailySeries(days, viewRows, likeRows, commentRows, quoteRows);
+  let countries = [];
+  if (keys.length) { try { const r = await pool.query(`SELECT country, COUNT(*)::int AS views FROM factory_video_view_events WHERE video = ANY($1) AND country <> '' GROUP BY country ORDER BY views DESC LIMIT 20`, [keys]); countries = r.rows; } catch (e) { countries = []; } }
+  res.json({ factory_id: fid, total_videos: videos.length, total_views: totalViews, total_comments: totalComments, total_likes: totalLikes, quote_count: qmap[fid] || 0, videos: perVideo, most_watched: mostWatched, commented_videos: commented, daily: daily, countries: countries });
 }));
 
 // CBOs26.2 — GET /api/products/factory/myfactory/messages — kendi fabrikasina yazilan musteri konusmalari (kullaniciya gore gruplu).
