@@ -15,6 +15,12 @@
 //   (requireFactoryOrMasterAuth) -> { available:boolean }; format gecersizse 400. Benzersizlik
 //   LOWER karsilastirmasiyla; fabrikanin KENDI mevcut kullanici adi "kullanilabilir" sayilir
 //   (master icin ?factory_id= verilirse o fabrika haric tutulur).
+// fix10u: CBOs26.55-A — fabrika MARKA TESCILI beyani + benzersizlik: factories'e brand_name /
+//   trademark_no / trademark_office / trademark_declared_at sutunlari + normalize (trim + ic
+//   bosluk tek) marka adinda kismi benzersiz dizin. PUT /factory/myfactory/brand
+//   (requireFactoryOrMasterAuth; master factory_id ZORUNLU -> 400 master_factory_id_required);
+//   marka baskasinda varsa 409 brand_taken; admin PUT /factory/admin/:id ayni kontrolle yazar.
+//   Brand alanlari yalniz toFactoryAdmin (+owner) ile doner, PUBLIC serializer'da YOK.
 // fix10e: H-B göç (transaction + doğrulama + DROP yoksa yapılmaz), H-E CBAI master
 // fix10h: CBOs26.4 — /myfactory/stats: gunluk seri (daily) + ulke dagilimi (countries); /factory/video-view: olay kaydi (ulke basliktan).
 // fix10i: CBOs26.5 — bildirimler: factory_messages/factory_quotes + seen_by_factory; GET/POST /myfactory/notifications[/read]; videos.description korunur.
@@ -571,6 +577,14 @@ async function ensureFactoryTables() {
   // Eski sutun yoksa (yeni kurulum) kopyalama adimi sessizce atlanir; hicbir sorgu cokmez.
   try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS myfactory_username TEXT UNIQUE`); } catch (e) { /* myfactory_username kolonu eklenemezse akis bozulmaz */ }
   try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS myfactory_password_hash TEXT`); } catch (e) { /* myfactory_password_hash kolonu eklenemezse akis bozulmaz */ }
+  // fix10u (CBOs26.55-A): fabrika MARKA TESCİLİ beyanı — marka adı fabrikalar arasında BENZERSİZ
+  // olmalı (uygulama katmanı normalize + LOWER karşılaştırmasıyla 409 brand_taken döner; kısmi
+  // benzersiz dizin ikinci savunma hattıdır). Her ALTER kendi try/catch'indedir, hata yutulur.
+  try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS brand_name TEXT`); } catch (e) { /* brand_name kolonu eklenemezse akis bozulmaz */ }
+  try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS trademark_no TEXT`); } catch (e) { /* trademark_no kolonu eklenemezse akis bozulmaz */ }
+  try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS trademark_office TEXT`); } catch (e) { /* trademark_office kolonu eklenemezse akis bozulmaz */ }
+  try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS trademark_declared_at TIMESTAMPTZ`); } catch (e) { /* trademark_declared_at kolonu eklenemezse akis bozulmaz */ }
+  try { await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS factories_brand_name_uniq ON factories (LOWER(TRIM(brand_name))) WHERE brand_name IS NOT NULL AND TRIM(brand_name) <> ''`); } catch (e) { /* benzersiz dizin kurulamazsa akis bozulmaz (uygulama katmani kontrolu devrede) */ }
   // fix10e H-B: eski fabrika giriş verisi göçü — transaction + doğrulama.
   // 1) Kopyalama tek transaction içinde, satır satır: MEVCUT myfactory_*
   // değeri ASLA eski değerle ezilmez (yalnız NULL olanlar doldurulur).
@@ -909,7 +923,8 @@ async function factoryFollowersMap(ids) {
 
 function toFactoryAdmin(r) {
   // myfactory_username: admin yonetimi icin doner. myfactory_password_hash ASLA donulmez (hicbir serializer'da yok).
-  return { ...toFactoryPublic(r), myfactory_username: r.myfactory_username || null, is_active: r.is_active !== false, created_at: r.created_at, updated_at: r.updated_at };
+  // fix10u: marka tescil beyani alanlari admin + owner (toFactoryMyFactory) gorunumunde doner; PUBLIC serializer'da YOK.
+  return { ...toFactoryPublic(r), myfactory_username: r.myfactory_username || null, brand_name: r.brand_name || null, trademark_no: r.trademark_no || null, trademark_office: r.trademark_office || null, trademark_declared_at: r.trademark_declared_at || null, is_active: r.is_active !== false, created_at: r.created_at, updated_at: r.updated_at };
 }
 
 // My Factory me/login yaniti: TAM fabrika kaydi, myfactory_username dahil, hash ASLA yok.
@@ -1246,6 +1261,23 @@ async function myFactoryUsernameTaken(username, excludeId) {
   return rows.length > 0;
 }
 
+// fix10u (CBOs26.55-A): marka adı normalize — trim + iç boşluklar tek boşluğa iner.
+// Çağıran taraf değerin string olduğunu doğrular; sonuç '' ise beyan temizleme sayılır.
+function normalizeBrandName(v) {
+  return String(v).trim().replace(/\s+/g, ' ');
+}
+
+// Marka adı BAŞKA fabrikada beyan edilmiş mi? (normalize edilmiş adla LOWER karşılaştırması;
+// excludeId hariç tutulur — myFactoryUsernameTaken deseni)
+async function factoryBrandTaken(brandName, excludeId) {
+  const params = [String(brandName)];
+  let sql = `SELECT id FROM factories WHERE LOWER(TRIM(brand_name)) = LOWER($1)`;
+  if (excludeId !== undefined && excludeId !== null) { params.push(excludeId); sql += ` AND id <> $2`; }
+  sql += ` LIMIT 1`;
+  const { rows } = await pool.query(sql, params);
+  return rows.length > 0;
+}
+
 // Fabrika JWT dogrulamasi: Bearer token + role === 'factory' + tamsayi factory_id.
 // Token yok/bozuk/suresi dolmus => 401; gecerli ama fabrika rolu degil => 403.
 function requireFactoryAuth(req, res, next) {
@@ -1575,6 +1607,77 @@ router.get('/factory/myfactory/username-available', requireFactoryOrMasterAuth, 
   }
   const taken = await myFactoryUsernameTaken(clean, excludeId);
   res.json({ available: !taken });
+}));
+
+// CBOs26.55-A (fix10u) — PUT /api/products/factory/myfactory/brand
+// Fabrika MARKA TESCİLİ beyanı. Gövde { brand_name?, trademark_no?, trademark_office? }.
+// Hedef fabrika çözümü credentials rotasıyla aynı: master → gövde/query factory_id ZORUNLU
+// (yoksa 400 master_factory_id_required; ikisi dolu ve farklıysa 400 factory_id_mismatch);
+// fabrika → gövde/query'deki farklı factory_id 403, hedef = req.factoryId.
+// brand_name BOŞSA beyan temizlenir (üç alan + trademark_declared_at NULL). Doluysa: normalize
+// (trim + iç boşluklar tek boşluk), en çok 120 karakter; BAŞKA fabrikada aynı normalize ad
+// (LOWER karşılaştırması) varsa 409 brand_taken. Kayıtta trademark_declared_at = now().
+// trademark_no / trademark_office en çok 100 karaktere kırpılır. Yanıt yalnız brand alanları.
+router.put('/factory/myfactory/brand', requireFactoryOrMasterAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const body = req.body || {};
+  // Hedef fabrika: master → gövde/query factory_id (ZORUNLU); fabrika → token'daki fabrika.
+  let targetFactoryId;
+  if (req.isMaster) {
+    const fromBody = body.factory_id;
+    const fromQuery = req.query.factory_id;
+    const hasBody = fromBody !== undefined && fromBody !== null && String(fromBody).trim() !== '';
+    const hasQuery = fromQuery !== undefined && fromQuery !== null && String(fromQuery).trim() !== '';
+    if (!hasBody && !hasQuery) return res.status(400).json({ error: 'master_factory_id_required', message: 'Master düzenlemesi için factory_id gerekli.' });
+    if (hasBody && hasQuery && Number(String(fromBody).trim()) !== Number(String(fromQuery).trim())) {
+      return res.status(400).json({ error: 'factory_id_mismatch', message: 'Gövde ve sorgudaki factory_id aynı olmalı.' });
+    }
+    targetFactoryId = Number(String(hasBody ? fromBody : fromQuery).trim());
+    if (!Number.isInteger(targetFactoryId) || targetFactoryId < 1) return res.status(400).json({ error: 'invalid_factory_id', message: 'Fabrika kimliği geçerli değil.' });
+  } else {
+    // Gövdeden gelen id ASLA güvenilmez: token'daki fabrikadan farklıysa 403.
+    for (const key of ['id', 'factory_id']) {
+      if (body[key] !== undefined && body[key] !== null && body[key] !== '' && Number(body[key]) !== req.factoryId) {
+        return res.status(403).json({ error: 'forbidden', message: 'Yalnız kendi fabrika kaydınızı düzenleyebilirsiniz.' });
+      }
+    }
+    // Sorgudaki factory_id de token'daki fabrikadan farklıysa 403 (izolasyon).
+    const qf = req.query.factory_id;
+    if (qf !== undefined && qf !== null && String(qf).trim() !== '' && Number(String(qf).trim()) !== req.factoryId) {
+      return res.status(403).json({ error: 'forbidden', message: 'Yalnız kendi fabrika kaydınızı düzenleyebilirsiniz.' });
+    }
+    targetFactoryId = req.factoryId;
+  }
+  // Marka adı: string değilse 400; boş/undefined ise beyan temizlenir.
+  if (body.brand_name !== undefined && body.brand_name !== null && typeof body.brand_name !== 'string') {
+    return res.status(400).json({ error: 'invalid_brand_name', message: 'Marka adı geçerli bir metin olmalı.' });
+  }
+  const brandClean = (body.brand_name === undefined || body.brand_name === null) ? '' : normalizeBrandName(body.brand_name);
+  if (!brandClean) {
+    const { rows } = await pool.query(
+      `UPDATE factories SET brand_name = NULL, trademark_no = NULL, trademark_office = NULL, trademark_declared_at = NULL, updated_at = now() WHERE id = $1 RETURNING brand_name, trademark_no, trademark_office, trademark_declared_at`,
+      [targetFactoryId]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'factory_not_found', message: 'Fabrika bulunamadı.' });
+    if (req.isMaster) await logMasterAudit('factory_brand_update', 'factory', targetFactoryId);
+    return res.json({ brand_name: null, trademark_no: null, trademark_office: null, trademark_declared_at: null });
+  }
+  if (brandClean.length > 120) {
+    return res.status(400).json({ error: 'invalid_brand_name', message: 'Marka adı en çok 120 karakter olabilir.' });
+  }
+  if (await factoryBrandTaken(brandClean, targetFactoryId)) {
+    return res.status(409).json({ error: 'brand_taken', message: 'Bu marka başka bir fabrika tarafından beyan edilmiş.' });
+  }
+  const trademarkNo = typeof body.trademark_no === 'string' ? body.trademark_no.trim().slice(0, 100) : '';
+  const trademarkOffice = typeof body.trademark_office === 'string' ? body.trademark_office.trim().slice(0, 100) : '';
+  const { rows } = await pool.query(
+    `UPDATE factories SET brand_name = $2, trademark_no = $3, trademark_office = $4, trademark_declared_at = now(), updated_at = now() WHERE id = $1 RETURNING brand_name, trademark_no, trademark_office, trademark_declared_at`,
+    [targetFactoryId, brandClean, trademarkNo === '' ? null : trademarkNo, trademarkOffice === '' ? null : trademarkOffice]
+  );
+  if (!rows.length) return res.status(404).json({ error: 'factory_not_found', message: 'Fabrika bulunamadı.' });
+  if (req.isMaster) await logMasterAudit('factory_brand_update', 'factory', targetFactoryId);
+  const r = rows[0];
+  res.json({ brand_name: r.brand_name || null, trademark_no: r.trademark_no || null, trademark_office: r.trademark_office || null, trademark_declared_at: r.trademark_declared_at || null });
 }));
 
 // CBOs26.2 — GET /api/products/factory/myfactory/quotes — kendi fabrikasina gelen teklifler.
@@ -2358,6 +2461,35 @@ router.put('/factory/admin/:id', requireAuth, requireAdmin,
         push('myfactory_username', myFactoryUsernameCleanPut);
       }
       if (myFactoryPasswordCleanPut) push('myfactory_password_hash', await bcrypt.hash(myFactoryPasswordCleanPut, 12));
+    }
+    // fix10u (CBOs26.55-A) — MARKA TESCİLİ beyanı (admin): brand_name verilirse normalize edilir;
+    // boşsa beyan temizlenir (üç alan + trademark_declared_at NULL); doluysa (en çok 120 krk)
+    // başka fabrikada aynı normalize ad varsa 409 brand_taken, kayıtta trademark_declared_at = now().
+    // brand_name verilmeden yalnız trademark_no/trademark_office de güncellenebilir (declared_at korunur).
+    // trademark_no/trademark_office en çok 100 karaktere kırpılır; boşsa NULL yazılır.
+    if (req.body.brand_name !== undefined || req.body.trademark_no !== undefined || req.body.trademark_office !== undefined) {
+      const brandNoClean = typeof req.body.trademark_no === 'string' ? req.body.trademark_no.trim().slice(0, 100) : '';
+      const brandOfficeClean = typeof req.body.trademark_office === 'string' ? req.body.trademark_office.trim().slice(0, 100) : '';
+      if (req.body.brand_name !== undefined) {
+        if (req.body.brand_name !== null && typeof req.body.brand_name !== 'string') return res.status(400).json({ error: 'invalid_brand_name', message: 'Marka adı geçerli bir metin olmalı.' });
+        const brandCleanPut = req.body.brand_name === null ? '' : normalizeBrandName(req.body.brand_name);
+        if (brandCleanPut === '') {
+          push('brand_name', null);
+          push('trademark_no', null);
+          push('trademark_office', null);
+          sets.push('trademark_declared_at = NULL');
+        } else {
+          if (brandCleanPut.length > 120) return res.status(400).json({ error: 'invalid_brand_name', message: 'Marka adı en çok 120 karakter olabilir.' });
+          if (await factoryBrandTaken(brandCleanPut, id)) return res.status(409).json({ error: 'brand_taken', message: 'Bu marka başka bir fabrika tarafından beyan edilmiş.' });
+          push('brand_name', brandCleanPut);
+          if (req.body.trademark_no !== undefined) push('trademark_no', brandNoClean === '' ? null : brandNoClean);
+          if (req.body.trademark_office !== undefined) push('trademark_office', brandOfficeClean === '' ? null : brandOfficeClean);
+          sets.push('trademark_declared_at = now()');
+        }
+      } else {
+        if (req.body.trademark_no !== undefined) push('trademark_no', brandNoClean === '' ? null : brandNoClean);
+        if (req.body.trademark_office !== undefined) push('trademark_office', brandOfficeClean === '' ? null : brandOfficeClean);
+      }
     }
     // CBF kilidi (UPDATE): gecerli kod SABIT'tir — farkli bir kodla degistirilemez.
     // Bozuk bicimli/eksik mevcut kod, gecerli bicimli kodla bir kez duzeltilebilir.
