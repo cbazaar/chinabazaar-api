@@ -142,6 +142,13 @@
 //   olan TUM aktif fabrikalar icin ensure cagirir; env yoksa
 //   { ok:false, reason:'netlify_not_configured' }. Node yerlesik fetch,
 //   ~8 sn zaman asimi (AbortController); ek bagimlilik yok.
+// fix10aj: CBOs26.89-A — sertifika icon listesine LOGO anahtarlari:
+//   FACTORY_CERT_ICONS'a ce / iso-9001 / iso-14001 / fda / reach / rohs /
+//   fcc eklendi (mevcut 9 ikon aynen). cleanFactoryCertIcon kucuk harfe
+//   cevirdikten sonra 'iso9001' tiresiz yazimini da 'iso-9001'e esler
+//   (tek normalizasyon istisnasi). Yazma + okuma yollari ayni listeyi
+//   kullandigi icin iki tarafta da yeni anahtarlar korunur; baska hicbir
+//   davranis degismez.
 // fix10ah: CBOs26.85-A — sertifika ogelerine opsiyonel ICON alani:
 //   cleanFactoryCertificates her ogede icon'u da temizler — string ise
 //   kucuk harfe cevrilir, SABIT listede (shield/award/leaf/flask/globe/
@@ -1409,10 +1416,16 @@ function cleanVideoAttributes(v) {
 // YAPILMAZ (yazarken denetlendi; eski veri geriye uyumlu doner).
 // fix10ah: opsiyonel icon — yalniz SABIT listedeki deger korunur (kucuk
 // harfe cevrilir); gecersiz/bos ikon ogeden DUSURULUR, oge kalir.
-const FACTORY_CERT_ICONS = ['shield', 'award', 'leaf', 'flask', 'globe', 'star', 'seal', 'factory', 'doc'];
+// fix10aj: listeye sertifika LOGO anahtarlari eklendi (ce, iso-9001,
+// iso-14001, fda, reach, rohs, fcc); 'iso9001' tiresiz yazimi 'iso-9001'e
+// normalize edilir (tek istisna). Yazma + okuma ayni listeyi kullanir.
+const FACTORY_CERT_ICONS = ['shield', 'award', 'leaf', 'flask', 'globe', 'star', 'seal', 'factory', 'doc',
+  // fix10aj: sertifika LOGO anahtarlari (on yuzdeki Sertifikalar rozetleriyle ayni)
+  'ce', 'iso-9001', 'iso-14001', 'fda', 'reach', 'rohs', 'fcc'];
 function cleanFactoryCertIcon(v) {
   if (typeof v !== 'string') return null;
-  const s = v.trim().toLowerCase();
+  let s = v.trim().toLowerCase();
+  if (s === 'iso9001') s = 'iso-9001'; // fix10aj: tiresiz yazim tek istisna olarak eslenir
   return FACTORY_CERT_ICONS.includes(s) ? s : null;
 }
 function cleanFactoryCertificates(v) {
