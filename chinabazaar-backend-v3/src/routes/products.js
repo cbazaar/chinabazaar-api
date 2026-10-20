@@ -21,6 +21,10 @@
 //   (requireFactoryOrMasterAuth; master factory_id ZORUNLU -> 400 master_factory_id_required);
 //   marka baskasinda varsa 409 brand_taken; admin PUT /factory/admin/:id ayni kontrolle yazar.
 //   Brand alanlari yalniz toFactoryAdmin (+owner) ile doner, PUBLIC serializer'da YOK.
+// fix10v: CBOs26.56-A — beyan edilen MARKA ADI herkese acik fabrika verisinde de gorunur:
+//   toFactoryPublic'e yalnizca brand_name eklendi (liste + GET /factory/:id detay kapsanir).
+//   trademark_no / trademark_office / trademark_declared_at PUBLIC'e ASLA gitmez;
+//   bu uc alan yalniz toFactoryAdmin (+owner) ile donmeye devam eder.
 // fix10e: H-B göç (transaction + doğrulama + DROP yoksa yapılmaz), H-E CBAI master
 // fix10h: CBOs26.4 — /myfactory/stats: gunluk seri (daily) + ulke dagilimi (countries); /factory/video-view: olay kaydi (ulke basliktan).
 // fix10i: CBOs26.5 — bildirimler: factory_messages/factory_quotes + seen_by_factory; GET/POST /myfactory/notifications[/read]; videos.description korunur.
@@ -859,6 +863,7 @@ function toFactoryPublic(r, opts) {
     ...contactFields,
     id: r.id,
     name: r.name,
+    brand_name: r.brand_name || null,
     cbf_code: r.cbf_code || '',
     is_verified: !!r.is_verified,
     city: r.city || '',
@@ -923,7 +928,8 @@ async function factoryFollowersMap(ids) {
 
 function toFactoryAdmin(r) {
   // myfactory_username: admin yonetimi icin doner. myfactory_password_hash ASLA donulmez (hicbir serializer'da yok).
-  // fix10u: marka tescil beyani alanlari admin + owner (toFactoryMyFactory) gorunumunde doner; PUBLIC serializer'da YOK.
+  // fix10u: marka tescil beyani alanlari admin + owner (toFactoryMyFactory) gorunumunde doner.
+  // fix10v: brand_name toFactoryPublic'te de doner; trademark_no/office/declared_at PUBLIC'te YOK.
   return { ...toFactoryPublic(r), myfactory_username: r.myfactory_username || null, brand_name: r.brand_name || null, trademark_no: r.trademark_no || null, trademark_office: r.trademark_office || null, trademark_declared_at: r.trademark_declared_at || null, is_active: r.is_active !== false, created_at: r.created_at, updated_at: r.updated_at };
 }
 
