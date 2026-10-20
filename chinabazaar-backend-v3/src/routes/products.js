@@ -115,6 +115,13 @@
 //   akis bozulmaz). fix10aa'nin site_visitors_total'i AYNEN kalir — ikisi
 //   farkli seylerdir: total = tum zamanlarin sayfa goruntulenmesi toplami,
 //   online_now = su an sitede olan ziyaretci sayisi.
+// fix10ad: CBOs26.77-A — ALT ALAN ADI eslesmesi icin public ciktiya username:
+//   toFactoryPublic artik username: r.myfactory_username || null doner
+//   (liste + GET /factory/:id detay ayni serializer'i kullanir, ikisi de
+//   kazanir; feed nesnesine EKLENMEDI). Login adi fabrikalarin paylastigi
+//   acik bilgidir — iletisim alanlari (fix10e M7, includeContact:false)
+//   public'e DONMEZ, o kural AYNEN. Tek degisiklik budur; baska hicbir
+//   serializer/uc davranisi degismez.
 // fix10e: H-B göç (transaction + doğrulama + DROP yoksa yapılmaz), H-E CBAI master
 // fix10h: CBOs26.4 — /myfactory/stats: gunluk seri (daily) + ulke dagilimi (countries); /factory/video-view: olay kaydi (ulke basliktan).
 // fix10i: CBOs26.5 — bildirimler: factory_messages/factory_quotes + seen_by_factory; GET/POST /myfactory/notifications[/read]; videos.description korunur.
@@ -995,6 +1002,10 @@ function toFactoryPublic(r, opts) {
     ...contactFields,
     id: r.id,
     name: r.name,
+    // fix10ad: alt alan adi (<username>.chinabazaar.com) eslesmesi icin login adi
+    // public ciktida — fabrikalarin paylastigi acik bilgidir; iletisim gizleme
+    // kurali (includeContact) AYNEN gecerlidir, bu alan onu etkilemez.
+    username: r.myfactory_username || null,
     brand_name: publicBrands.length ? publicBrands[0].brand_name : null,
     brands: publicBrands.map((b) => b.brand_name),
     cbf_code: r.cbf_code || '',
