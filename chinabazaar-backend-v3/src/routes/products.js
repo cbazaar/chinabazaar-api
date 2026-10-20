@@ -65,6 +65,17 @@
 //   OKUMA: toFactoryPublic videos'u DB'den aynen gecirdigi icin attributes
 //   public dahil her serializer'da aynen doner; GET /factory/feed'in elle
 //   kurdugu video nesnesine de attributes (dizi ise) aynen eklendi.
+// fix10z: CBOs26.64-A — gonderi turu FOTOGRAF (kind:'photo'): fabrikalar akista
+//   video gibi fotograf da paylasir. cleanFactoryVideos 'photo'yu kabul eder;
+//   url bir RESIM adresidir ve video ile AYNI denetimden gecer (https zorunlu +
+//   isAllowedFactoryMediaUrl konak allowlist'i — kapak/sohbet dosyalarinin
+//   geldigi kendi API konagimizdaki chat-file yolu dahil). Izin disi konak ->
+//   oge atilir (invalid_videos, mevcut desen). title/description/attributes
+//   (fix10y) photo'da AYNEN korunur; video-ozgu sure/oran alani photo'da
+//   ARANMAZ. OKUMA: public serializer videos'u aynen gecirir (photo da doner);
+//   GET /factory/feed'in video nesnesine kind da eklendi (photo ayirt edilsin).
+//   Izlenme takibi (factory_video_views) DEGISMADI — photo ogeleri video
+//   sayaclarina karismaz, photo icin ayri sayac YOKTUR.
 // fix10e: H-B göç (transaction + doğrulama + DROP yoksa yapılmaz), H-E CBAI master
 // fix10h: CBOs26.4 — /myfactory/stats: gunluk seri (daily) + ulke dagilimi (countries); /factory/video-view: olay kaydi (ulke basliktan).
 // fix10i: CBOs26.5 — bildirimler: factory_messages/factory_quotes + seen_by_factory; GET/POST /myfactory/notifications[/read]; videos.description korunur.
@@ -1164,6 +1175,8 @@ function cleanVideoAttributes(v) {
 }
 
 // videos: [{title?, url, kind, attributes?}] — gecersiz oge varsa null (handler 400 doner)
+// fix10z: kind 'photo' da gecerli — fotograf gonderisi; url bir resim adresidir,
+// ayni konak allowlist denetiminden gecer (asagidaki url satiri tum turler icin ortak).
 function cleanFactoryVideos(v) {
   if (v === undefined) return undefined;
   if (!Array.isArray(v)) return null;
@@ -1171,7 +1184,7 @@ function cleanFactoryVideos(v) {
   for (const it of v) {
     if (!it || typeof it !== 'object' || Array.isArray(it)) return null;
     if (typeof it.url !== 'string' || !isAllowedFactoryMediaUrl(it.url.trim()) || it.url.trim().length > 2048) return null; // fix10e L8: konak allowlist
-    if (it.kind !== 'video' && it.kind !== 'canli') return null;
+    if (it.kind !== 'video' && it.kind !== 'canli' && it.kind !== 'photo') return null; // fix10z: 'photo' fotograf gonderisi
     const rec = { title: typeof it.title === 'string' ? it.title.trim().slice(0, 200) : '', description: typeof it.description === 'string' ? it.description.trim().slice(0, 2000) : '', url: it.url.trim(), kind: it.kind };
     const attrs = cleanVideoAttributes(it.attributes); // fix10y: ürün özellikleri (yoksa anahtar eklenmez)
     if (attrs) rec.attributes = attrs;
@@ -2475,6 +2488,7 @@ router.get('/factory/feed', requireAuth, asyncHandler(async (req, res) => {
       const url = typeof v.url === 'string' ? v.url : '';
       if (!url) continue;
       const feedVideo = { title: typeof v.title === 'string' ? v.title : '', description: typeof v.description === 'string' ? v.description : '', url };
+      if (v.kind === 'video' || v.kind === 'canli' || v.kind === 'photo') feedVideo.kind = v.kind; // fix10z (CBOs26.64): gonderi turu de doner (photo ayirt edilsin)
       if (Array.isArray(v.attributes)) feedVideo.attributes = v.attributes; // fix10y (CBOs26.62): ürün özellikleri aynen döner
       items.push({
         factory_id: r.id,
