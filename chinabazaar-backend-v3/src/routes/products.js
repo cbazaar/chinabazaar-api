@@ -115,6 +115,15 @@
 //   akis bozulmaz). fix10aa'nin site_visitors_total'i AYNEN kalir — ikisi
 //   farkli seylerdir: total = tum zamanlarin sayfa goruntulenmesi toplami,
 //   online_now = su an sitede olan ziyaretci sayisi.
+// fix10af: CBOs26.80-A — fabrika panelinden SIRKET ADI guncelleme:
+//   PUT /factory/myfactory/profile artik `name` alanini da kabul eder —
+//   fabrika kendi sirket adini panelden degistirebilir. Kurallar: yalniz
+//   string; trim sonrasi 2-120 krk arasindaysa factories.name guncellenir;
+//   bos / 1 krk / 120'den uzun / string olmayan deger SESSIZCE atlanir
+//   (diger alanlar islenir, tek basina gelirse nothing_to_update deseni).
+//   cbf_code / is_verified / is_active bu yolda HALA yasaktir (sessizce
+//   yoksayilir). Admin PUT davranisi AYNEN (orada name zaten kabul
+//   ediliyordu). Tek degisiklik budur; baska hicbir alan/uc degismez.
 // fix10ae: CBOs26.79-A — fabrika SERTIFIKALARI (belgeler): fabrika nesnesine
 //   certificates: [{title, url}] alani. factories.certificates JSONB sutunu
 //   (ensureFactoryTables ADD COLUMN IF NOT EXISTS). YUKLEME: mevcut chat-upload
@@ -1920,10 +1929,11 @@ router.get('/factory/myfactory/me', requireFactoryOrMasterAuth, asyncHandler(asy
 }));
 
 // PUT /api/products/factory/myfactory/profile — SADECE kendi fabrikasini gunceller.
-// Duzenlenebilir: desc, city, category, main_products, certs, features, hashtags, tags,
+// Duzenlenebilir: name (fix10af — yalniz string, trim sonrasi 2-120 krk; baska turlu sessizce
+// atlanir), desc, city, category, main_products, certs, features, hashtags, tags,
 // address, phone, contact, wechat, whatsapp, email, import_countries, employees,
 // annual_revenue, factory_area, years, socials, cover_image, videos, certificates (fix10ae).
-// YASAK (sessizce yoksayilir): name, cbf_code, is_verified, is_active (+ moq/stock/capacity).
+// YASAK (sessizce yoksayilir): cbf_code, is_verified, is_active (+ moq/stock/capacity).
 // fix10d — master: factory_id gövdede/query'de ZORUNLU (yoksa 400), master her fabrikayı
 // düzenler. Fabrika tokenı: yalnızca kendi fabrikası (gövdedeki/sorgudaki farklı factory_id → 403).
 router.put('/factory/myfactory/profile', requireFactoryOrMasterAuth, asyncHandler(async (req, res) => {
@@ -1960,6 +1970,13 @@ router.put('/factory/myfactory/profile', requireFactoryOrMasterAuth, asyncHandle
   const params = [targetFactoryId];
   const push = (col, val, cast) => { params.push(val); sets.push(`${col} = $${params.length}${cast || ''}`); };
   const bad = (code, message) => res.status(400).json({ error: code, message });
+  // fix10af — sirket adi (name): yalniz string kabul edilir; trim sonrasi 2-120 krk
+  // arasindaysa guncellenir. Bos / 1 krk / 120'den uzun / string olmayan deger
+  // sessizce atlanir (diger alanlar islenmeye devam eder).
+  if (typeof body.name === 'string') {
+    const factoryName = body.name.trim();
+    if (factoryName.length >= 2 && factoryName.length <= 120) push('name', factoryName);
+  }
   // desc / description: ikisi de kabul edilir, desc onceliklidir.
   if (body.desc !== undefined || body.description !== undefined) {
     const c = cleanFactoryText(body.desc !== undefined ? body.desc : body.description, 10000);
