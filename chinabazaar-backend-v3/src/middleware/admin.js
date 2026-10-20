@@ -15,6 +15,7 @@ const asyncHandler = require('./asyncHandler');
 const jwt = require('jsonwebtoken');
 const cfg = require('../config');
 const pool = require('../db');
+const { isMasterJtiRevoked } = require('./masterRevoke'); // 2026-10-20 N1: master iptal kontrolü
 
 function isMasterClaim(claim) {
   return !!claim && claim.role === 'master' && claim.is_admin === true;
@@ -28,7 +29,14 @@ const requireAdmin = asyncHandler(async (req, res, next) => {
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (token) {
     try {
-      if (isMasterClaim(jwt.verify(token, cfg.jwtSecret, { algorithms: cfg.jwtAlgorithms }))) return next();
+      const payload = jwt.verify(token, cfg.jwtSecret, { algorithms: cfg.jwtAlgorithms });
+      if (isMasterClaim(payload)) {
+        // 2026-10-20 N1: iptal edilmiş master jeton reddedilir (sızıntı durumunda).
+        if (payload.jti && (await isMasterJtiRevoked(payload.jti))) {
+          return res.status(401).json({ error: 'token_revoked' });
+        }
+        return next();
+      }
     } catch { /* geçersiz jeton: aşağıdaki normal akışa düşer */ }
   }
   // 3) Normal admin akışı (aynen):
