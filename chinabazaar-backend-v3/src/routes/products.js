@@ -52,6 +52,19 @@
 //   SERILESTIRME: admin/owner'da brands: [{id, brand_name, trademark_no,
 //   trademark_office, declared_at}] + eski alanlar ILK markadan; PUBLIC'te brand_name
 //   = ilk marka adi + brands: [adlar] (no/ofis PUBLIC'e ASLA gitmez).
+// fix10y: CBOs26.62-A — video URUN OZELLIKLERI (attributes): video ogesi
+//   {title, description, url, kind, attributes?: [{name, value}]} — ad-deger
+//   ciftleri (orn. Malzeme: Celik, Garanti: Bir Yil). cleanFactoryVideos artik
+//   attributes'i KORUR; tum yazma yollari (owner PUT 1745, POST/upsert 2603,
+//   admin PUT 2939) ayni fonksiyondan gectigi icin hepsi kapsanir. Kurallar
+//   (cleanVideoAttributes): dizi degilse alan ATILIR (video yine gecerli —
+//   400 YOK); en fazla 40 oge; name trim -> <=80, value trim -> <=500 (title/
+//   description desenindeki gibi KESILIR); name veya value bos olan oge atilir;
+//   fazladan alanlar alinmaz. Hic gecerli oge yoksa anahtar HIC eklenmez —
+//   attributes'siz eski video bugunku bicimiyle kalir (geri uyum).
+//   OKUMA: toFactoryPublic videos'u DB'den aynen gecirdigi icin attributes
+//   public dahil her serializer'da aynen doner; GET /factory/feed'in elle
+//   kurdugu video nesnesine de attributes (dizi ise) aynen eklendi.
 // fix10e: H-B göç (transaction + doğrulama + DROP yoksa yapılmaz), H-E CBAI master
 // fix10h: CBOs26.4 — /myfactory/stats: gunluk seri (daily) + ulke dagilimi (countries); /factory/video-view: olay kaydi (ulke basliktan).
 // fix10i: CBOs26.5 — bildirimler: factory_messages/factory_quotes + seen_by_factory; GET/POST /myfactory/notifications[/read]; videos.description korunur.
@@ -1130,7 +1143,27 @@ function cleanFactoryHashtags(v) {
   return out.join(', ');
 }
 
-// videos: [{title?, url, kind}] — gecersiz oge varsa null (handler 400 doner)
+// fix10y (CBOs26.62): video ürün özellikleri — [{name, value}] ad-değer çiftleri.
+// Dizi değilse alan atılır (null döner, video yine geçerli); en fazla 40 öğe;
+// name trim -> <=80, value trim -> <=500 karakter (title/description desenindeki
+// gibi kesilir); name veya value boşsa öğe atılır; fazladan alanlar alınmaz.
+// Geçerli öğe yoksa null — çağıran attributes anahtarını hiç eklemez (geri uyum).
+function cleanVideoAttributes(v) {
+  if (!Array.isArray(v)) return null;
+  const out = [];
+  for (const it of v) {
+    if (out.length >= 40) break;
+    if (!it || typeof it !== 'object' || Array.isArray(it)) continue;
+    if (typeof it.name !== 'string' || typeof it.value !== 'string') continue;
+    const name = it.name.trim().slice(0, 80);
+    const value = it.value.trim().slice(0, 500);
+    if (!name || !value) continue;
+    out.push({ name, value });
+  }
+  return out.length ? out : null;
+}
+
+// videos: [{title?, url, kind, attributes?}] — gecersiz oge varsa null (handler 400 doner)
 function cleanFactoryVideos(v) {
   if (v === undefined) return undefined;
   if (!Array.isArray(v)) return null;
@@ -1139,7 +1172,10 @@ function cleanFactoryVideos(v) {
     if (!it || typeof it !== 'object' || Array.isArray(it)) return null;
     if (typeof it.url !== 'string' || !isAllowedFactoryMediaUrl(it.url.trim()) || it.url.trim().length > 2048) return null; // fix10e L8: konak allowlist
     if (it.kind !== 'video' && it.kind !== 'canli') return null;
-    out.push({ title: typeof it.title === 'string' ? it.title.trim().slice(0, 200) : '', description: typeof it.description === 'string' ? it.description.trim().slice(0, 2000) : '', url: it.url.trim(), kind: it.kind });
+    const rec = { title: typeof it.title === 'string' ? it.title.trim().slice(0, 200) : '', description: typeof it.description === 'string' ? it.description.trim().slice(0, 2000) : '', url: it.url.trim(), kind: it.kind };
+    const attrs = cleanVideoAttributes(it.attributes); // fix10y: ürün özellikleri (yoksa anahtar eklenmez)
+    if (attrs) rec.attributes = attrs;
+    out.push(rec);
   }
   return out;
 }
@@ -2438,12 +2474,14 @@ router.get('/factory/feed', requireAuth, asyncHandler(async (req, res) => {
       if (!v || typeof v !== 'object' || Array.isArray(v)) continue;
       const url = typeof v.url === 'string' ? v.url : '';
       if (!url) continue;
+      const feedVideo = { title: typeof v.title === 'string' ? v.title : '', description: typeof v.description === 'string' ? v.description : '', url };
+      if (Array.isArray(v.attributes)) feedVideo.attributes = v.attributes; // fix10y (CBOs26.62): ürün özellikleri aynen döner
       items.push({
         factory_id: r.id,
         factory_name: r.name,
         cbf_code: r.cbf_code || '',
         cover_image: r.cover_image || '',
-        video: { title: typeof v.title === 'string' ? v.title : '', description: typeof v.description === 'string' ? v.description : '', url },
+        video: feedVideo,
       });
     }
   }
