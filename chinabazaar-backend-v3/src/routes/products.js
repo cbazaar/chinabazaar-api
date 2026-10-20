@@ -142,6 +142,13 @@
 //   olan TUM aktif fabrikalar icin ensure cagirir; env yoksa
 //   { ok:false, reason:'netlify_not_configured' }. Node yerlesik fetch,
 //   ~8 sn zaman asimi (AbortController); ek bagimlilik yok.
+// fix10ah: CBOs26.85-A — sertifika ogelerine opsiyonel ICON alani:
+//   cleanFactoryCertificates her ogede icon'u da temizler — string ise
+//   kucuk harfe cevrilir, SABIT listede (shield/award/leaf/flask/globe/
+//   star/seal/factory/doc) ise korunur; listede degilse/bossa ogede icon
+//   anahtari YAZILMAZ (on yuz varsayilan ikonu kullanir). parse da ayni
+//   listeyle dogrular (okumada gecersiz ikon dusurulur). title/url
+//   davranisi ve baska hicbir uc/davranis AYNEN.
 // fix10ae: CBOs26.79-A — fabrika SERTIFIKALARI (belgeler): fabrika nesnesine
 //   certificates: [{title, url}] alani. factories.certificates JSONB sutunu
 //   (ensureFactoryTables ADD COLUMN IF NOT EXISTS). YUKLEME: mevcut chat-upload
@@ -1400,6 +1407,14 @@ function cleanVideoAttributes(v) {
 // OKUMA (parseFactoryCertificates): DB degeri (JSONB dizi veya JSON string)
 // ayni bicime normalize edilir; bozuk/bos ise []. Okumada konak denetimi
 // YAPILMAZ (yazarken denetlendi; eski veri geriye uyumlu doner).
+// fix10ah: opsiyonel icon — yalniz SABIT listedeki deger korunur (kucuk
+// harfe cevrilir); gecersiz/bos ikon ogeden DUSURULUR, oge kalir.
+const FACTORY_CERT_ICONS = ['shield', 'award', 'leaf', 'flask', 'globe', 'star', 'seal', 'factory', 'doc'];
+function cleanFactoryCertIcon(v) {
+  if (typeof v !== 'string') return null;
+  const s = v.trim().toLowerCase();
+  return FACTORY_CERT_ICONS.includes(s) ? s : null;
+}
 function cleanFactoryCertificates(v) {
   if (v === undefined) return undefined;
   if (!Array.isArray(v)) return undefined;
@@ -1412,7 +1427,10 @@ function cleanFactoryCertificates(v) {
     const url = it.url.trim();
     if (!title || !url || url.length > 2048) continue;
     if (!isAllowedFactoryMediaUrl(url)) continue;
-    out.push({ title, url });
+    const rec = { title, url };
+    const icon = cleanFactoryCertIcon(it.icon);
+    if (icon) rec.icon = icon;
+    out.push(rec);
   }
   return out;
 }
@@ -1429,7 +1447,10 @@ function parseFactoryCertificates(v) {
     const title = it.title.trim();
     const url = it.url.trim();
     if (!title || !url) continue;
-    out.push({ title, url });
+    const rec = { title, url };
+    const icon = cleanFactoryCertIcon(it.icon); // fix10ah: okumada da ayni liste gecerli
+    if (icon) rec.icon = icon;
+    out.push(rec);
   }
   return out;
 }
