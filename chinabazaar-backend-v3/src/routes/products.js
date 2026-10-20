@@ -115,6 +115,17 @@
 //   akis bozulmaz). fix10aa'nin site_visitors_total'i AYNEN kalir — ikisi
 //   farkli seylerdir: total = tum zamanlarin sayfa goruntulenmesi toplami,
 //   online_now = su an sitede olan ziyaretci sayisi.
+// fix10ae: CBOs26.79-A — fabrika SERTIFIKALARI (belgeler): fabrika nesnesine
+//   certificates: [{title, url}] alani. factories.certificates JSONB sutunu
+//   (ensureFactoryTables ADD COLUMN IF NOT EXISTS). YUKLEME: mevcut chat-upload
+//   akisinda kind=cert destegi — PDF + resim (mevcut sihirli bayt denetimi,
+//   <=10MB), SURESIz saklama (kind=cover davranisinin aynisi, expires_at NULL;
+//   yalniz fabrika/master). OKUMA: toFactoryPublic certificates doner (yoksa
+//   []); admin/myfactory serializer'lari zincirle kazanir. YAZMA: myfactory PUT
+//   + admin PUT yollarinda TOPTAN yazilir (socials deseni) — en cok 20 oge;
+//   title ZORUNLU (trim -> <=120 kesilir), url ZORUNLU ve
+//   isAllowedFactoryMediaUrl denetiminden gecer; gecersiz oge ATILIR; dizi
+//   olmayan deger sessizce yok sayilir. Baska hicbir davranis degismez.
 // fix10ad: CBOs26.77-A — ALT ALAN ADI eslesmesi icin public ciktiya username:
 //   toFactoryPublic artik username: r.myfactory_username || null doner
 //   (liste + GET /factory/:id detay ayni serializer'i kullanir, ikisi de
@@ -660,6 +671,8 @@ async function ensureFactoryTables() {
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS wechat TEXT DEFAULT ''`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS whatsapp TEXT DEFAULT ''`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS socials JSONB DEFAULT '{}'`);
+  // fix10ae (CBOs26.79-A): fabrika SERTIFIKA belgeleri — [{title, url}] (JSONB dizi).
+  await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS certificates JSONB DEFAULT '[]'`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS tags TEXT DEFAULT ''`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS features TEXT DEFAULT ''`);
@@ -1027,6 +1040,7 @@ function toFactoryPublic(r, opts) {
     cover_image: r.cover_image || '',
     hashtags: r.hashtags || '',
     socials: parseFactorySocials(r.socials),
+    certificates: parseFactoryCertificates(r.certificates), // fix10ae: sertifika belgeleri [{title, url}] (yoksa [])
     tags: r.tags || '',
     videos,
     // fix10aa (CBOs26.68): page_views — yalnizca satir degeri TASIRSA eklenir (public liste/detay
@@ -1276,6 +1290,50 @@ function cleanVideoAttributes(v) {
     out.push({ name, value });
   }
   return out.length ? out : null;
+}
+
+// fix10ae (CBOs26.79-A): fabrika SERTIFIKA belgeleri — [{title, url}].
+// YAZMA (cleanFactoryCertificates): undefined => dokunma; dizi DEGILSE sessizce
+// yok sayilir (undefined doner — mevcut PUT desenlerindeki gibi handler
+// yazmadan gecer, 400 YOK). Dizi ise TOPTAN yazim listesi kurulur: en cok 20
+// oge; title ZORUNLU (trim -> <=120 kesilir, bos ise oge atilir); url ZORUNLU
+// (trim, <=2048) ve isAllowedFactoryMediaUrl konak denetiminden gecer (kendi
+// API chat-file yolu + izinli konaklar) — gecemeyen oge ATILIR, yazim durmaz.
+// OKUMA (parseFactoryCertificates): DB degeri (JSONB dizi veya JSON string)
+// ayni bicime normalize edilir; bozuk/bos ise []. Okumada konak denetimi
+// YAPILMAZ (yazarken denetlendi; eski veri geriye uyumlu doner).
+function cleanFactoryCertificates(v) {
+  if (v === undefined) return undefined;
+  if (!Array.isArray(v)) return undefined;
+  const out = [];
+  for (const it of v) {
+    if (out.length >= 20) break;
+    if (!it || typeof it !== 'object' || Array.isArray(it)) continue;
+    if (typeof it.title !== 'string' || typeof it.url !== 'string') continue;
+    const title = it.title.trim().slice(0, 120);
+    const url = it.url.trim();
+    if (!title || !url || url.length > 2048) continue;
+    if (!isAllowedFactoryMediaUrl(url)) continue;
+    out.push({ title, url });
+  }
+  return out;
+}
+
+function parseFactoryCertificates(v) {
+  let arr = v;
+  if (typeof arr === 'string') { try { arr = JSON.parse(arr); } catch { return []; } }
+  if (!Array.isArray(arr)) return [];
+  const out = [];
+  for (const it of arr) {
+    if (out.length >= 20) break;
+    if (!it || typeof it !== 'object' || Array.isArray(it)) continue;
+    if (typeof it.title !== 'string' || typeof it.url !== 'string') continue;
+    const title = it.title.trim();
+    const url = it.url.trim();
+    if (!title || !url) continue;
+    out.push({ title, url });
+  }
+  return out;
 }
 
 // videos: [{title?, url, kind, product_description?, attributes?}] — gecersiz oge varsa null (handler 400 doner)
@@ -1864,7 +1922,7 @@ router.get('/factory/myfactory/me', requireFactoryOrMasterAuth, asyncHandler(asy
 // PUT /api/products/factory/myfactory/profile — SADECE kendi fabrikasini gunceller.
 // Duzenlenebilir: desc, city, category, main_products, certs, features, hashtags, tags,
 // address, phone, contact, wechat, whatsapp, email, import_countries, employees,
-// annual_revenue, factory_area, years, socials, cover_image, videos.
+// annual_revenue, factory_area, years, socials, cover_image, videos, certificates (fix10ae).
 // YASAK (sessizce yoksayilir): name, cbf_code, is_verified, is_active (+ moq/stock/capacity).
 // fix10d — master: factory_id gövdede/query'de ZORUNLU (yoksa 400), master her fabrikayı
 // düzenler. Fabrika tokenı: yalnızca kendi fabrikası (gövdedeki/sorgudaki farklı factory_id → 403).
@@ -1929,6 +1987,8 @@ router.put('/factory/myfactory/profile', requireFactoryOrMasterAuth, asyncHandle
   if (body.socials !== undefined) { const c = cleanFactorySocials(body.socials); if (c === null) return bad('invalid_socials', 'Sosyal medya bağlantıları geçerli değil.'); push('socials', JSON.stringify(c), '::jsonb'); }
   if (body.cover_image !== undefined) { const c = cleanFactoryCoverImage(body.cover_image); if (c === null) return bad('invalid_cover_image', 'Kapak görseli geçerli bir bağlantı olmalı.'); push('cover_image', c); }
   if (body.videos !== undefined) { const c = cleanFactoryVideos(body.videos); if (c === null) return bad('invalid_videos', 'Videolar geçerli değil.'); push('videos', JSON.stringify(c), '::jsonb'); }
+  // fix10ae: sertifikalar TOPTAN yazilir — dizi degilse cleaner undefined doner (sessizce yok sayilir).
+  if (body.certificates !== undefined) { const c = cleanFactoryCertificates(body.certificates); if (c !== undefined) push('certificates', JSON.stringify(c), '::jsonb'); }
   if (!sets.length) return bad('nothing_to_update', 'Güncellenecek bir alan gönderilmedi.');
   sets.push('updated_at = now()');
   const { rows } = await pool.query(`UPDATE factories SET ${sets.join(', ')} WHERE id = $1 RETURNING *`, params);
@@ -3142,6 +3202,11 @@ router.put('/factory/admin/:id', requireAuth, requireAdmin,
       if (c === null) return res.status(400).json({ error: 'invalid_cover_image' });
       push('cover_image', c);
     }
+    // fix10ae: sertifikalar TOPTAN yazilir — dizi degilse cleaner undefined doner (sessizce yok sayilir).
+    if (req.body.certificates !== undefined) {
+      const c = cleanFactoryCertificates(req.body.certificates);
+      if (c !== undefined) push('certificates', JSON.stringify(c), '::jsonb');
+    }
     if (!sets.length && adminBrandsSet === null) return res.status(400).json({ error: 'nothing_to_update' });
     let rows;
     if (sets.length) {
@@ -3372,6 +3437,12 @@ const CHAT_UPLOAD_MIME = {
   'video/mp4': 'mp4', 'video/webm': 'webm',
 };
 const CHAT_UPLOAD_MAX = 10 * 1024 * 1024; // 10 MB
+
+// fix10ae (CBOs26.79-A): kind=cert yuklemeleri — fabrika SERTIFIKA belgeleri.
+// Yalniz PDF + resim kabul edilir (Excel/video cert olarak yuklenemez); ayni
+// sihirli bayt denetimi + <=10MB kurali gecerlidir. Kalicilik kind=cover
+// desenindedir (expires_at NULL) ve cover gibi yalniz fabrika/master kullanir.
+const CERT_UPLOAD_MIME = { 'application/pdf': true, 'image/jpeg': true, 'image/png': true, 'image/webp': true, 'image/gif': true };
 
 // Dosya adi temizleme: basename al, yol ayiraci + kontrol karakterlerini at, en fazla 200 karakter.
 function sanitizeChatFilename(name) {
@@ -3670,6 +3741,10 @@ router.post(
     }
     const mime = file.contentType;
     if (!CHAT_UPLOAD_MIME[mime]) return res.status(400).json({ error: 'unsupported_file_type' });
+    // fix10ae: kind=cert (fabrika/master) — sertifika belgesi yalniz PDF/resim
+    // olabilir; Excel/video gibi diger izinli sohbet turleri cert olarak reddedilir.
+    const isCert = String(req.query.kind || '').toLowerCase() === 'cert' && (req.factoryId != null || req.isMaster);
+    if (isCert && !CERT_UPLOAD_MIME[mime]) return res.status(400).json({ error: 'unsupported_file_type' });
     // fix10e M5: mime/boyut çapraz kontrolü — beyan edilen boyut (multipart
     // Content-Length / gövde uzunluğu) gerçek arabellek uzunluğuyla aynı
     // olmalı; uyuşmazlık reddedilir. (file.data.length gövdenin kendisidir;
@@ -3698,8 +3773,9 @@ router.post(
     // fix10l (CBOs26.16): kapak yüklemesi SÜRESİZ — fabrika/master ?kind=cover ile yükler
     // (kapak banner'ı 7 günde ölmemeli). Normal kullanıcılar kind=cover KULLANAMAZ (depolama şişmesin).
     const isCover = String(req.query.kind || '').toLowerCase() === 'cover' && (req.factoryId != null || req.isMaster);
+    // fix10ae: kind=cert de SÜRESİZ saklanir (sertifika belgesi 7 gunde olmemeli) — cover deseni.
     const { rows } = await pool.query(
-      `INSERT INTO factory_chat_files (token, data, mime, name, size, uploaded_by, expires_at) VALUES ($1, $2, $3, $4, $5, $6, ${isCover ? 'NULL' : "now() + interval '7 days'"}) RETURNING id`,
+      `INSERT INTO factory_chat_files (token, data, mime, name, size, uploaded_by, expires_at) VALUES ($1, $2, $3, $4, $5, $6, ${isCover || isCert ? 'NULL' : "now() + interval '7 days'"}) RETURNING id`,
       [token, file.data, mime, displayName, file.data.length, ownerId]
     );
     const base = req.protocol + '://' + req.get('host');
