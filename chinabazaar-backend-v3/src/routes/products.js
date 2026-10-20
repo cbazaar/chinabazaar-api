@@ -76,6 +76,29 @@
 //   GET /factory/feed'in video nesnesine kind da eklendi (photo ayirt edilsin).
 //   Izlenme takibi (factory_video_views) DEGISMADI — photo ogeleri video
 //   sayaclarina karismaz, photo icin ayri sayac YOKTUR.
+// fix10aa: CBOs26.68-A — ZIYARETCI SAYILARI public yanitlarda: fabrika basina
+//   page_views + site toplami site_visitors_total. Kaynak/tanim panel
+//   istatistigiyle (GET /factory/myfactory/stats -> total_page_visitors)
+//   BIREBIR AYNI: factory_page_views.visits (tablo yoksa 0, akis bozulmaz).
+//   toFactoryPublic, satir page_views TASIRSA alani ekler — public liste
+//   (GET /factory/list) ve detay (GET /factory/:id) uclari factoryPageViewsMap
+//   ile doldurur; admin/owner satirlari tasimadigi icin o serializer'larin
+//   ciktisi DEGISMEZ. GET /factory/list yaniti { factories: [...],
+//   site_visitors_total } olur (on yuz v230+ Array.isArray ? data :
+//   data.factories ile iki bicimi de kabul eder — dogrulandi). GET
+//   /factory/feed meta'sina da site_visitors_total eklendi (tek aggregate
+//   sorgu: factorySiteVisitorsTotal). Ekleme yalnizdir; mevcut alan yok olmaz.
+// fix10ab: CBOs26.68-B — video/foto ogesinde product_description: paneldeki
+//   "Urun Aciklamasi" alani (kisa description'dan AYRI, uzun urun aciklamasi).
+//   cleanFactoryVideos artik product_description'i KORUR; tum yazma yollari
+//   (owner PUT, admin POST/upsert+merge, admin PUT) ayni fonksiyondan gectigi
+//   icin hepsi kapsanir. Kurallar: yalnizca dizgi ise alinir; trim -> <=2000
+//   karakter (description desenindeki gibi KESILIR); bos ise anahtar HIC
+//   eklenmez; dizgi degilse alan ATILIR (oge yine gecerli — 400 YOK).
+//   Anahtar sirasi: title, description, product_description, url, kind,
+//   attributes. OKUMA: serializer'lar videos'u aynen gecirir; GET
+//   /factory/feed'in elle kurdugu video nesnesine de product_description
+//   (dizgi ise) aynen eklendi.
 // fix10e: H-B göç (transaction + doğrulama + DROP yoksa yapılmaz), H-E CBAI master
 // fix10h: CBOs26.4 — /myfactory/stats: gunluk seri (daily) + ulke dagilimi (countries); /factory/video-view: olay kaydi (ulke basliktan).
 // fix10i: CBOs26.5 — bildirimler: factory_messages/factory_quotes + seen_by_factory; GET/POST /myfactory/notifications[/read]; videos.description korunur.
@@ -962,6 +985,10 @@ function toFactoryPublic(r, opts) {
     socials: parseFactorySocials(r.socials),
     tags: r.tags || '',
     videos,
+    // fix10aa (CBOs26.68): page_views — yalnizca satir degeri TASIRSA eklenir (public liste/detay
+    // uclari factoryPageViewsMap ile doldurur; tanim panel istatistigiyle ayni: factory_page_views.visits).
+    // Admin/owner satirlari tasimaz -> o serializer'larin ciktisi birebir ayni kalir.
+    ...(r.page_views !== undefined && r.page_views !== null ? { page_views: Number(r.page_views) || 0 } : {}),
   };
 }
 // v55: fabrika puan ortalamalari — tek sorgu, N+1 yok. Yoksa avg=null, count=0.
@@ -1001,6 +1028,30 @@ async function factoryFollowersMap(ids) {
   const { rows } = await pool.query('SELECT factory_id, COUNT(*)::int AS cnt FROM factory_follows WHERE factory_id = ANY($1) GROUP BY factory_id', [list]);
   for (const r of rows) map[r.factory_id] = r.cnt;
   return map;
+}
+
+// fix10aa (CBOs26.68): fabrika sayfa goruntulenmeleri — panel istatistigiyle (myfactory/stats
+// total_page_visitors) AYNI tanim/kaynak: factory_page_views.visits. Tek sorgu, N+1 yok.
+// Goruntulenme yoksa 0; tablo yoksa (eski DB) hepsi 0 — panel desenindeki gibi akis bozulmaz.
+async function factoryPageViewsMap(ids) {
+  const map = {};
+  const list = (ids || []).filter((x) => Number.isInteger(x));
+  for (const id of list) map[id] = 0;
+  if (!list.length) return map;
+  try {
+    const { rows } = await pool.query('SELECT factory_id, visits FROM factory_page_views WHERE factory_id = ANY($1)', [list]);
+    for (const r of rows) map[r.factory_id] = r.visits || 0;
+  } catch (e) { /* factory_page_views yoksa hepsi 0 kalir */ }
+  return map;
+}
+
+// fix10aa (CBOs26.68): TUM fabrikalarin toplam sayfa goruntulenmesi (site ziyaretci sayisi).
+// Tek aggregate sorgu; tablo yoksa 0.
+async function factorySiteVisitorsTotal() {
+  try {
+    const { rows } = await pool.query('SELECT COALESCE(SUM(visits), 0)::int AS total FROM factory_page_views');
+    return (rows[0] && rows[0].total) || 0;
+  } catch (e) { return 0; }
 }
 
 function toFactoryAdmin(r) {
@@ -1174,7 +1225,7 @@ function cleanVideoAttributes(v) {
   return out.length ? out : null;
 }
 
-// videos: [{title?, url, kind, attributes?}] — gecersiz oge varsa null (handler 400 doner)
+// videos: [{title?, url, kind, product_description?, attributes?}] — gecersiz oge varsa null (handler 400 doner)
 // fix10z: kind 'photo' da gecerli — fotograf gonderisi; url bir resim adresidir,
 // ayni konak allowlist denetiminden gecer (asagidaki url satiri tum turler icin ortak).
 function cleanFactoryVideos(v) {
@@ -1185,7 +1236,11 @@ function cleanFactoryVideos(v) {
     if (!it || typeof it !== 'object' || Array.isArray(it)) return null;
     if (typeof it.url !== 'string' || !isAllowedFactoryMediaUrl(it.url.trim()) || it.url.trim().length > 2048) return null; // fix10e L8: konak allowlist
     if (it.kind !== 'video' && it.kind !== 'canli' && it.kind !== 'photo') return null; // fix10z: 'photo' fotograf gonderisi
-    const rec = { title: typeof it.title === 'string' ? it.title.trim().slice(0, 200) : '', description: typeof it.description === 'string' ? it.description.trim().slice(0, 2000) : '', url: it.url.trim(), kind: it.kind };
+    const rec = { title: typeof it.title === 'string' ? it.title.trim().slice(0, 200) : '', description: typeof it.description === 'string' ? it.description.trim().slice(0, 2000) : '' };
+    // fix10ab: product_description — yalnizca dizgi ise korunur; trim -> <=2000 (kesilir); bos ise anahtar eklenmez; dizgi degilse atilir (oge yine gecerli)
+    if (typeof it.product_description === 'string') { const pd = it.product_description.trim().slice(0, 2000); if (pd) rec.product_description = pd; }
+    rec.url = it.url.trim();
+    rec.kind = it.kind;
     const attrs = cleanVideoAttributes(it.attributes); // fix10y: ürün özellikleri (yoksa anahtar eklenmez)
     if (attrs) rec.attributes = attrs;
     out.push(rec);
@@ -2338,7 +2393,11 @@ router.get('/factory/list', asyncHandler(async (req, res) => {
   const rmap = await factoryRatingsMap(rows.map((r) => r.id));
   const qmap = await factoryQuoteCountsMap(rows.map((r) => r.id));
   const fmap = await factoryFollowersMap(rows.map((r) => r.id)); // fix10k: takipci sayisi
-  res.json(rows.map((r) => ({ ...toFactoryPublic(r, { includeContact: false }), rating_avg: (rmap[r.id] && rmap[r.id].rating_avg !== undefined) ? rmap[r.id].rating_avg : null, rating_count: (rmap[r.id] && rmap[r.id].rating_count) || 0, quote_count: qmap[r.id] || 0, followers: fmap[r.id] || 0 }))); // fix10e M7
+  const pvmap = await factoryPageViewsMap(rows.map((r) => r.id)); // fix10aa: sayfa goruntulenmesi (panel tanimiyla ayni)
+  const siteVisitorsTotal = await factorySiteVisitorsTotal(); // fix10aa: tum fabrikalarin toplami (tek aggregate sorgu)
+  for (const r of rows) r.page_views = pvmap[r.id] || 0; // fix10aa: toFactoryPublic satirdan okur
+  // fix10aa: yanit { factories, site_visitors_total } — on yuz (v230+) Array.isArray ? data : data.factories ile iki bicimi de kabul eder.
+  res.json({ factories: rows.map((r) => ({ ...toFactoryPublic(r, { includeContact: false }), rating_avg: (rmap[r.id] && rmap[r.id].rating_avg !== undefined) ? rmap[r.id].rating_avg : null, rating_count: (rmap[r.id] && rmap[r.id].rating_count) || 0, quote_count: qmap[r.id] || 0, followers: fmap[r.id] || 0 })), site_visitors_total: siteVisitorsTotal }); // fix10e M7
 }));
 
 // GET /api/products/factory/quote-counts — her fabrikanin toplam teklif sayisi (herkese acik istatistik)
@@ -2489,6 +2548,7 @@ router.get('/factory/feed', requireAuth, asyncHandler(async (req, res) => {
       if (!url) continue;
       const feedVideo = { title: typeof v.title === 'string' ? v.title : '', description: typeof v.description === 'string' ? v.description : '', url };
       if (v.kind === 'video' || v.kind === 'canli' || v.kind === 'photo') feedVideo.kind = v.kind; // fix10z (CBOs26.64): gonderi turu de doner (photo ayirt edilsin)
+      if (typeof v.product_description === 'string' && v.product_description) feedVideo.product_description = v.product_description; // fix10ab (CBOs26.68-B): urun aciklamasi aynen doner
       if (Array.isArray(v.attributes)) feedVideo.attributes = v.attributes; // fix10y (CBOs26.62): ürün özellikleri aynen döner
       items.push({
         factory_id: r.id,
@@ -2499,7 +2559,8 @@ router.get('/factory/feed', requireAuth, asyncHandler(async (req, res) => {
       });
     }
   }
-  res.json({ items: items.slice(offset, offset + limit), total: items.length, limit, offset });
+  const siteVisitorsTotal = await factorySiteVisitorsTotal(); // fix10aa: site toplami meta'da (tek aggregate sorgu)
+  res.json({ items: items.slice(offset, offset + limit), total: items.length, limit, offset, site_visitors_total: siteVisitorsTotal });
 }));
 
 // fix10n (CBOs26.22): GET /api/products/factory/follows/mine — giris yapan kullanicinin takip ettigi fabrikalarin LISTESI.
@@ -3610,6 +3671,8 @@ router.get('/factory/:id', asyncHandler(async (req, res) => {
   const rmap = await factoryRatingsMap([r.id]);
   const qmap = await factoryQuoteCountsMap([r.id]);
   const fmap = await factoryFollowersMap([r.id]);
+  const pvmap = await factoryPageViewsMap([r.id]); // fix10aa: sayfa goruntulenmesi (panel tanimiyla ayni)
+  r.page_views = pvmap[r.id] || 0; // fix10aa: toFactoryPublic satirdan okur
   res.json({ ...toFactoryPublic(r, { includeContact: false }), rating_avg: (rmap[r.id] && rmap[r.id].rating_avg !== undefined) ? rmap[r.id].rating_avg : null, rating_count: (rmap[r.id] && rmap[r.id].rating_count) || 0, quote_count: qmap[r.id] || 0, followers: fmap[r.id] || 0 });
 }));
 
