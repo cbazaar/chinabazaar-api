@@ -25,6 +25,16 @@
 //   toFactoryPublic'e yalnizca brand_name eklendi (liste + GET /factory/:id detay kapsanir).
 //   trademark_no / trademark_office / trademark_declared_at PUBLIC'e ASLA gitmez;
 //   bu uc alan yalniz toFactoryAdmin (+owner) ile donmeye devam eder.
+// fix10w: CBOs26.57-A — yonetici (is_admin) + CBAI master ABONELIK MUAFIYETI:
+//   GET /factory/subscription/me, admin/master icin abonelik tablosuna bakmadan
+//   ve SATIR YAZMADAN { has_active:true, plan:'admin' } doner (sahte odeme kaydi
+//   YOKTUR; muafiyet yalniz yanit duzeyindedir). Admin tespiti: master iddiasi
+//   (role 'master' + is_admin) veya req.user.is_admin iddiasi, ikisi de yoksa
+//   users.is_admin DB kontrolu (requireAdmin + urun listesi ?all=true deseniyle
+//   ayni; canli giris jetonu is_admin tasimayabilir). Normal kullanici akisi
+//   AYNEN korunur. products.js'de abonelik kapisi olan tek yer bu uctur:
+//   liste/detay iletisim gizleme kosulsuzdur (includeContact:false),
+//   quotes/messages olusturma abonelik kontrolu yapmaz.
 // fix10e: H-B göç (transaction + doğrulama + DROP yoksa yapılmaz), H-E CBAI master
 // fix10h: CBOs26.4 — /myfactory/stats: gunluk seri (daily) + ulke dagilimi (countries); /factory/video-view: olay kaydi (ulke basliktan).
 // fix10i: CBOs26.5 — bildirimler: factory_messages/factory_quotes + seen_by_factory; GET/POST /myfactory/notifications[/read]; videos.description korunur.
@@ -2635,10 +2645,31 @@ router.get('/factory/admin/subscriptions', requireAuth, requireAdmin, asyncHandl
 // UYELIK KAPISI: factory/quotes ve factory/messages olusturma su an ACIK (uyelik kontrolu yok);
 // bu gorevde kilitlenmedi — mevcut davranis aynen korundu.
 
+// fix10w: abonelik muafiyeti — CBAI master veya is_admin kullanici.
+// Master: jeton iddiasi (requireAuth, payload'dan req.user'a tasir). Admin: once
+// req.user.is_admin iddiasi; iddia yoksa users.is_admin DB kontrolu (canli giris
+// jetonu is_admin TASIMAYABILIR — requireAdmin/middleware de ayni DB yolunu
+// kullanir). DB hatasinda muaf SAYILMAZ, normal abonelik akisina dusulur.
+async function isSubscriptionExemptUser(req) {
+  const u = req.user || {};
+  if (u.role === 'master' && u.is_admin === true) return true;
+  if (u.is_admin === true) return true;
+  if (u.id === null || u.id === undefined || u.id === '') return false;
+  try {
+    const { rows } = await pool.query('SELECT is_admin FROM users WHERE id = $1', [u.id]);
+    return !!rows[0]?.is_admin;
+  } catch { return false; }
+}
+
 // GET /api/products/factory/subscription/me — giris yapan kullanicinin kendi aboneligi (baskasinin satiri donulmez)
 // { has_active, plan, expires_at, is_vip } — is_vip = aktif + plan='yearly' (on yuz VIP rozeti icin).
+// fix10w: admin/master MUAF — plan 'admin' ile aktif donulur, tabloya satir YAZILMAZ.
 router.get('/factory/subscription/me', requireAuth, asyncHandler(async (req, res) => {
   await ensureFactoryTables();
+  // fix10w: admin/master muafiyeti yalniz yanit duzeyindedir (sahte odeme kaydi yaratilmaz).
+  if (await isSubscriptionExemptUser(req)) {
+    return res.json({ has_active: true, active: true, plan: 'admin', expires_at: null, is_vip: true });
+  }
   const { rows } = await pool.query(
     `SELECT id, user_id, status, plan, provider, started_at, COALESCE(expires_at, ends_at) AS expires_at
      FROM factory_subscriptions
