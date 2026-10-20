@@ -99,6 +99,22 @@
 //   attributes. OKUMA: serializer'lar videos'u aynen gecirir; GET
 //   /factory/feed'in elle kurdugu video nesnesine de product_description
 //   (dizgi ise) aynen eklendi.
+// fix10ac: CBOs26.72-A — gercek "CEVRIMICI" sayisi (presence): frontend'deki
+//   cevrimici gostergesi artik gercek veriden beslenir. Yeni tablo
+//   factory_presence (session_id TEXT PRIMARY KEY, factory_id INT opsiyonel —
+//   page_views deseninde FK YOK, last_seen TIMESTAMPTZ) ensureFactoryTables
+//   icinde IF NOT EXISTS ile acilir. Yeni uc POST /factory/presence (herkese
+//   acik, kimlik YOK — page-view deseni): govde {session_id (ZORUNLU,
+//   /^[A-Za-z0-9._-]{8,64}$/), factory_id (opsiyonel, pozitif tamsayi)} ->
+//   upsert last_seen=now(), yanit {ok:true}; gecersiz govde 400.
+//   factoryPresenceLimiter (IP basina dakikada 60) kotuye kullanim freni.
+//   TEMIZLIK zaman kosullu (dakikada en fazla bir kez): 1 saatten eski
+//   satirlar silinir — her cagrida DELETE kosulmaz. GET /factory/list
+//   yanitina site_online_now eklendi: son 120 saniyede last_seen'i olan
+//   DISTINCT session sayisi (factoryOnlineNow, tek sorgu; tablo yoksa 0,
+//   akis bozulmaz). fix10aa'nin site_visitors_total'i AYNEN kalir — ikisi
+//   farkli seylerdir: total = tum zamanlarin sayfa goruntulenmesi toplami,
+//   online_now = su an sitede olan ziyaretci sayisi.
 // fix10e: H-B göç (transaction + doğrulama + DROP yoksa yapılmaz), H-E CBAI master
 // fix10h: CBOs26.4 — /myfactory/stats: gunluk seri (daily) + ulke dagilimi (countries); /factory/video-view: olay kaydi (ulke basliktan).
 // fix10i: CBOs26.5 — bildirimler: factory_messages/factory_quotes + seen_by_factory; GET/POST /myfactory/notifications[/read]; videos.description korunur.
@@ -609,6 +625,11 @@ async function ensureFactoryTables() {
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_page_views (factory_id INT PRIMARY KEY, visits INT NOT NULL DEFAULT 0)`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_page_view_events (id SERIAL PRIMARY KEY, factory_id INT NOT NULL DEFAULT 0, country TEXT NOT NULL DEFAULT '', created_at TIMESTAMPTZ DEFAULT now())`);
   await pool.query(`CREATE INDEX IF NOT EXISTS factory_page_view_events_factory_idx ON factory_page_view_events (factory_id)`);
+  // CBOs26.72 (fix10ac): CEVRIMICI presence — ziyaretci kalp atisi (POST /factory/presence upsert eder,
+  // GET /factory/list son 120 sn'de gorulen DISTINCT session sayisini doner). FK yok (page_views deseni:
+  // factory_id yalnizca bilgi amacli; fabrika silinse de satir last_seen yaslaninca temizlikte gider).
+  await pool.query(`CREATE TABLE IF NOT EXISTS factory_presence (session_id TEXT PRIMARY KEY, factory_id INT, last_seen TIMESTAMPTZ NOT NULL DEFAULT now())`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS factory_presence_last_seen_idx ON factory_presence (last_seen)`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_ratings (id SERIAL PRIMARY KEY, factory_id INT NOT NULL REFERENCES factories(id) ON DELETE CASCADE, user_id TEXT NOT NULL, rating INT NOT NULL CHECK (rating BETWEEN 1 AND 5), created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now(), UNIQUE(factory_id, user_id))`);
   // fix10k (CBOs26.15): fabrika takip — giris yapmis kullanici fabrikayi takip eder. user_id TEXT (likes/favorites deseni);
   // factory silinince takipler CASCADE ile gider (ratings deseni). UNIQUE(user_id, factory_id) = idempotent follow.
@@ -789,6 +810,18 @@ const factoryApplyLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: 'too_many_requests' },
   keyGenerator: (req) => 'factory-apply:' + ipKeyGenerator(req.ip),
+});
+
+// CBOs26.72 (fix10ac): presence kalp atisi icin nazik limit (IP basina dakikada 60).
+// Kalp atisi istemcide ~30 sn'de bir atilir (IP basina ~2/dk); pay, NAT arkasindaki
+// cok sekmeli/ziyaretcili baglantilara da kalir. Botun tabloyu sisirmesi yavaslatilir.
+const factoryPresenceLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 60,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'too_many_requests' },
+  keyGenerator: (req) => 'factory-presence:' + ipKeyGenerator(req.ip),
 });
 
 // SHOP SECURITY: gizli jeton karsilastirmasi icin zamanlama-saldirisina dayanikli esitlik.
@@ -1051,6 +1084,15 @@ async function factorySiteVisitorsTotal() {
   try {
     const { rows } = await pool.query('SELECT COALESCE(SUM(visits), 0)::int AS total FROM factory_page_views');
     return (rows[0] && rows[0].total) || 0;
+  } catch (e) { return 0; }
+}
+
+// fix10ac (CBOs26.72): SU AN cevrimici ziyaretci sayisi — factory_presence'ta son 120 saniyede
+// last_seen'i taze olan DISTINCT session sayisi. Tek sorgu; tablo yoksa 0 (akis bozulmaz).
+async function factoryOnlineNow() {
+  try {
+    const { rows } = await pool.query(`SELECT COUNT(DISTINCT session_id)::int AS n FROM factory_presence WHERE last_seen > now() - INTERVAL '120 seconds'`);
+    return (rows[0] && rows[0].n) || 0;
   } catch (e) { return 0; }
 }
 
@@ -1339,6 +1381,35 @@ router.post('/factory/page-view', asyncHandler(async (req, res) => {
   );
   try { await pool.query(`INSERT INTO factory_page_view_events (factory_id, country) VALUES ($1, $2)`, [fid, factoryViewCountry(req)]); } catch (e) { /* olay kaydi sayaci bozmaz */ }
   res.json({ factory_id: fid, visits: rows[0].visits });
+}));
+
+// CBOs26.72 (fix10ac): POST /api/products/factory/presence {session_id, factory_id?} — cevrimici
+// kalp atisi (herkese acik, kimlik yok; page-view deseni). session_id istemcinin urettigi oturum
+// kimligidir (8-64 krk guvenli desen); gecerli fabrika KONTROLU yapilmaz (factory_id yalniz bilgi:
+// sayim site geneli DISTINCT session'dir, var olmayan fabrika sayimi bozmaz). Temizlik zaman
+// kosullu: en fazla dakikada bir, 1 saatten eski satirlar silinir — yaniti ASLA bozmaz.
+const FACTORY_SESSION_RE = /^[A-Za-z0-9._-]{8,64}$/;
+let factoryPresenceCleanupAt = 0;
+router.post('/factory/presence', factoryPresenceLimiter, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const sid = String((req.body && req.body.session_id) || '').trim();
+  if (!FACTORY_SESSION_RE.test(sid)) return res.status(400).json({ error: 'invalid_session_id' });
+  let fid = null;
+  if (req.body && req.body.factory_id !== undefined && req.body.factory_id !== null && req.body.factory_id !== '') {
+    fid = Number(req.body.factory_id);
+    if (!Number.isInteger(fid) || fid < 1) return res.status(400).json({ error: 'invalid_factory_id' });
+  }
+  await pool.query(
+    `INSERT INTO factory_presence (session_id, factory_id, last_seen) VALUES ($1, $2, now())
+     ON CONFLICT (session_id) DO UPDATE SET last_seen = now(), factory_id = COALESCE(EXCLUDED.factory_id, factory_presence.factory_id)`,
+    [sid, fid]
+  );
+  const nowMs = Date.now();
+  if (nowMs - factoryPresenceCleanupAt > 60 * 1000) {
+    factoryPresenceCleanupAt = nowMs;
+    try { await pool.query(`DELETE FROM factory_presence WHERE last_seen < now() - INTERVAL '1 hour'`); } catch (e) { /* temizlik yaniti bozmaz */ }
+  }
+  res.json({ ok: true });
 }));
 
 // GET /api/products/factory/comments?video=F-V — en yeni 50 yorum (herkese acik)
@@ -2395,9 +2466,11 @@ router.get('/factory/list', asyncHandler(async (req, res) => {
   const fmap = await factoryFollowersMap(rows.map((r) => r.id)); // fix10k: takipci sayisi
   const pvmap = await factoryPageViewsMap(rows.map((r) => r.id)); // fix10aa: sayfa goruntulenmesi (panel tanimiyla ayni)
   const siteVisitorsTotal = await factorySiteVisitorsTotal(); // fix10aa: tum fabrikalarin toplami (tek aggregate sorgu)
+  const siteOnlineNow = await factoryOnlineNow(); // fix10ac: su an cevrimici (son 120 sn, tek sorgu)
   for (const r of rows) r.page_views = pvmap[r.id] || 0; // fix10aa: toFactoryPublic satirdan okur
   // fix10aa: yanit { factories, site_visitors_total } — on yuz (v230+) Array.isArray ? data : data.factories ile iki bicimi de kabul eder.
-  res.json({ factories: rows.map((r) => ({ ...toFactoryPublic(r, { includeContact: false }), rating_avg: (rmap[r.id] && rmap[r.id].rating_avg !== undefined) ? rmap[r.id].rating_avg : null, rating_count: (rmap[r.id] && rmap[r.id].rating_count) || 0, quote_count: qmap[r.id] || 0, followers: fmap[r.id] || 0 })), site_visitors_total: siteVisitorsTotal }); // fix10e M7
+  // fix10ac: site_online_now da ayni yanitta (ekleme yalnizdir; site_visitors_total AYNEN kalir).
+  res.json({ factories: rows.map((r) => ({ ...toFactoryPublic(r, { includeContact: false }), rating_avg: (rmap[r.id] && rmap[r.id].rating_avg !== undefined) ? rmap[r.id].rating_avg : null, rating_count: (rmap[r.id] && rmap[r.id].rating_count) || 0, quote_count: qmap[r.id] || 0, followers: fmap[r.id] || 0 })), site_visitors_total: siteVisitorsTotal, site_online_now: siteOnlineNow }); // fix10e M7
 }));
 
 // GET /api/products/factory/quote-counts — her fabrikanin toplam teklif sayisi (herkese acik istatistik)
