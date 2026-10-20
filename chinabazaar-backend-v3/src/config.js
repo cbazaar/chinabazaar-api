@@ -29,6 +29,7 @@ const cfg = {
       'https://www.chinabazaar.shop',
       'https://cbcbcb.netlify.app',
       'https://cbazaar.netlify.app',
+      'https://cbfactory.netlify.app',
     ].filter(Boolean);
     return [...new Set([...defaults, ...fromEnv])];
   })(),
