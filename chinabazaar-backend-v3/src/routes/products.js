@@ -124,6 +124,24 @@
 //   cbf_code / is_verified / is_active bu yolda HALA yasaktir (sessizce
 //   yoksayilir). Admin PUT davranisi AYNEN (orada name zaten kabul
 //   ediliyordu). Tek degisiklik budur; baska hicbir alan/uc degismez.
+// fix10ag: CBOs26.82-A — fabrika ALT ALAN ADI otomasyonu (Netlify API):
+//   fabrika kullanici adi aldiginda <kullaniciadi>.chinabazaar.com adresi
+//   Netlify cbfactory sitesine domain alias olarak OTOMATIK eklenir (DNS
+//   jokeri Cloudflare'da; on yuz her alt adresi zaten karsiliyor). Env
+//   kapisi: NETLIFY_API_TOKEN + NETLIFY_SITE_ID yoksa otomasyon SESSIZCE
+//   devre disi (sahte basari yok; hicbir akis degismez). Yardimci:
+//   ensureFactoryDomainAlias — etiket /^[a-z0-9][a-z0-9-]{1,40}$/ desenine
+//   uymali ve rezerve listede (www/api/admin/...) OLMAMALI; Netlify'dan
+//   mevcut domain_aliases alinir (custom_domain'e dokunulmaz), adres yoksa
+//   PATCH ile listenin TAMAMI + yeni adres gonderilir. Fire-and-forget:
+//   cagiran akis BLOKLANMAZ, hata yalniz console.error'a duser. Cagri
+//   noktalari: admin fabrika olusturma (basvuru onayindan olusturma da
+//   ayni POST /factory/admin ucudur — CBF merge + yeni kayit yollari),
+//   admin PUT'ta kullanici adi DEGISTIYSE yeni adres. BACKFILL ucu:
+//   POST /factory/admin/sync-domain-aliases (requireAdmin) — kullanici adi
+//   olan TUM aktif fabrikalar icin ensure cagirir; env yoksa
+//   { ok:false, reason:'netlify_not_configured' }. Node yerlesik fetch,
+//   ~8 sn zaman asimi (AbortController); ek bagimlilik yok.
 // fix10ae: CBOs26.79-A — fabrika SERTIFIKALARI (belgeler): fabrika nesnesine
 //   certificates: [{title, url}] alani. factories.certificates JSONB sutunu
 //   (ensureFactoryTables ADD COLUMN IF NOT EXISTS). YUKLEME: mevcut chat-upload
@@ -1216,6 +1234,77 @@ function cleanMyFactoryPassword(v) {
   if (!passwordStrong(v)) return null; // fix10e L4: harf + rakam zorunlu
   return v;
 }
+
+// fix10ag (CBOs26.82-A) — ALT ALAN ADI otomasyonu (Netlify API) yardimcilari.
+// Env kapisi: NETLIFY_API_TOKEN + NETLIFY_SITE_ID yoksa otomasyon sessizce
+// devre disi (netlifyFactoryCfg null doner; cagri noktalari akisi degistirmez).
+const FACTORY_SUBDOMAIN_RESERVED = new Set(['www', 'api', 'admin', 'panel', 'mail', 'ftp', 'shop', 'store', 'app', 'blog', 'help', 'support', 'static', 'assets', 'cdn', 'ns1', 'ns2']);
+const FACTORY_SUBDOMAIN_RE = /^[a-z0-9][a-z0-9-]{1,40}$/;
+
+// Kullanici adindan alt alan adi etiketi: kucuk harfe cevrilir; desen disi
+// (nokta/alt cizgi iceren kullanici adlari dahil) veya rezerve isimse null.
+function factorySubdomainLabel(username) {
+  if (typeof username !== 'string') return null;
+  const label = username.trim().toLowerCase();
+  if (!FACTORY_SUBDOMAIN_RE.test(label)) return null;
+  if (FACTORY_SUBDOMAIN_RESERVED.has(label)) return null;
+  return label;
+}
+
+function netlifyFactoryCfg() {
+  const token = typeof process.env.NETLIFY_API_TOKEN === 'string' ? process.env.NETLIFY_API_TOKEN.trim() : '';
+  const siteId = typeof process.env.NETLIFY_SITE_ID === 'string' ? process.env.NETLIFY_SITE_ID.trim() : '';
+  if (!token || !siteId) return null;
+  return { token, siteId };
+}
+
+// Netlify API istegi — ~8 sn zaman asimi (AbortController), yerlesik fetch.
+async function netlifyFactoryFetch(cfg, pathname, options) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    return await fetch(`https://api.netlify.com/api/v1${pathname}`, {
+      ...(options || {}),
+      signal: ctrl.signal,
+      headers: { Authorization: `Bearer ${cfg.token}`, 'Content-Type': 'application/json', ...((options && options.headers) || {}) },
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Sitenin mevcut domain_aliases listesi (custom_domain'e DOKUNULMAZ).
+async function fetchNetlifyDomainAliases(cfg) {
+  const r = await netlifyFactoryFetch(cfg, `/sites/${encodeURIComponent(cfg.siteId)}`);
+  if (!r.ok) throw new Error(`netlify_get_site_${r.status}`);
+  const site = await r.json();
+  return Array.isArray(site && site.domain_aliases) ? site.domain_aliases.map((x) => String(x)) : [];
+}
+
+// <username>.chinabazaar.com adresini Netlify alias listesine ekler (yoksa).
+// HICBIR kosulda firlatmaz: hata yalniz console.error'a duser; cagiran akis
+// bloklanmaz ve istegin sonucu degismez (fire-and-forget kullanilir).
+async function ensureFactoryDomainAlias(username) {
+  try {
+    const cfg = netlifyFactoryCfg();
+    if (!cfg) return false; // env yok: sessizce devre disi
+    const label = factorySubdomainLabel(username);
+    if (!label) return false; // gecersiz/rezerve: API cagrisi yapilmaz
+    const host = `${label}.chinabazaar.com`;
+    const aliases = await fetchNetlifyDomainAliases(cfg);
+    if (aliases.some((a) => a.toLowerCase() === host)) return true; // zaten ekli
+    const r = await netlifyFactoryFetch(cfg, `/sites/${encodeURIComponent(cfg.siteId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ domain_aliases: [...aliases, host] }),
+    });
+    if (!r.ok) throw new Error(`netlify_patch_site_${r.status}`);
+    return true;
+  } catch (e) {
+    console.error('[fix10ag] ensureFactoryDomainAlias:', e && e.message);
+    return false;
+  }
+}
+
 // fix9: fabrika kapak gorseli — undefined => dokunma, bos string => '' (yok),
 // gecersiz (string degil / 2048'den uzun / http(s) URL degil) => null (handler 400 doner)
 function cleanFactoryCoverImage(v) {
@@ -2987,6 +3076,7 @@ router.post('/factory/admin', requireAuth, requireAdmin,
         const { rows: mergedRows } = await pool.query(`UPDATE factories SET ${mergeSets.join(', ')} WHERE id = $1 RETURNING *`, mergeParams);
         if (!mergedRows.length) return res.status(404).json({ error: 'factory_not_found' });
         await attachFactoryBrands(mergedRows); // fix10x
+        if (myFactoryUsernameClean) ensureFactoryDomainAlias(myFactoryUsernameClean); // fix10ag: alt alan adi alias'i (fire-and-forget)
         return res.json(toFactoryAdmin(mergedRows[0]));
       }
     }
@@ -3044,6 +3134,7 @@ router.post('/factory/admin', requireAuth, requireAdmin,
       if (upd.rows.length) rows[0] = upd.rows[0];
     }
     await attachFactoryBrands(rows); // fix10x
+    if (myFactoryUsernameClean) ensureFactoryDomainAlias(myFactoryUsernameClean); // fix10ag: alt alan adi alias'i (fire-and-forget)
     res.status(201).json(toFactoryAdmin(rows[0]));
   })
 );
@@ -3061,6 +3152,7 @@ router.put('/factory/admin/:id', requireAuth, requireAdmin,
     const push = (col, val, cast) => { params.push(val); sets.push(`${col} = $${params.length}${cast || ''}`); };
     if (req.body.name !== undefined) push('name', String(req.body.name).trim());
     // FAZ 1 — My Factory hesabi (admin override): kullanici adi cakisirsa 409; sifre bos degilse hash'lenir, bossa mevcut sifre korunur.
+    let putAliasUsername = null; // fix10ag: kullanici adi DEGISTIYSE yeni adres, yanittan once doldurulur
     if (req.body.myfactory_username !== undefined || req.body.myfactory_password !== undefined) {
       const myFactoryUsernameCleanPut = cleanMyFactoryUsername(req.body.myfactory_username);
       if (myFactoryUsernameCleanPut === null) return res.status(400).json({ error: 'invalid_myfactory_username', message: 'ChinaBazaar My Factory kullanıcı adı 3-50 karakter olmalı, yalnızca harf, rakam, nokta, alt çizgi ve tire içerebilir.' });
@@ -3068,6 +3160,11 @@ router.put('/factory/admin/:id', requireAuth, requireAdmin,
       if (myFactoryPasswordCleanPut === null) return res.status(400).json({ error: 'invalid_myfactory_password', message: 'ChinaBazaar My Factory şifresi en az 8 karakter olmalı.' });
       if (myFactoryUsernameCleanPut) {
         if (await myFactoryUsernameTaken(myFactoryUsernameCleanPut, id)) return res.status(409).json({ error: 'myfactory_username_taken', message: 'Bu ChinaBazaar My Factory kullanıcı adı başka bir fabrikada kullanılıyor.' });
+        // fix10ag: degisiklik tespiti — eski kullanici adi yalniz bu blokta okunur;
+        // ayni ad tekrar yazilirsa alias cagrisi yapilmaz.
+        const { rows: prevUsernameRows } = await pool.query('SELECT myfactory_username FROM factories WHERE id = $1', [id]);
+        const prevUsername = prevUsernameRows.length ? String(prevUsernameRows[0].myfactory_username || '') : '';
+        if (prevUsername.trim().toLowerCase() !== myFactoryUsernameCleanPut.toLowerCase()) putAliasUsername = myFactoryUsernameCleanPut;
         push('myfactory_username', myFactoryUsernameCleanPut);
       }
       if (myFactoryPasswordCleanPut) push('myfactory_password_hash', await bcrypt.hash(myFactoryPasswordCleanPut, 12));
@@ -3254,9 +3351,29 @@ router.put('/factory/admin/:id', requireAuth, requireAdmin,
       if (freshRows.length) rows = freshRows;
     }
     await attachFactoryBrands(rows);
+    if (putAliasUsername) ensureFactoryDomainAlias(putAliasUsername); // fix10ag: alt alan adi alias'i (fire-and-forget)
     res.json(toFactoryAdmin(rows[0]));
   })
 );
+
+// fix10ag (CBOs26.82-A) — BACKFILL: kullanici adi olan TUM aktif fabrikalarin
+// alt alan adi alias'larini Netlify ile senkronlar (admin elle tetikler).
+// POST /api/products/factory/admin/sync-domain-aliases
+// Env yoksa { ok:false, reason:'netlify_not_configured' } — sahte basari donmez.
+router.post('/factory/admin/sync-domain-aliases', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  const cfg = netlifyFactoryCfg();
+  if (!cfg) return res.json({ ok: false, reason: 'netlify_not_configured' });
+  await ensureFactoryTables();
+  const { rows } = await pool.query(
+    `SELECT myfactory_username FROM factories WHERE myfactory_username IS NOT NULL AND TRIM(myfactory_username) <> '' AND COALESCE(is_active, true) = true`
+  );
+  for (const row of rows) {
+    await ensureFactoryDomainAlias(row.myfactory_username);
+  }
+  let aliases = [];
+  try { aliases = await fetchNetlifyDomainAliases(cfg); } catch (e) { console.error('[fix10ag] sync-domain-aliases liste:', e && e.message); }
+  res.json({ ok: true, checked: rows.length, aliases });
+}));
 
 // DELETE /api/products/factory/admin/:id — fabrika sil (admin)
 router.delete('/factory/admin/:id', requireAuth, requireAdmin, param('id').isInt({ min: 1 }), asyncHandler(async (req, res) => {
