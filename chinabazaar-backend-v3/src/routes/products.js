@@ -142,6 +142,31 @@
 //   olan TUM aktif fabrikalar icin ensure cagirir; env yoksa
 //   { ok:false, reason:'netlify_not_configured' }. Node yerlesik fetch,
 //   ~8 sn zaman asimi (AbortController); ek bagimlilik yok.
+// fix10ak: CBOs26.92-A — fabrikaya SECILEBILIR ALT ADRES (subdomain):
+//   factories.subdomain TEXT kolonu (ensureFactoryTables: ADD COLUMN IF
+//   NOT EXISTS + backfill — subdomain NULL ise ve myfactory_username
+//   etiket desenine uyuyorsa subdomain = LOWER(TRIM(myfactory_username)),
+//   tek seferlik/idempotent UPDATE; kismi UNIQUE dizin ikinci savunma).
+//   Fabrika adresini artik kullanici adindan BAGIMSIZ secer/degistirir;
+//   etkin adres on yuzde subdomain || username olarak hesaplanir.
+//   Dogrulama: cleanFactorySubdomain — trim + kucuk harf, desen
+//   FACTORY_SUBDOMAIN_RE (^[a-z0-9][a-z0-9-]{1,40}$), rezerve liste
+//   FACTORY_SUBDOMAIN_RESERVED (fix10ag ile ayni). Benzersizlik
+//   (factorySubdomainTaken): aday BASKA fabrikanin subdomain'ine VEYA
+//   myfactory_username'ine (LOWER) esit olamaz; kendi degeri serbest.
+//   UCLAR: GET /factory/myfactory/subdomain-available?u= -> { available }
+//   (gecersiz/rezerve/dolu -> false, neden alani YOK — username-available
+//   sadelik deseni); PUT /factory/myfactory/subdomain { subdomain } —
+//   bos/null = TEMIZLE (200 { subdomain:null }), hata 400
+//   invalid_subdomain / 400 reserved_subdomain / 409 subdomain_taken;
+//   basarida ensureFactoryDomainAlias(subdomain) fire-and-forget.
+//   Admin PUT /factory/admin/:id govdede subdomain gelirse AYNI kurallar
+//   ana UPDATE'ten ONCE (atomik: hata ise baska alan yazilmaz). Admin
+//   POST olusturma (+ basvuru onayi ayni uctur): subdomain verilirse
+//   yazilir, verilmezse kullanici adindan varsayilan etiket turetilir
+//   (acikca verilende cakisma 409; varsayilan cakisirsa sessizce NULL).
+//   Serializer: toFactoryPublic'e subdomain eklendi (ham deger);
+//   admin/owner serializer'lari zincirle kazanir. Baska davranis ayni.
 // fix10aj: CBOs26.89-A — sertifika icon listesine LOGO anahtarlari:
 //   FACTORY_CERT_ICONS'a ce / iso-9001 / iso-14001 / fda / reach / rohs /
 //   fcc eklendi (mevcut 9 ikon aynen). cleanFactoryCertIcon kucuk harfe
@@ -821,6 +846,23 @@ async function ensureFactoryTables() {
   } catch (e) { /* göç hatası akışı bozmaz — eski hesaplar bir sonraki çağrıda tekrar denenir, DROP yapılmaz */ }
   // Sutun daha once UNIQUE'siz olusmus olabilir — kucuk harfe duyarsiz benzersizlik icin ifade indexi (varsa yoksayilir).
   try { await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS factories_myfactory_username_uidx ON factories (LOWER(myfactory_username))`); } catch (e) { /* index kurulamazsa akis bozulmaz */ }
+  // fix10ak (CBOs26.92-A): fabrika ALT ADRESİ — factories.subdomain. Backfill: subdomain
+  // NULL ise ve myfactory_username etiket desenine uyuyorsa (rezerve listede değilse ve
+  // başka fabrikanın subdomain'iyle çakışmıyorsa) subdomain = LOWER(TRIM(myfactory_username)).
+  // UPDATE ... WHERE subdomain IS NULL koşulu göçü idempotent yapar (her açılışta güvenle
+  // koşar, dolu değer ASLA ezilmez). Her ifade kendi try/catch'indedir, hata yutulur.
+  try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS subdomain TEXT`); } catch (e) { /* subdomain kolonu eklenemezse akis bozulmaz */ }
+  try {
+    await pool.query(
+      `UPDATE factories f SET subdomain = LOWER(TRIM(f.myfactory_username))
+        WHERE f.subdomain IS NULL
+          AND f.myfactory_username IS NOT NULL
+          AND LOWER(TRIM(f.myfactory_username)) ~ '^[a-z0-9][a-z0-9-]{1,40}$'
+          AND LOWER(TRIM(f.myfactory_username)) NOT IN ('www','api','admin','panel','mail','ftp','shop','store','app','blog','help','support','static','assets','cdn','ns1','ns2')
+          AND NOT EXISTS (SELECT 1 FROM factories f2 WHERE LOWER(f2.subdomain) = LOWER(TRIM(f.myfactory_username)))`
+    );
+  } catch (e) { /* backfill hatası akışı bozmaz — bir sonraki açılışta tekrar denenir */ }
+  try { await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS factories_subdomain_uidx ON factories (LOWER(subdomain)) WHERE subdomain IS NOT NULL`); } catch (e) { /* benzersiz dizin kurulamazsa akis bozulmaz (uygulama katmani kontrolu devrede) */ }
   // v118: user_id tip onarimi — users.id UUID, ama fabrika tablolari user_id'yi INT diye
   // tanimlamisti; UUID'li kullaniciyla her user_id sorgusu 500 veriyordu. INT->TEXT
   // donusumu kayipsizdir (her INT metne cevrilir); TEXT kolonda tekrar calismak no-op'tur.
@@ -1060,6 +1102,9 @@ function toFactoryPublic(r, opts) {
     // public ciktida — fabrikalarin paylastigi acik bilgidir; iletisim gizleme
     // kurali (includeContact) AYNEN gecerlidir, bu alan onu etkilemez.
     username: r.myfactory_username || null,
+    // fix10ak: fabrikanin SECTIGI alt adres (ham deger); etkin adres on yuzde
+    // subdomain || username ile hesaplanir. Iletisim gizleme kuralini etkilemez.
+    subdomain: r.subdomain || null,
     brand_name: publicBrands.length ? publicBrands[0].brand_name : null,
     brands: publicBrands.map((b) => b.brand_name),
     cbf_code: r.cbf_code || '',
@@ -1263,6 +1308,37 @@ function factorySubdomainLabel(username) {
   if (!FACTORY_SUBDOMAIN_RE.test(label)) return null;
   if (FACTORY_SUBDOMAIN_RESERVED.has(label)) return null;
   return label;
+}
+
+// fix10ak (CBOs26.92-A) — fabrika ALT ADRESİ temizliği. Etiketli sonuç döner;
+// çağıranlar invalid/reserved ayrımıyla farklı hata kodları üretir:
+//   { kind:'skip' }    — undefined: alana dokunma (admin kismi guncelleme)
+//   { kind:'clear' }   — null / boş string: adresi temizle (username'e düşülür)
+//   { kind:'invalid' } — string değil veya desen dışı (400 invalid_subdomain)
+//   { kind:'reserved' }— rezerve liste (400 reserved_subdomain)
+//   { kind:'ok', label } — geçerli etiket (trim + küçük harf)
+function cleanFactorySubdomain(v) {
+  if (v === undefined) return { kind: 'skip' };
+  if (v === null) return { kind: 'clear' };
+  if (typeof v !== 'string') return { kind: 'invalid' };
+  const label = v.trim().toLowerCase();
+  if (label === '') return { kind: 'clear' };
+  if (!FACTORY_SUBDOMAIN_RE.test(label)) return { kind: 'invalid' };
+  if (FACTORY_SUBDOMAIN_RESERVED.has(label)) return { kind: 'reserved' };
+  return { kind: 'ok', label };
+}
+
+// Aday alt adres BASKA fabrikada kullanımda mı? İki kaynak kontrol edilir:
+// factories.subdomain VE factories.myfactory_username (LOWER karşılaştırması —
+// bir fabrikanın giriş adı, başkasının adresi OLAMAZ; myFactoryUsernameTaken deseni).
+// excludeId = fabrikanın kendisi (kendi mevcut değeri/adresi serbest).
+async function factorySubdomainTaken(label, excludeId) {
+  const params = [String(label).toLowerCase()];
+  let sql = `SELECT id FROM factories WHERE (LOWER(subdomain) = $1 OR LOWER(myfactory_username) = $1)`;
+  if (excludeId !== undefined && excludeId !== null) { params.push(excludeId); sql += ` AND id <> $2`; }
+  sql += ` LIMIT 1`;
+  const { rows } = await pool.query(sql, params);
+  return rows.length > 0;
 }
 
 function netlifyFactoryCfg() {
@@ -2234,6 +2310,86 @@ router.get('/factory/myfactory/username-available', requireFactoryOrMasterAuth, 
   res.json({ available: !taken });
 }));
 
+// CBOs26.92-A (fix10ak) — GET /api/products/factory/myfactory/subdomain-available?u=<aday>
+// Paneldeki "Alt Adres" formunda ANLIK uygunluk göstergesi için. requireFactoryOrMasterAuth.
+// Yanıt: yalnız { available: true|false } — format geçersiz / rezerve / dolu ise false
+// (neden alanı YOK). Benzersizlik subdomain + username iki kaynağa bakar
+// (factorySubdomainTaken); fabrikanın KENDİ mevcut değeri "kullanılabilir" sayılır
+// (excludeId = token'daki fabrika; master ?factory_id= verirse o fabrika).
+router.get('/factory/myfactory/subdomain-available', requireFactoryOrMasterAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const raw = req.query.u;
+  if (raw === undefined || raw === null || String(raw).trim() === '') return res.json({ available: false });
+  const clean = cleanFactorySubdomain(String(raw));
+  if (clean.kind !== 'ok') return res.json({ available: false });
+  let excludeId = null;
+  if (req.isMaster) {
+    const qf = req.query.factory_id;
+    if (qf !== undefined && qf !== null && String(qf).trim() !== '') {
+      const n = Number(String(qf).trim());
+      if (Number.isInteger(n) && n >= 1) excludeId = n;
+    }
+  } else {
+    excludeId = req.factoryId;
+  }
+  const taken = await factorySubdomainTaken(clean.label, excludeId);
+  res.json({ available: !taken });
+}));
+
+// CBOs26.92-A (fix10ak) — PUT /api/products/factory/myfactory/subdomain { subdomain }
+// Fabrika kendi ALT ADRESİNİ seçer/değiştirir: <subdomain>.chinabazaar.com.
+// Hedef fabrika çözümü credentials rotasıyla BİREBİR aynı: master → gövde/query
+// factory_id ZORUNLU (yoksa 400 factory_id_required; ikisi dolu ve farklıysa 400
+// factory_id_mismatch); fabrika → gövde/query'deki farklı factory_id 403, hedef =
+// req.factoryId. Gövde: subdomain boş/null ise TEMİZLENİR (fabrika username
+// etiketine düşer) → 200 { subdomain: null }; geçerliyse 200 { subdomain }.
+// Hatalar: 400 invalid_subdomain (biçim) / 400 reserved_subdomain (rezerve) /
+// 409 subdomain_taken (başka fabrikanın subdomain'i veya kullanıcı adı).
+// Başarıda Netlify alias otomasyonu fire-and-forget çağrılır (fix10ag yardımcısı).
+router.put('/factory/myfactory/subdomain', requireFactoryOrMasterAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const body = req.body || {};
+  // Hedef fabrika: master → gövde/query factory_id (ZORUNLU); fabrika → token'daki fabrika.
+  let targetFactoryId;
+  if (req.isMaster) {
+    const fromBody = body.factory_id;
+    const fromQuery = req.query.factory_id;
+    const hasBody = fromBody !== undefined && fromBody !== null && String(fromBody).trim() !== '';
+    const hasQuery = fromQuery !== undefined && fromQuery !== null && String(fromQuery).trim() !== '';
+    if (!hasBody && !hasQuery) return res.status(400).json({ error: 'factory_id_required', message: 'Master düzenlemesi için factory_id gerekli.' });
+    if (hasBody && hasQuery && Number(String(fromBody).trim()) !== Number(String(fromQuery).trim())) {
+      return res.status(400).json({ error: 'factory_id_mismatch', message: 'Gövde ve sorgudaki factory_id aynı olmalı.' });
+    }
+    targetFactoryId = Number(String(hasBody ? fromBody : fromQuery).trim());
+    if (!Number.isInteger(targetFactoryId) || targetFactoryId < 1) return res.status(400).json({ error: 'invalid_factory_id', message: 'Fabrika kimliği geçerli değil.' });
+  } else {
+    // Govdeden gelen id ASLA guvenilmez: token'daki fabrikadan farkliysa 403.
+    for (const key of ['id', 'factory_id']) {
+      if (body[key] !== undefined && body[key] !== null && body[key] !== '' && Number(body[key]) !== req.factoryId) {
+        return res.status(403).json({ error: 'forbidden', message: 'Yalnız kendi fabrika kaydınızı düzenleyebilirsiniz.' });
+      }
+    }
+    // Sorgudaki factory_id de token'daki fabrikadan farklıysa 403 (izolasyon).
+    const qf = req.query.factory_id;
+    if (qf !== undefined && qf !== null && String(qf).trim() !== '' && Number(String(qf).trim()) !== req.factoryId) {
+      return res.status(403).json({ error: 'forbidden', message: 'Yalnız kendi fabrika kaydınızı düzenleyebilirsiniz.' });
+    }
+    targetFactoryId = req.factoryId;
+  }
+  const clean = cleanFactorySubdomain(body.subdomain);
+  if (clean.kind === 'invalid') return res.status(400).json({ error: 'invalid_subdomain', message: 'Alt adres 2-41 karakter olmalı; küçük harf, rakam ve tire içerebilir, harf veya rakamla başlamalı.' });
+  if (clean.kind === 'reserved') return res.status(400).json({ error: 'reserved_subdomain', message: 'Bu alt adres ayrılmıştır, kullanılamaz.' });
+  if (clean.kind === 'ok' && await factorySubdomainTaken(clean.label, targetFactoryId)) {
+    return res.status(409).json({ error: 'subdomain_taken', message: 'Bu alt adres başka bir fabrikada kullanılıyor.' });
+  }
+  const newSubdomain = clean.kind === 'ok' ? clean.label : null; // clear (ve gövdesiz) = temizle
+  const { rows } = await pool.query(`UPDATE factories SET subdomain = $2, updated_at = now() WHERE id = $1 RETURNING subdomain`, [targetFactoryId, newSubdomain]);
+  if (!rows.length) return res.status(404).json({ error: 'factory_not_found', message: 'Fabrika bulunamadı.' });
+  if (req.isMaster) await logMasterAudit('factory_subdomain_update', 'factory', targetFactoryId);
+  if (newSubdomain) ensureFactoryDomainAlias(newSubdomain); // fix10ag: alt alan adi alias'i (fire-and-forget)
+  res.json({ subdomain: rows[0].subdomain || null });
+}));
+
 // CBOs26.55-A (fix10u) — PUT /api/products/factory/myfactory/brand
 // Fabrika MARKA TESCİLİ beyanı. Gövde { brand_name?, trademark_no?, trademark_office? }.
 // Hedef fabrika çözümü credentials rotasıyla aynı: master → gövde/query factory_id ZORUNLU
@@ -2997,6 +3153,12 @@ router.post('/factory/admin', requireAuth, requireAdmin,
     if (myFactoryPasswordClean === null) return res.status(400).json({ error: 'invalid_myfactory_password', message: 'ChinaBazaar My Factory şifresi en az 8 karakter olmalı.' });
     let myFactoryPasswordHash;
     if (myFactoryPasswordClean) myFactoryPasswordHash = await bcrypt.hash(myFactoryPasswordClean, 12);
+    // fix10ak — ALT ADRES (admin oluşturma): gövdede verilirse aynı doğrulama (biçim 400 /
+    // rezerve 400); benzersizlik yola göre aşağıda (merge: hedef hariç; yeni kayıt: tüm tablo).
+    // Verilmezse yeni kayıtta kullanıcı adından varsayılan etiket türetilir.
+    const subdomainCleanCreate = cleanFactorySubdomain(req.body.subdomain);
+    if (subdomainCleanCreate.kind === 'invalid') return res.status(400).json({ error: 'invalid_subdomain', message: 'Alt adres 2-41 karakter olmalı; küçük harf, rakam ve tire içerebilir, harf veya rakamla başlamalı.' });
+    if (subdomainCleanCreate.kind === 'reserved') return res.status(400).json({ error: 'reserved_subdomain', message: 'Bu alt adres ayrılmıştır, kullanılamaz.' });
     const videos = cleanFactoryVideos(req.body.videos);
     if (videos === null) return res.status(400).json({ error: 'invalid_videos' });
     const hashtagsClean = cleanFactoryHashtags(req.body.hashtags);
@@ -3092,6 +3254,13 @@ router.post('/factory/admin', requireAuth, requireAdmin,
           mergePush('myfactory_username', myFactoryUsernameClean);
         }
         if (myFactoryPasswordHash) mergePush('myfactory_password_hash', myFactoryPasswordHash);
+        // fix10ak — ALT ADRES (CBF merge): verilirse yaz (çakışma 409), boş/null ise temizle.
+        if (subdomainCleanCreate.kind === 'ok') {
+          if (await factorySubdomainTaken(subdomainCleanCreate.label, existingFactory.id)) return res.status(409).json({ error: 'subdomain_taken', message: 'Bu alt adres başka bir fabrikada kullanılıyor.' });
+          mergePush('subdomain', subdomainCleanCreate.label);
+        } else if (subdomainCleanCreate.kind === 'clear') {
+          mergePush('subdomain', null);
+        }
         // Videolar — REPLACE degil APPEND: mevcut videolar korunur, yalniz yeni URL'ler eklenir.
         if (videos !== undefined) {
           let existingVideos = existingFactory.videos;
@@ -3111,6 +3280,7 @@ router.post('/factory/admin', requireAuth, requireAdmin,
         if (!mergedRows.length) return res.status(404).json({ error: 'factory_not_found' });
         await attachFactoryBrands(mergedRows); // fix10x
         if (myFactoryUsernameClean) ensureFactoryDomainAlias(myFactoryUsernameClean); // fix10ag: alt alan adi alias'i (fire-and-forget)
+        if (subdomainCleanCreate.kind === 'ok') ensureFactoryDomainAlias(subdomainCleanCreate.label); // fix10ak: seçili alt adres alias'i (fire-and-forget)
         return res.json(toFactoryAdmin(mergedRows[0]));
       }
     }
@@ -3123,6 +3293,17 @@ router.post('/factory/admin', requireAuth, requireAdmin,
     // FAZ 1 — My Factory hesabi (yeni kayit): kullanici adi cakisirsa 409.
     if (myFactoryUsernameClean) {
       if (await myFactoryUsernameTaken(myFactoryUsernameClean, null)) return res.status(409).json({ error: 'myfactory_username_taken', message: 'Bu ChinaBazaar My Factory kullanıcı adı başka bir fabrikada kullanılıyor.' });
+    }
+    // fix10ak — etkin ALT ADRES (yeni kayıt): açıkça verildiyse o (çakışma 409);
+    // verilmediyse kullanıcı adından varsayılan etiket — varsayılan çakışırsa
+    // sessizce NULL kalır (kayıt yalnız ima edilen varsayılan yüzünden düşmez).
+    let createSubdomain = null;
+    if (subdomainCleanCreate.kind === 'ok') {
+      if (await factorySubdomainTaken(subdomainCleanCreate.label, null)) return res.status(409).json({ error: 'subdomain_taken', message: 'Bu alt adres başka bir fabrikada kullanılıyor.' });
+      createSubdomain = subdomainCleanCreate.label;
+    } else if (subdomainCleanCreate.kind === 'skip' && myFactoryUsernameClean) {
+      const defaultSubdomainLabel = factorySubdomainLabel(myFactoryUsernameClean);
+      if (defaultSubdomainLabel && !(await factorySubdomainTaken(defaultSubdomainLabel, null))) createSubdomain = defaultSubdomainLabel;
     }
     const { rows } = await pool.query(
       `INSERT INTO factories (name, city, category, description, moq, stock, capacity, certs, features, videos, hashtags, cbf_code, is_verified)
@@ -3143,7 +3324,7 @@ router.post('/factory/admin', requireAuth, requireAdmin,
         verifiedCreate,
       ]
     );
-    if (addressClean !== undefined || phoneClean !== undefined || contactClean !== undefined || wechatClean !== undefined || whatsappClean !== undefined || emailClean !== undefined || socialsClean !== undefined || tagsClean !== undefined || importCountriesClean !== undefined || employeesClean !== undefined || annualRevenueClean !== undefined || coverImageClean !== undefined || factoryAreaClean !== undefined || yearsClean !== undefined || mainProductsClean !== undefined || myFactoryUsernameClean || myFactoryPasswordHash) {
+    if (addressClean !== undefined || phoneClean !== undefined || contactClean !== undefined || wechatClean !== undefined || whatsappClean !== undefined || emailClean !== undefined || socialsClean !== undefined || tagsClean !== undefined || importCountriesClean !== undefined || employeesClean !== undefined || annualRevenueClean !== undefined || coverImageClean !== undefined || factoryAreaClean !== undefined || yearsClean !== undefined || mainProductsClean !== undefined || myFactoryUsernameClean || myFactoryPasswordHash || createSubdomain) {
       const updSets = [];
       const updParams = [rows[0].id];
       const updPush = (col, val, cast) => { updParams.push(val); updSets.push(`${col} = $${updParams.length}${cast || ''}`); };
@@ -3164,11 +3345,13 @@ router.post('/factory/admin', requireAuth, requireAdmin,
       if (mainProductsClean !== undefined) updPush('main_products', mainProductsClean);
       if (myFactoryUsernameClean) updPush('myfactory_username', myFactoryUsernameClean);
       if (myFactoryPasswordHash) updPush('myfactory_password_hash', myFactoryPasswordHash);
+      if (createSubdomain) updPush('subdomain', createSubdomain); // fix10ak
       const upd = await pool.query(`UPDATE factories SET ${updSets.join(', ')} WHERE id = $1 RETURNING *`, updParams);
       if (upd.rows.length) rows[0] = upd.rows[0];
     }
     await attachFactoryBrands(rows); // fix10x
     if (myFactoryUsernameClean) ensureFactoryDomainAlias(myFactoryUsernameClean); // fix10ag: alt alan adi alias'i (fire-and-forget)
+    if (createSubdomain) ensureFactoryDomainAlias(createSubdomain); // fix10ak: etkin alt adres alias'i (fire-and-forget)
     res.status(201).json(toFactoryAdmin(rows[0]));
   })
 );
@@ -3202,6 +3385,22 @@ router.put('/factory/admin/:id', requireAuth, requireAdmin,
         push('myfactory_username', myFactoryUsernameCleanPut);
       }
       if (myFactoryPasswordCleanPut) push('myfactory_password_hash', await bcrypt.hash(myFactoryPasswordCleanPut, 12));
+    }
+    // fix10ak (CBOs26.92-A) — ALT ADRES (admin): gövdede subdomain gelirse AYNI doğrulama +
+    // benzersizlik ana UPDATE'ten ÖNCE yapılır (hata → 400/409, başka alan YAZILMAZ);
+    // ''/null = temizle (fabrika username etiketine düşer). Başarıda alias otomasyonu.
+    let putAliasSubdomain = null; // yanıt öncesi doldurulur (fire-and-forget alias)
+    if (req.body.subdomain !== undefined) {
+      const subdomainCleanPut = cleanFactorySubdomain(req.body.subdomain);
+      if (subdomainCleanPut.kind === 'invalid') return res.status(400).json({ error: 'invalid_subdomain', message: 'Alt adres 2-41 karakter olmalı; küçük harf, rakam ve tire içerebilir, harf veya rakamla başlamalı.' });
+      if (subdomainCleanPut.kind === 'reserved') return res.status(400).json({ error: 'reserved_subdomain', message: 'Bu alt adres ayrılmıştır, kullanılamaz.' });
+      if (subdomainCleanPut.kind === 'ok') {
+        if (await factorySubdomainTaken(subdomainCleanPut.label, id)) return res.status(409).json({ error: 'subdomain_taken', message: 'Bu alt adres başka bir fabrikada kullanılıyor.' });
+        push('subdomain', subdomainCleanPut.label);
+        putAliasSubdomain = subdomainCleanPut.label;
+      } else {
+        push('subdomain', null); // clear
+      }
     }
     // fix10x (CBOs26.60-A) — ÇOKLU MARKA (admin): gövdede brands[] gelirse fabrikanın marka
     // kümesi TAMAMEN onunla değiştirilir. Doğrulama + çakışma kontrolü BURADA, ana UPDATE
@@ -3386,6 +3585,7 @@ router.put('/factory/admin/:id', requireAuth, requireAdmin,
     }
     await attachFactoryBrands(rows);
     if (putAliasUsername) ensureFactoryDomainAlias(putAliasUsername); // fix10ag: alt alan adi alias'i (fire-and-forget)
+    if (putAliasSubdomain) ensureFactoryDomainAlias(putAliasSubdomain); // fix10ak: seçili alt adres alias'i (fire-and-forget)
     res.json(toFactoryAdmin(rows[0]));
   })
 );
