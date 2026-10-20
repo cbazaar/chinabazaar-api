@@ -36,6 +36,12 @@ app.use(
     origin: (origin, cb) => {
       if (!origin) return cb(null, true);
       if (allowedOrigins.has(origin)) return cb(null, true);
+      // fix10ai (CBOs26.88): fabrika alt alan adları (<kullaniciadi>.chinabazaar.com)
+      // joker DNS ile otomatik açılır — her fabrika adresi Set'e tek tek eklenemez,
+      // bu yüzden desenle izin verilir. Yalnız https + tek etiket + tam
+      // ".chinabazaar.com" son eki kabul edilir (http, çok katmanlı alt adres ve
+      // benzer görünümlü domainler yine reddedilir).
+      if (/^https:\/\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.chinabazaar\.com$/.test(origin)) return cb(null, true);
       const err = new Error('cors_not_allowed');
       err.status = 403;
       return cb(err);
