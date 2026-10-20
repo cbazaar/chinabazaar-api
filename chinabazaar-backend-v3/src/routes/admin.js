@@ -14,6 +14,7 @@ const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const { ipKeyGenerator } = require('express-rate-limit');
 const appCfg = require('../config');
+const { isMasterJtiRevoked, revokeMasterJti } = require('../middleware/masterRevoke'); // 2026-10-20 N1
 
 // fix10e H-C: Stream uçları için rota hız limiti (IP + aktör bazlı; v8'de
 // req.ip doğrudan kullanılmaz — ipKeyGenerator zorunlu, M2).
@@ -52,7 +53,7 @@ const router = express.Router();
 // Fabrika jetonu baska hicbir admin rotasinda calismaz (403) — /upload-video DAHIL.
 // Normal kullanici jetonu Stream uclarinda 403 almaya DEVAM EDER (yalnizca admin + fabrika).
 // Jetonsuz/bozuk => 401. Diger tum rotalarda davranis aynen.
-function requireAdminOrFactory(req, res, next) {
+async function requireAdminOrFactory(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'unauthorized' });
@@ -63,6 +64,10 @@ function requireAdminOrFactory(req, res, next) {
   // req.isMaster'dadır (req.user yalnızca aşağı akışın req.user.id okuyan
   // yerlerini kırmaması için boş tutulur).
   if (payload && payload.role === 'master' && payload.is_admin === true) {
+    // 2026-10-20 N1: iptal edilmiş master jeton reddedilir (sızıntı durumunda).
+    if (payload.jti && (await isMasterJtiRevoked(payload.jti))) {
+      return res.status(401).json({ error: 'token_revoked' });
+    }
     req.isMaster = true;
     req.isAdmin = true;
     req.user = { id: null, email: null, is_admin: true, role: 'master' };
@@ -76,6 +81,20 @@ function requireAdminOrFactory(req, res, next) {
   return res.status(401).json({ error: 'unauthorized' });
 }
 router.use(requireAdminOrFactory);
+
+// POST /api/admin/master/revoke { jti } — CBAI master jetonunu iptal eder
+// (sızıntı şüphesinde). Yalnız admin/master. jti UUID formatında olmalı;
+// iptal edilen jti, süresi dolsa da bir daha kabul edilmez.
+// İptal edilecek jti'ler: master_audit_log'da action='master_login' kayıtlarının target_id'si.
+router.post('/master/revoke', asyncHandler(async (req, res) => {
+  const jti = String((req.body && req.body.jti) || '').trim();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(jti)) {
+    return res.status(400).json({ error: 'invalid_jti' });
+  }
+  await revokeMasterJti(jti);
+  try { await logMasterAudit('master_revoke', 'master', jti); } catch (_) { /* denetim kaydı akışı bozmaz */ }
+  res.json({ ok: true });
+}));
 
 // GET /api/admin/users — kayıtlı profiller (?source=myfactory|shop filtresi)
 router.get(

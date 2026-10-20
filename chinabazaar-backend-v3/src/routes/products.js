@@ -43,6 +43,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cfg = require('../config');
 const { loginLimiter, loginIdentifierLimiter } = require('../middleware/rateLimit');
+const { isMasterJtiRevoked } = require('../middleware/masterRevoke'); // 2026-10-20 N1: master iptal kontrolü
 
 // Fabrika yoksa bile karsilastirma yapilir (zamanlama ile kullanici sayimini zorlastirmak icin).
 const MYFACTORY_DUMMY_HASH = bcrypt.hashSync('__chinabazaar_no_such_myfactory__', 12); // fix10e L1: 10 -> 12
@@ -270,7 +271,7 @@ async function waSettings() {
   return kv;
 }
 // WHATSAPP SECURITY: X-Hub-Signature-256 dogrulamasi (Meta App Secret ile HMAC-SHA256).
-// - Secret bos/yoksa: eski davranis aynen (kabul) — geriye donuk uyumlu, kirilma yok.
+// - Secret bos/yoksa: FAIL-CLOSED (reddet) — 2026-10-20 N2: imzasiz webhook asla kabul edilmez.
 // - Secret VARSA: imza eksik/gecersizse reddet (401). Yanlis imza asla kabul edilmez:
 //   saldirgan secret'i bilmeden gecerli bir HMAC uretemez (yanlis govde karsilastirmasi
 //   yalnizca hatali REDDE yol acabilir, hatali kabule degil — fail-closed).
@@ -280,7 +281,7 @@ async function waSettings() {
 //   express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }).
 function verifyWhatsappSignature(req, secret) {
   try {
-    if (!secret || !String(secret).trim()) return true; // secret yoksa: eski davranis
+    if (!secret || !String(secret).trim()) return false; // 2026-10-20 N2: secret yoksa FAIL-CLOSED (imzasiz webhook reddedilir)
     const sig = String(req.headers['x-hub-signature-256'] || '');
     const m = /^sha256=([a-f0-9]{64})$/i.exec(sig);
     if (!m) return false;
@@ -1261,14 +1262,20 @@ function requireFactoryAuth(req, res, next) {
 // (yonetici jetonu bir kullanici jetonudur). Normal kullanici jetonu chat-upload'i kullanmaya
 // DEVAM EDER (CBAI sohbet dosya yukleme) — fix10c yalnizca fabrika erisimini EKLER,
 // mevcut hicbir erisimi kapatmaz.
-function requireUserOrFactoryAuth(req, res, next) {
+async function requireUserOrFactoryAuth(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'unauthorized', message: 'Giriş gerekli.' });
   let payload;
   try { payload = jwt.verify(token, cfg.jwtSecret, { algorithms: cfg.jwtAlgorithms }); } catch { return res.status(401).json({ error: 'invalid_token', message: 'Oturumunuz geçersiz veya süresi dolmuş. Lütfen tekrar giriş yapın.' }); }
   if (payload && payload.role === 'factory' && Number.isInteger(payload.factory_id)) { req.factoryId = payload.factory_id; return next(); }
-  if (payload && payload.role === 'master' && payload.is_admin === true) { req.isMaster = true; req.user = { id: 'cbai', email: null, role: 'master' }; return next(); }
+  if (payload && payload.role === 'master' && payload.is_admin === true) {
+    // 2026-10-20 N1: iptal edilmiş master jeton reddedilir (sızıntı durumunda).
+    if (payload.jti && (await isMasterJtiRevoked(payload.jti))) {
+      return res.status(401).json({ error: 'token_revoked', message: 'Oturum iptal edilmiş. Lütfen tekrar giriş yapın.' });
+    }
+    req.isMaster = true; req.user = { id: 'cbai', email: null, role: 'master' }; return next();
+  }
   if (payload && payload.sub) { req.user = { id: payload.sub, email: payload.email, role: payload.role || 'user' }; return next(); }
   return res.status(401).json({ error: 'unauthorized', message: 'Giriş gerekli.' });
 }
@@ -1321,13 +1328,19 @@ function myFactoryPhoneCandidates(identifier) {
 // Fabrika: role 'factory' + tamsayi factory_id → req.factoryId.
 // Master: role 'master' + is_admin true → req.isMaster = true (factory_id YOK).
 // Token yok/bozuk/süresi dolmuş => 401; geçerli ama ne fabrika ne master => 403.
-function requireFactoryOrMasterAuth(req, res, next) {
+async function requireFactoryOrMasterAuth(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'unauthorized', message: 'Giriş gerekli. Lütfen ChinaBazaar My Factory hesabınızla giriş yapın.' });
   let payload;
   try { payload = jwt.verify(token, cfg.jwtSecret, { algorithms: cfg.jwtAlgorithms }); } catch { return res.status(401).json({ error: 'invalid_token', message: 'Oturumunuz geçersiz veya süresi dolmuş. Lütfen tekrar giriş yapın.' }); }
-  if (payload && payload.role === 'master' && payload.is_admin === true) { req.isMaster = true; return next(); }
+  if (payload && payload.role === 'master' && payload.is_admin === true) {
+    // 2026-10-20 N1: iptal edilmiş master jeton reddedilir (sızıntı durumunda).
+    if (payload.jti && (await isMasterJtiRevoked(payload.jti))) {
+      return res.status(401).json({ error: 'token_revoked', message: 'Oturum iptal edilmiş. Lütfen tekrar giriş yapın.' });
+    }
+    req.isMaster = true; return next();
+  }
   if (payload && payload.role === 'factory' && Number.isInteger(payload.factory_id)) { req.factoryId = payload.factory_id; return next(); }
   return res.status(403).json({ error: 'forbidden', message: 'Bu işlem için fabrika hesabı gerekli.' });
 }
@@ -1351,8 +1364,12 @@ router.post('/factory/myfactory/login', loginLimiter, loginIdentifierLimiter, as
       await bcrypt.compare(password, MYFACTORY_DUMMY_HASH);
       return res.status(401).json({ error: 'invalid_credentials', message: 'Kullanıcı adı veya şifre hatalı.' });
     }
-    await logMasterAudit('master_login', 'factory', null);
-    return res.json({ token: signMasterToken(), master: true });
+    // 2026-10-20 N1: jti denetim kaydına yazılır (şüpheli girişin jetonu
+    // POST /api/admin/master/revoke ile iptal edilebilir).
+    const masterToken = signMasterToken();
+    const masterJti = (jwt.decode(masterToken) || {}).jti || null;
+    await logMasterAudit('master_login', 'factory', masterJti);
+    return res.json({ token: masterToken, master: true });
   }
   const cbf = normalizeMyFactoryCbfIdentifier(identifier);
   const phoneCands = myFactoryPhoneCandidates(identifier);

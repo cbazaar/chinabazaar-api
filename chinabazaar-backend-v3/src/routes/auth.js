@@ -245,8 +245,12 @@ router.post(
         await bcrypt.compare(password, DUMMY_HASH);
         return res.status(401).json(GENERIC);
       }
-      await logMasterAudit('master_login', 'auth', null);
-      return res.json({ user: masterPublicUser(), token: signMasterToken(), master: true });
+      // 2026-10-20 N1: jti denetim kaydına yazılır (şüpheli girişin jetonu
+      // POST /api/admin/master/revoke ile iptal edilebilir).
+      const masterToken = signMasterToken();
+      const masterJti = (jwt.decode(masterToken) || {}).jti || null;
+      await logMasterAudit('master_login', 'auth', masterJti);
+      return res.json({ user: masterPublicUser(), token: masterToken, master: true });
     }
     const candidates = phoneCandidates(identifier);
     const { rows } = await pool.query(
