@@ -4,6 +4,7 @@ const router = express.Router();
 const pool = require('../db');
 const { requireAuth } = require('../middleware/auth');
 const asyncHandler = require('../middleware/asyncHandler');
+const translator = require('../services/translator');
 
 router.use(requireAuth);
 
@@ -14,14 +15,18 @@ async function myConv(userId) {
   return r.rows[0];
 }
 
-// Müşteri mesaj gönderir
+// Müşteri mesaj gönderir — gövde ayrıca {translated_text, source_lang,
+// target_lang} (istemci çevirisi) ya da {translate_to} (sunucu çevirisi)
+// taşıyabilir; çeviri alanları RETURNING * ile yanıta aynen eklenir.
 router.post('/send', asyncHandler(async (req, res) => {
   const body = String(req.body.body || '').trim().slice(0, 2000);
   if (!body) return res.status(400).json({ ok: false, error: 'empty' });
+  await translator.ensureSchema();
+  const tr = await translator.resolveMessageTranslation(body, req.body);
   const conv = await myConv(req.user.id);
   const m = await pool.query(
-    `INSERT INTO chat_messages (conversation_id, sender, body, read_by_customer) VALUES ($1,'customer',$2,true) RETURNING *`,
-    [conv.id, body]);
+    `INSERT INTO chat_messages (conversation_id, sender, body, read_by_customer, translated_text, source_lang, target_lang) VALUES ($1,'customer',$2,true,$3,$4,$5) RETURNING *`,
+    [conv.id, body, tr.translated_text, tr.source_lang, tr.target_lang]);
   await pool.query(`UPDATE chat_conversations SET last_message_at=now() WHERE id=$1`, [conv.id]);
   res.json({ ok: true, message: m.rows[0] });
 }));

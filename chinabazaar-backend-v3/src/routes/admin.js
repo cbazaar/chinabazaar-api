@@ -42,6 +42,7 @@ async function ensureStreamUploadsTable() {
   await pool.query(`CREATE TABLE IF NOT EXISTS stream_uploads (uid TEXT PRIMARY KEY, factory_id INT, created_by TEXT, created_at TIMESTAMPTZ DEFAULT now())`);
 }
 const pool = require('../db');
+const translator = require('../services/translator'); // canlı çeviri (CBAi cevapları)
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -402,9 +403,12 @@ router.get('/chat/:id/messages', asyncHandler(async (req, res) => {
 router.post('/chat/:id/reply', asyncHandler(async (req, res) => {
   const body = String(req.body.body || '').trim().slice(0, 2000);
   if (!body) return res.status(400).json({ ok: false, error: 'empty' });
+  // Canlı çeviri: {translated_text, source_lang, target_lang} ya da {translate_to}
+  await translator.ensureSchema();
+  const tr = await translator.resolveMessageTranslation(body, req.body);
   const m = await pool.query(
-    `INSERT INTO chat_messages (conversation_id, sender, body, read_by_admin) VALUES ($1,'admin',$2,true) RETURNING *`,
-    [req.params.id, body]);
+    `INSERT INTO chat_messages (conversation_id, sender, body, read_by_admin, translated_text, source_lang, target_lang) VALUES ($1,'admin',$2,true,$3,$4,$5) RETURNING *`,
+    [req.params.id, body, tr.translated_text, tr.source_lang, tr.target_lang]);
   await pool.query(`UPDATE chat_conversations SET last_message_at=now(), status='open' WHERE id=$1`, [req.params.id]);
   res.json({ ok: true, message: m.rows[0] });
 }));

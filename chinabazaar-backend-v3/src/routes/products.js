@@ -227,6 +227,7 @@ const { requireAuth, optionalAuth } = require('../middleware/auth');
 const { requireAdmin } = require('../middleware/admin');
 const { isMasterJtiRevoked } = require('../middleware/masterRevoke'); // 2026-10-21 F1: iptal edilmis master jeton reddedilir
 const pool = require('../db');
+const translator = require('../services/translator'); // canlı çeviri (CBChat/CBDestek mesajları)
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -2687,7 +2688,7 @@ router.get('/factory/myfactory/messages', requireFactoryOrMasterAuth, asyncHandl
     if (!Number.isInteger(fid) || fid < 1) return res.status(400).json({ error: 'invalid_factory_id' });
   } else fid = req.factoryId;
   const { rows } = await pool.query(
-    `SELECT m.id, m.user_id, m.body, m.sender, m.attachment_url, m.kind, m.attachment_name, m.attachment_size, m.attachment_mime, m.factory_id, m.created_at,
+    `SELECT m.id, m.user_id, m.body, m.sender, m.attachment_url, m.kind, m.attachment_name, m.attachment_size, m.attachment_mime, m.factory_id, m.translated_text, m.source_lang, m.target_lang, m.created_at,
             COALESCE(NULLIF(u.nickname,''), NULLIF(u.name,''), split_part(u.email,'@',1), 'Misafir') AS name
      FROM factory_messages m LEFT JOIN users u ON u.id::text = m.user_id::text
      WHERE m.factory_id = $1 ORDER BY m.user_id ASC, m.created_at ASC, m.id ASC`,
@@ -2696,7 +2697,7 @@ router.get('/factory/myfactory/messages', requireFactoryOrMasterAuth, asyncHandl
   const byUser = new Map();
   for (const r of rows) {
     if (!byUser.has(r.user_id)) byUser.set(r.user_id, { user_id: r.user_id, name: r.name || 'Misafir', messages: [] });
-    byUser.get(r.user_id).messages.push({ id: r.id, body: r.body, sender: r.sender, attachment_url: r.attachment_url || null, kind: r.kind || 'text', attachment_name: r.attachment_name || null, attachment_size: r.attachment_size ?? null, attachment_mime: r.attachment_mime || null, factory_id: r.factory_id, created_at: r.created_at });
+    byUser.get(r.user_id).messages.push({ id: r.id, body: r.body, sender: r.sender, attachment_url: r.attachment_url || null, kind: r.kind || 'text', attachment_name: r.attachment_name || null, attachment_size: r.attachment_size ?? null, attachment_mime: r.attachment_mime || null, factory_id: r.factory_id, translated_text: r.translated_text || null, source_lang: r.source_lang || null, target_lang: r.target_lang || null, created_at: r.created_at });
   }
   res.json({ conversations: [...byUser.values()] });
 }));
@@ -2711,6 +2712,10 @@ router.post('/factory/myfactory/messages/:id/reply', requireFactoryOrMasterAuth,
   body('attachment_name').optional().isString().isLength({ max: 200 }),
   body('attachment_size').optional().isInt({ min: 0, max: 10485760 }),
   body('attachment_mime').optional().isString().isLength({ max: 100 }),
+  body('translated_text').optional().isString().isLength({ max: 4000 }),
+  body('source_lang').optional().isString().isLength({ max: 8 }),
+  body('target_lang').optional().isString().isLength({ max: 8 }),
+  body('translate_to').optional().isString().isLength({ max: 8 }),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     await ensureFactoryMessagesTable();
@@ -2737,9 +2742,10 @@ router.post('/factory/myfactory/messages/:id/reply', requireFactoryOrMasterAuth,
       const factoryOwn = req.isMaster ? await chatFileOwnedBy(att.attachmentUrl, 'factory:' + fid) : false;
       if (!own && !factoryOwn) return res.status(403).json({ error: 'forbidden' });
     }
+    const tr = await translator.resolveMessageTranslation(text, req.body);
     const { rows } = await pool.query(
-      `INSERT INTO factory_messages (user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, factory_id) VALUES ($1, $2, 'factory', $3, $4, $5, $6, $7, $8) RETURNING id, user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, factory_id, created_at`,
-      [userId, text, att.attachmentUrl, att.kind, att.name, att.size, att.mime, fid]
+      `INSERT INTO factory_messages (user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, factory_id, translated_text, source_lang, target_lang) VALUES ($1, $2, 'factory', $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id, user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, factory_id, translated_text, source_lang, target_lang, created_at`,
+      [userId, text, att.attachmentUrl, att.kind, att.name, att.size, att.mime, fid, tr.translated_text, tr.source_lang, tr.target_lang]
     );
     res.status(201).json({ message: rows[0] });
   })
@@ -3806,6 +3812,10 @@ async function ensureFactoryMessagesTable() {
   try { await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS attachment_name TEXT`); } catch (e) { /* attachment_name eklenemezse akis bozulmaz */ }
   try { await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS attachment_size INT`); } catch (e) { /* attachment_size eklenemezse akis bozulmaz */ }
   try { await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS attachment_mime TEXT`); } catch (e) { /* attachment_mime eklenemezse akis bozulmaz */ }
+  // Canlı çeviri: iki dilli mesaj gösterimi için çeviri alanları (services/translator.js).
+  try { await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS translated_text TEXT`); } catch (e) { /* yoksay */ }
+  try { await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS source_lang VARCHAR(8)`); } catch (e) { /* yoksay */ }
+  try { await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS target_lang VARCHAR(8)`); } catch (e) { /* yoksay */ }
 // fix7: sohbet dosyalari Postgres'te saklanir (Railway diski gecici — her redeploy
 // yuklenen dosyalari siler, bu yuzden resimler bozuluyordu). token = tahmin edilemez URL anahtari.
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_chat_files (id SERIAL PRIMARY KEY, token TEXT NOT NULL UNIQUE, data BYTEA NOT NULL, mime TEXT NOT NULL, name TEXT, size INT, created_at TIMESTAMPTZ DEFAULT now())`);
@@ -3897,6 +3907,10 @@ router.post('/factory/messages', requireAuth, factorySpamLimiter,
   body('attachment_size').optional().isInt({ min: 0, max: 10485760 }),
   body('attachment_mime').optional().isString().isLength({ max: 100 }),
   body('factory_id').optional().isInt({ min: 1 }),
+  body('translated_text').optional().isString().isLength({ max: 4000 }),
+  body('source_lang').optional().isString().isLength({ max: 8 }),
+  body('target_lang').optional().isString().isLength({ max: 8 }),
+  body('translate_to').optional().isString().isLength({ max: 8 }),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     await ensureFactoryMessagesTable();
@@ -3915,9 +3929,10 @@ router.post('/factory/messages', requireAuth, factorySpamLimiter,
     if (att.attachmentUrl && att.attachmentUrl.startsWith('/api/products/factory/chat-file/')) {
       if (!(await chatFileOwnedBy(att.attachmentUrl, req.user.id))) return res.status(403).json({ error: 'forbidden' });
     }
+    const tr = await translator.resolveMessageTranslation(text, req.body);
     const { rows } = await pool.query(
-      `INSERT INTO factory_messages (user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, factory_id) VALUES ($1, $2, 'user', $3, $4, $5, $6, $7, $8) RETURNING id, user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, factory_id, created_at`,
-      [req.user.id, text, att.attachmentUrl, att.kind, att.name, att.size, att.mime, msgFactoryId]
+      `INSERT INTO factory_messages (user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, factory_id, translated_text, source_lang, target_lang) VALUES ($1, $2, 'user', $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id, user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, factory_id, translated_text, source_lang, target_lang, created_at`,
+      [req.user.id, text, att.attachmentUrl, att.kind, att.name, att.size, att.mime, msgFactoryId, tr.translated_text, tr.source_lang, tr.target_lang]
     );
     res.status(201).json({ message: rows[0] });
   })
@@ -3927,7 +3942,7 @@ router.post('/factory/messages', requireAuth, factorySpamLimiter,
 router.get('/factory/messages', requireAuth, asyncHandler(async (req, res) => {
   await ensureFactoryMessagesTable();
   const { rows } = await pool.query(
-    `SELECT m.id, m.user_id, m.body, m.sender, m.attachment_url, m.kind, m.attachment_name, m.attachment_size, m.attachment_mime, m.factory_id, f.name AS factory_name, m.created_at FROM factory_messages m LEFT JOIN factories f ON f.id = m.factory_id WHERE m.user_id=$1 ORDER BY m.created_at ASC, m.id ASC`,
+    `SELECT m.id, m.user_id, m.body, m.sender, m.attachment_url, m.kind, m.attachment_name, m.attachment_size, m.attachment_mime, m.factory_id, m.translated_text, m.source_lang, m.target_lang, f.name AS factory_name, m.created_at FROM factory_messages m LEFT JOIN factories f ON f.id = m.factory_id WHERE m.user_id=$1 ORDER BY m.created_at ASC, m.id ASC`,
     [req.user.id]
   );
   res.json({ messages: rows });
@@ -3978,7 +3993,7 @@ router.get('/factory/quotes', requireAuth, asyncHandler(async (req, res) => {
 router.get('/factory/admin/messages', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
   await ensureFactoryMessagesTable();
   const { rows } = await pool.query(
-    `SELECT m.id, m.user_id, m.body, m.sender, m.attachment_url, m.kind, m.attachment_name, m.attachment_size, m.attachment_mime, m.created_at,
+    `SELECT m.id, m.user_id, m.body, m.sender, m.attachment_url, m.kind, m.attachment_name, m.attachment_size, m.attachment_mime, m.translated_text, m.source_lang, m.target_lang, m.created_at,
             COALESCE(NULLIF(u.nickname,''), NULLIF(u.name,''), split_part(u.email,'@',1), 'Misafir') AS name
      FROM factory_messages m LEFT JOIN users u ON u.id::text = m.user_id::text
      ORDER BY m.user_id ASC, m.created_at ASC, m.id ASC`
@@ -3986,7 +4001,7 @@ router.get('/factory/admin/messages', requireAuth, requireAdmin, asyncHandler(as
   const byUser = new Map();
   for (const r of rows) {
     if (!byUser.has(r.user_id)) byUser.set(r.user_id, { user_id: r.user_id, name: r.name || 'Misafir', messages: [] });
-    byUser.get(r.user_id).messages.push({ id: r.id, body: r.body, sender: r.sender, attachment_url: r.attachment_url || null, kind: r.kind || 'text', attachment_name: r.attachment_name || null, attachment_size: r.attachment_size ?? null, attachment_mime: r.attachment_mime || null, created_at: r.created_at });
+    byUser.get(r.user_id).messages.push({ id: r.id, body: r.body, sender: r.sender, attachment_url: r.attachment_url || null, kind: r.kind || 'text', attachment_name: r.attachment_name || null, attachment_size: r.attachment_size ?? null, attachment_mime: r.attachment_mime || null, translated_text: r.translated_text || null, source_lang: r.source_lang || null, target_lang: r.target_lang || null, created_at: r.created_at });
   }
   res.json({ conversations: [...byUser.values()] });
 }));
@@ -4049,7 +4064,7 @@ router.get('/admin/factory-conversations', requireMasterAuth, asyncHandler(async
      ORDER BY last_at DESC`
   );
   const { rows: lasts } = await pool.query(
-    `SELECT DISTINCT ON (m.factory_id, m.user_id) m.factory_id, m.user_id, m.body, m.sender, m.kind, m.attachment_name, m.created_at
+    `SELECT DISTINCT ON (m.factory_id, m.user_id) m.factory_id, m.user_id, m.body, m.sender, m.kind, m.attachment_name, m.translated_text, m.source_lang, m.target_lang, m.created_at
      FROM factory_messages m
      WHERE m.factory_id IS NOT NULL
      ORDER BY m.factory_id, m.user_id, m.created_at DESC, m.id DESC`
@@ -4062,7 +4077,7 @@ router.get('/admin/factory-conversations', requireMasterAuth, asyncHandler(async
       factory_id: r.factory_id, factory_name: r.factory_name || '', factory_code: r.factory_code || '',
       user_id: r.user_id, user_name: r.user_name || 'Misafir',
       message_count: r.message_count, unread_count: r.unread_count, last_at: r.last_at,
-      last_message: lm ? { body: lm.body, sender: lm.sender, kind: lm.kind || 'text', attachment_name: lm.attachment_name || null, created_at: lm.created_at } : null
+      last_message: lm ? { body: lm.body, sender: lm.sender, kind: lm.kind || 'text', attachment_name: lm.attachment_name || null, translated_text: lm.translated_text || null, source_lang: lm.source_lang || null, target_lang: lm.target_lang || null, created_at: lm.created_at } : null
     };
   });
   res.json({ conversations });
@@ -4083,7 +4098,7 @@ router.get('/admin/factory-conversations/:id', requireMasterAuth, asyncHandler(a
     [userId]
   );
   const { rows } = await pool.query(
-    `SELECT id, user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, factory_id, created_at
+    `SELECT id, user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, factory_id, translated_text, source_lang, target_lang, created_at
      FROM factory_messages WHERE factory_id = $1 AND user_id = $2 ORDER BY created_at ASC, id ASC`,
     [fid, userId]
   );
@@ -4091,7 +4106,7 @@ router.get('/admin/factory-conversations/:id', requireMasterAuth, asyncHandler(a
   res.json({
     factory: { id: frows[0].id, name: frows[0].name || '', code: frows[0].cbf_code || '' },
     user: { id: userId, name: (urows[0] && urows[0].name) || 'Misafir' },
-    messages: rows.map((r) => ({ id: r.id, body: r.body, sender: r.sender, attachment_url: r.attachment_url || null, kind: r.kind || 'text', attachment_name: r.attachment_name || null, attachment_size: r.attachment_size ?? null, attachment_mime: r.attachment_mime || null, created_at: r.created_at }))
+    messages: rows.map((r) => ({ id: r.id, body: r.body, sender: r.sender, attachment_url: r.attachment_url || null, kind: r.kind || 'text', attachment_name: r.attachment_name || null, attachment_size: r.attachment_size ?? null, attachment_mime: r.attachment_mime || null, translated_text: r.translated_text || null, source_lang: r.source_lang || null, target_lang: r.target_lang || null, created_at: r.created_at }))
   });
 }));
 
@@ -4104,6 +4119,10 @@ router.post('/factory/admin/messages/:id/reply', requireAuth, requireAdmin,
   body('attachment_name').optional().isString().isLength({ max: 200 }),
   body('attachment_size').optional().isInt({ min: 0, max: 10485760 }),
   body('attachment_mime').optional().isString().isLength({ max: 100 }),
+  body('translated_text').optional().isString().isLength({ max: 4000 }),
+  body('source_lang').optional().isString().isLength({ max: 8 }),
+  body('target_lang').optional().isString().isLength({ max: 8 }),
+  body('translate_to').optional().isString().isLength({ max: 8 }),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     await ensureFactoryMessagesTable();
@@ -4113,9 +4132,10 @@ router.post('/factory/admin/messages/:id/reply', requireAuth, requireAdmin,
     const text = (req.body.body || '').trim();
     const att = cleanChatAttachment(req.body);
     if (!att.ok) return res.status(att.status).json({ error: att.error });
+    const tr = await translator.resolveMessageTranslation(text, req.body);
     const { rows } = await pool.query(
-      `INSERT INTO factory_messages (user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime) VALUES ($1, $2, 'admin', $3, $4, $5, $6, $7) RETURNING id, user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, created_at`,
-      [userId, text, att.attachmentUrl, att.kind, att.name, att.size, att.mime]
+      `INSERT INTO factory_messages (user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, translated_text, source_lang, target_lang) VALUES ($1, $2, 'admin', $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id, user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, translated_text, source_lang, target_lang, created_at`,
+      [userId, text, att.attachmentUrl, att.kind, att.name, att.size, att.mime, tr.translated_text, tr.source_lang, tr.target_lang]
     );
     res.status(201).json({ message: rows[0] });
   })
