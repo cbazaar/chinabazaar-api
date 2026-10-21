@@ -65,4 +65,11 @@ const trackingLimiter = limiter({ windowMs: 60 * 60 * 1000, max: 60 });
 // için katı limit — anahtar deneme (brute-force) koruması.
 const adminResetLimiter = limiter({ windowMs: 15 * 60 * 1000, max: 10 });
 
-module.exports = { apiLimiter, loginLimiter, registerLimiter, trackingLimiter, strictLoginLimiter, loginIdentifierLimiter, adminResetLimiter, ipKeyGenerator };
+
+// Canlı çeviri (POST /api/translate) — dış sağlayıcı kotasını ve kötüye
+// kullanımı korumak için IP başına 15 dakikada 300 istek. Sohbet yoklamaları
+// bu uca dokunmaz; yalnız gönderilen mesajlar (ve istemci tarafı tembel
+// çeviriler) sayılır.
+const translateLimiter = limiter({ windowMs: 15 * 60 * 1000, max: 300 });
+
+module.exports = { apiLimiter, loginLimiter, registerLimiter, trackingLimiter, strictLoginLimiter, loginIdentifierLimiter, adminResetLimiter, translateLimiter, ipKeyGenerator };
