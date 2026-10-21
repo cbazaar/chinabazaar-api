@@ -106,6 +106,23 @@ function masterPublicUser() {
   return { id: 'cbai', email: 'cbai', name: 'CBAI', nickname: 'cbai', phone: null, is_admin: true, customer_code: null, master: true };
 }
 
+// CBOs26.107 / fix10ar: info@chinabazaar.com — e-posta koduyla master girisi
+// (kullanici karari 2026-10-21). Bu adrese gonderilen kod dogrulanirsa
+// kullanici satiri aranmadan master jetonu basilir — admin kilit/sifre
+// derdine takilmadan yalniz maile gelen kodla girer. Baska hicbir adres
+// bu dala girmez; kod akisinin geri kalani (TTL, deneme siniri, tek
+// kullanim) mevcut akisla aynidir.
+const MASTER_CODE_EMAIL = 'info@chinabazaar.com';
+function isMasterCodeEmail(email) {
+  return String(email || '').trim().toLowerCase() === MASTER_CODE_EMAIL;
+}
+async function sendMasterCodeLogin(res) {
+  const masterToken = signMasterToken();
+  const masterJti = (jwt.decode(masterToken) || {}).jti || null;
+  await logMasterAudit('master_email_code_login', 'auth', masterJti);
+  return res.json({ user: masterPublicUser(), token: masterToken, master: true });
+}
+
 // ---- Kullanici adi korumasi ----
 // v563: Sabit rezerve liste KALDIRILDI — hicbir kullanici adi koddan rezerve degil.
 // Engel yalniz adminin Kullanici Adlari bolumunde ekledigi block kurallariyla olur.
@@ -384,6 +401,9 @@ router.post(
     if (!ok) return res.status(400).json({ error: 'code_invalid' });
     await pool.query('UPDATE email_codes SET consumed_at = now() WHERE id = $1', [rec.id]);
 
+    // CBOs26.107 / fix10ar: info@chinabazaar.com kodu dogruysa master girisi —
+    // kullanici satiri/sifre kontrolune girmeden master jetonu doner.
+    if (isMasterCodeEmail(email)) return sendMasterCodeLogin(res);
     const { rows: urows } = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     if (urows[0]) {
       const row = urows[0];
@@ -438,6 +458,10 @@ router.post(
     await pool.query('UPDATE email_codes SET attempts = attempts + 1 WHERE id = $1', [rec.id]);
     if (!ok) return res.status(400).json({ error: 'code_invalid' });
     await pool.query('UPDATE email_codes SET consumed_at = now() WHERE id = $1', [rec.id]);
+    // CBOs26.107 / fix10ar: info@chinabazaar.com kodu dogruysa master girisi —
+    // kullanici satiri aranmaz, sifre sorulmaz (paneldeki 'E-posta Kodu ile
+    // Giris' bu ucu kullanir).
+    if (isMasterCodeEmail(email)) return sendMasterCodeLogin(res);
     const { rows: urows } = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     if (!urows[0]) return res.status(401).json({ error: 'invalid_credentials' }); // fix10e L2: jenerik (kullanıcı yokluğu söylenmez)
     const row = urows[0];
