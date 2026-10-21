@@ -2098,7 +2098,10 @@ router.post('/factory/myfactory/login', loginLimiter, loginIdentifierLimiter, as
       return res.status(401).json({ error: 'invalid_credentials', message: 'Kullanıcı adı veya şifre hatalı.' });
     }
     await logMasterAudit('master_login', 'factory', null);
-    return res.json({ token: signMasterToken(), master: true });
+    // fix10al (CBOs26.93-A): master fabrika baglami secmeden girer; panel bu
+    // isaretle fabrika secim ekranini acar. Ek alandir — mevcut {token, master}
+    // sozlesmesi aynen korunur; fabrika girisi davranisi degismez.
+    return res.json({ token: signMasterToken(), master: true, needs_factory_selection: true });
   }
   const cbf = normalizeMyFactoryCbfIdentifier(identifier);
   const phoneCands = myFactoryPhoneCandidates(identifier);
@@ -3638,6 +3641,10 @@ router.delete('/factory/admin/:id', requireAuth, requireAdmin, param('id').isInt
   await ensureFactoryTables();
   const { rows } = await pool.query('DELETE FROM factories WHERE id = $1 RETURNING id', [parseInt(req.params.id, 10)]);
   if (!rows.length) return res.status(404).json({ error: 'factory_not_found' });
+  // fix10al (CBOs26.93-A): master silmesi mevcut logMasterAudit desenine duser
+  // (diger master fabrika islemleriyle ayni). Admin-kullanici silmesinde kayit
+  // yazilmaz — yanit ve davranis aynen.
+  if (req.user && req.user.role === 'master' && req.user.is_admin === true) await logMasterAudit('factory_delete', 'factory', rows[0].id);
   res.json({ ok: true });
 }));
 
