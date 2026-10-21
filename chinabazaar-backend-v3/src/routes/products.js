@@ -4444,7 +4444,9 @@ const SETTINGS_PUBLIC_KEYS = [...WA_PUBLIC_KEYS, ...ACC_PUBLIC_KEYS, ...GA_PUBLI
 const XML_PUBLIC_KEYS = ['xml_feed_enabled', 'xml_feed_mode'];
 const XML_SECRET_KEYS = ['api_key'];
 const SEC_PUBLIC_KEYS = ['sec_session_minutes', 'sec_failed_login_limit'];
-const SETTINGS_PUBLIC_KEYS_ALL = [...SETTINGS_PUBLIC_KEYS, ...XML_PUBLIC_KEYS, ...SEC_PUBLIC_KEYS, ...SMS_PUBLIC_KEYS, ...SOCIAL_PUBLIC_KEYS];
+const MAIL_PUBLIC_KEYS = ['mail_smtp_host', 'mail_smtp_port', 'mail_smtp_user', 'mail_from', 'mail_from_name', 'mail_smtp_secure'];
+const MAIL_SECRET_KEYS = ['mail_smtp_pass'];
+const SETTINGS_PUBLIC_KEYS_ALL = [...SETTINGS_PUBLIC_KEYS, ...XML_PUBLIC_KEYS, ...SEC_PUBLIC_KEYS, ...SMS_PUBLIC_KEYS, ...SOCIAL_PUBLIC_KEYS, ...MAIL_PUBLIC_KEYS];
 router.get('/settings', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
   await ensureSettingsTable();
   const { rows } = await pool.query('SELECT key, value FROM settings');
@@ -4463,12 +4465,14 @@ router.get('/settings', requireAuth, requireAdmin, asyncHandler(async (req, res)
   settings.has_sms_netgsm_usercode = rows.some((r) => r.key === 'sms_netgsm_usercode' && r.value);
   settings.has_sms_netgsm_password = rows.some((r) => r.key === 'sms_netgsm_password' && r.value);
   settings.has_api_key = rows.some((r) => r.key === 'api_key' && r.value);
+  settings.has_mail_smtp_pass = rows.some((r) => r.key === 'mail_smtp_pass' && r.value);
+  try { const ms = await require('../services/mailer').getEmailStatus(); settings.mail_env_enabled = !!ms.enabled; settings.mail_env_from = ms.from || ''; settings.mail_env_source = ms.source || 'env'; } catch (e) {}
   res.json({ settings });
 }));
 router.put('/settings', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
   await ensureSettingsTable();
   const incoming = req.body && req.body.settings && typeof req.body.settings === 'object' ? req.body.settings : {};
-  const allowed = [...WA_PUBLIC_KEYS, 'wa_token', 'wa_app_secret', ...ACC_PUBLIC_KEYS, ...ACC_SECRET_KEYS, ...GA_PUBLIC_KEYS, ...GA_SECRET_KEYS, ...XML_PUBLIC_KEYS, ...XML_SECRET_KEYS, ...SEC_PUBLIC_KEYS, ...SMS_PUBLIC_KEYS, ...SMS_SECRET_KEYS, ...SOCIAL_PUBLIC_KEYS]; // fix10e SABAH-4: wa_app_secret
+  const allowed = [...WA_PUBLIC_KEYS, 'wa_token', 'wa_app_secret', ...ACC_PUBLIC_KEYS, ...ACC_SECRET_KEYS, ...GA_PUBLIC_KEYS, ...GA_SECRET_KEYS, ...XML_PUBLIC_KEYS, ...XML_SECRET_KEYS, ...SEC_PUBLIC_KEYS, ...SMS_PUBLIC_KEYS, ...SMS_SECRET_KEYS, ...SOCIAL_PUBLIC_KEYS, ...MAIL_PUBLIC_KEYS, ...MAIL_SECRET_KEYS]; // fix10e SABAH-4: wa_app_secret
   for (const [k, v] of Object.entries(incoming)) {
     if (!allowed.includes(k)) continue;
     if (typeof v !== 'string' && typeof v !== 'boolean') continue;
@@ -4503,6 +4507,14 @@ router.post('/settings/whatsapp/test', requireAuth, requireAdmin, asyncHandler(a
   } catch (e) {
     return res.json({ ok: false, message: 'Bağlantı hatası: ' + (e && e.message ? e.message : 'bilinmeyen hata') });
   }
+}));
+
+// CBOs26.113 (fix10as): Panelden test e-postası gönderme (yalnız admin)
+router.post('/settings/email/test', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  const to = String((req.body && req.body.to) || '').trim();
+  if (!to || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return res.status(400).json({ ok: false, message: 'Geçerli bir e-posta adresi girin.' });
+  try { const id = await require('../services/mailer').sendTestEmail(to); return res.json({ ok: true, id: id || undefined }); }
+  catch (e) { if (e && e.message === 'email_not_configured') return res.status(503).json({ ok: false, message: 'E-posta yapılandırılmamış.' }); return res.status(502).json({ ok: false, message: 'Test e-postası gönderilemedi.' }); }
 }));
 
 // v588: Muhasebe programi baglanti testi — sunucuya erisilebilirlik kontrolu (kimlik dogrulama satici API'sine ozeldir)
