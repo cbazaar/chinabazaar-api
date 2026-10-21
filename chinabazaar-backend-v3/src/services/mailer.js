@@ -1,15 +1,82 @@
-// E-posta gönderimi — doğrulama kodları için.
-// İki sağlayıcı desteklenir (ENV ile seçilir):
+// E-posta gönderimi — doğrulama kodları, sipariş ve fatura e-postaları.
+// İki sağlayıcı desteklenir:
 //   1) SMTP (önerilen): SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS,
 //      SMTP_SECURE ('1' = 465 TLS, yoksa STARTTLS), EMAIL_FROM
 //   2) Resend: RESEND_API_KEY (+ EMAIL_FROM)
-// Hiçbiri yoksa isEnabled() false döner; kod gönderimi 503 verir.
+// CBOs26.113 (fix10as): Ayarlar artık admin panelinden de yönetilebilir —
+// settings tablosundaki mail_* anahtarları ENV'i alan bazında ezer
+// (DB değeri boşsa ENV kullanılır). Hiçbir kaynak yoksa isEnabled() false
+// döner; kod gönderimi 503 verir.
 // Kodun kendisi bu modülde üretilmez; routes/auth.js üretir ve hash'ler.
 const cfg = require('../config');
+const pool = require('../db');
 
-function isEnabled() {
+// ENV'den gelen temel yapılandırma.
+function envCfg() {
   const e = cfg.email || {};
-  return Boolean(e.from && ((e.smtpHost && e.smtpUser) || e.resendKey));
+  return {
+    from: e.from || '',
+    fromName: '',
+    smtpHost: e.smtpHost || '',
+    smtpPort: e.smtpPort ? parseInt(e.smtpPort, 10) || 587 : 587,
+    smtpUser: e.smtpUser || '',
+    smtpPass: e.smtpPass || '',
+    smtpSecure: Boolean(e.smtpSecure),
+    resendKey: e.resendKey || '',
+    source: 'env',
+  };
+}
+
+const MAIL_DB_KEYS = ['mail_smtp_host', 'mail_smtp_port', 'mail_smtp_user', 'mail_smtp_pass', 'mail_from', 'mail_from_name', 'mail_smtp_secure'];
+let _eff = null;
+let _effAt = 0;
+const EFF_TTL_MS = 60000;
+
+// Etkin yapılandırmayı çözer: settings tablosu (panel) > ENV, alan bazında.
+// 60 saniyelik bellek içi önbellek; force=true ile taze okunur.
+async function resolveEmailCfg(force) {
+  if (!force && _eff && (Date.now() - _effAt) < EFF_TTL_MS) return _eff;
+  const base = envCfg();
+  let db = {};
+  try {
+    const { rows } = await pool.query('SELECT key, value FROM settings WHERE key = ANY($1)', [MAIL_DB_KEYS]);
+    rows.forEach((r) => { db[r.key] = r.value; });
+  } catch (e) {
+    db = {}; // settings tablosu yoksa / DB hatasında ENV ile devam et
+  }
+  const pick = (dbVal, envVal) => {
+    const v = typeof dbVal === 'string' ? dbVal.trim() : dbVal;
+    return v ? v : envVal;
+  };
+  const eff = { ...base };
+  eff.smtpHost = pick(db.mail_smtp_host, base.smtpHost);
+  eff.smtpUser = pick(db.mail_smtp_user, base.smtpUser);
+  eff.smtpPass = pick(db.mail_smtp_pass, base.smtpPass);
+  eff.from = pick(db.mail_from, base.from);
+  eff.fromName = pick(db.mail_from_name, base.fromName);
+  const dbPort = parseInt(db.mail_smtp_port, 10);
+  if (db.mail_smtp_port && !Number.isNaN(dbPort) && dbPort > 0) eff.smtpPort = dbPort;
+  if (db.mail_smtp_secure === 'true') eff.smtpSecure = true;
+  else if (db.mail_smtp_secure === 'false') eff.smtpSecure = false;
+  eff.source = MAIL_DB_KEYS.some((k) => typeof db[k] === 'string' && db[k].trim() !== '') ? 'panel' : 'env';
+  _eff = eff;
+  _effAt = Date.now();
+  return eff;
+}
+
+function enabledOf(eff) {
+  return Boolean(eff && eff.from && ((eff.smtpHost && eff.smtpUser) || eff.resendKey));
+}
+
+// SENKRON: son çözülmüş yapılandırma (yoksa ENV) üzerinden durum.
+// Eşzamanlı kullanan çağıranlar (auth akışı) geriye dönük uyumlu kalır.
+function isEnabled() {
+  return enabledOf(_eff || envCfg());
+}
+
+function formatFrom(eff) {
+  if (eff.fromName) return `"${String(eff.fromName).replace(/"/g, '')}" <${eff.from}>`;
+  return eff.from;
 }
 
 function codeEmail(code) {
@@ -35,42 +102,59 @@ function codeEmail(code) {
 }
 
 let nodemailer = null;
-function getTransport() {
-  const e = cfg.email;
+let _transport = null;
+let _transportKey = '';
+function getTransport(eff) {
   if (!nodemailer) nodemailer = require('nodemailer');
-  if (!getTransport.t) {
-    getTransport.t = nodemailer.createTransport({
-      host: e.smtpHost,
-      port: e.smtpPort,
-      secure: e.smtpSecure, // true: 465, false: STARTTLS
-      auth: { user: e.smtpUser, pass: e.smtpPass },
+  const key = [eff.smtpHost, eff.smtpPort, eff.smtpUser, eff.smtpSecure ? '1' : '0'].join('|');
+  if (!_transport || _transportKey !== key) {
+    _transport = nodemailer.createTransport({
+      host: eff.smtpHost,
+      port: eff.smtpPort,
+      secure: eff.smtpSecure, // true: 465, false: STARTTLS
+      auth: { user: eff.smtpUser, pass: eff.smtpPass },
       connectionTimeout: 10000,
       greetingTimeout: 10000,
       socketTimeout: 15000,
     });
+    _transportKey = key;
   }
-  return getTransport.t;
+  return _transport;
 }
 
-async function sendViaSmtp(to, { subject, text, html }) {
-  const info = await getTransport().sendMail({
-    from: cfg.email.from,
+async function sendViaSmtp(to, { subject, text, html, attachments }, eff) {
+  const info = await getTransport(eff).sendMail({
+    from: formatFrom(eff),
     to,
     subject,
     text,
     html,
+    attachments: (attachments || []).map((a) => ({ filename: a.filename, content: a.content })),
   });
   return info && info.messageId;
 }
 
-async function sendViaResend(to, { subject, text, html }) {
+async function sendViaResend(to, { subject, text, html, attachments }, eff) {
+  const payload = {
+    from: formatFrom(eff),
+    to: [to],
+    subject,
+    text,
+    html,
+  };
+  if (attachments && attachments.length) {
+    payload.attachments = attachments.map((a) => ({
+      filename: a.filename,
+      content: Buffer.isBuffer(a.content) ? a.content.toString('base64') : a.content,
+    }));
+  }
   const res = await fetch('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
-      Authorization: `Bearer ${cfg.email.resendKey}`,
+      Authorization: `Bearer ${eff.resendKey}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ from: cfg.email.from, to: [to], subject, text, html }),
+    body: JSON.stringify(payload),
     signal: AbortSignal.timeout(15000),
   });
   const data = await res.json().catch(() => ({}));
@@ -78,53 +162,46 @@ async function sendViaResend(to, { subject, text, html }) {
   return data.id;
 }
 
+async function dispatch(to, mail) {
+  const eff = await resolveEmailCfg();
+  if (!enabledOf(eff)) throw new Error('email_not_configured');
+  if (eff.smtpHost && eff.smtpUser) return sendViaSmtp(to, mail, eff);
+  return sendViaResend(to, mail, eff);
+}
+
 // Doğrulama kodunu gönderir. Başarılıysa sağlayıcının mesaj kimliğini döner.
 async function sendVerificationCode(to, code) {
-  if (!isEnabled()) throw new Error('email_not_configured');
-  const mail = codeEmail(code);
-  const e = cfg.email;
-  if (e.smtpHost && e.smtpUser) return sendViaSmtp(to, mail);
-  return sendViaResend(to, mail);
+  return dispatch(to, codeEmail(code));
 }
 
 // --- Genel e-posta gönderimi (fatura vb.) ---
 // attachments: [{ filename, content: Buffer }] — SMTP'ye Buffer, Resend'e base64 gider.
 async function sendMail(to, { subject, text, html: htmlBody, attachments }) {
-  if (!isEnabled()) throw new Error('email_not_configured');
-  const e = cfg.email;
-  if (e.smtpHost && e.smtpUser) {
-    const info = await getTransport().sendMail({
-      from: cfg.email.from,
-      to,
-      subject,
-      text,
-      html: htmlBody,
-      attachments: (attachments || []).map((a) => ({ filename: a.filename, content: a.content })),
-    });
-    return info && info.messageId;
-  }
-  const res = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${e.resendKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      from: cfg.email.from,
-      to: [to],
-      subject,
-      text,
-      html: htmlBody,
-      attachments: (attachments || []).map((a) => ({
-        filename: a.filename,
-        content: Buffer.isBuffer(a.content) ? a.content.toString('base64') : a.content,
-      })),
-    }),
-    signal: AbortSignal.timeout(15000),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error('resend_failed: ' + (data.message || res.status));
-  return data.id;
+  return dispatch(to, { subject, text, html: htmlBody, attachments });
+}
+
+// CBOs26.113: Paneldeki "Test E-postası Gönder" düğmesi için.
+async function sendTestEmail(to) {
+  const subject = 'ChinaBazaar — test e-postası';
+  const text = 'Bu bir test e-postasıdır. E-posta ayarlarınız çalışıyor.';
+  const html =
+    `<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;background:#0d0d12;color:#f5f5f7;padding:32px;border-radius:12px">` +
+    `<div style="font-size:20px;font-weight:700;margin-bottom:8px">ChinaBazaar</div>` +
+    `<p style="color:#b9b9c2">Bu bir test e-postasıdır. E-posta ayarlarınız çalışıyor.</p>` +
+    `</div>`;
+  return sendMail(to, { subject, text, html });
+}
+
+// CBOs26.113: Panelin durum rozeti / ENV notu için etkin durum özeti (sır dönmez).
+async function getEmailStatus() {
+  const eff = await resolveEmailCfg();
+  return {
+    enabled: enabledOf(eff),
+    from: eff.from || '',
+    fromName: eff.fromName || '',
+    host: eff.smtpHost || '',
+    source: eff.source || 'env',
+  };
 }
 
 function invoiceEmail(order, invoiceNumber) {
@@ -147,4 +224,4 @@ function invoiceEmail(order, invoiceNumber) {
   return { subject, text, html: htmlBody };
 }
 
-module.exports = { isEnabled, sendVerificationCode, sendMail, invoiceEmail };
+module.exports = { isEnabled, sendVerificationCode, sendMail, invoiceEmail, sendTestEmail, getEmailStatus, resolveEmailCfg };
