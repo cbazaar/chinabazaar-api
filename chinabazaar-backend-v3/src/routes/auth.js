@@ -3100,6 +3100,7 @@ function qrSvgEncode(text) {
 const QR_LOGIN_TTL_MS = 120 * 1000;
 const qrCreateLimiter = require('express-rate-limit')({ windowMs: 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false, message: { error: 'too_many_requests' }, keyGenerator: (req) => 'qrcreate:' + ipKeyGenerator(req.ip) });
 const qrStatusLimiter = require('express-rate-limit')({ windowMs: 60 * 1000, max: 90, standardHeaders: true, legacyHeaders: false, message: { error: 'too_many_requests' }, keyGenerator: (req) => 'qrstatus:' + ipKeyGenerator(req.ip) + ':' + String((req.query && req.query.session_id) || '') });
+const qrApproveLimiter = require('express-rate-limit')({ windowMs: 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false, message: { error: 'too_many_requests' }, keyGenerator: (req) => 'qrapprove:' + ipKeyGenerator(req.ip) }); // 2026-10-21 F4: qr/approve savunma-derinligi limiti
 
 async function ensureQrLogins() {
   await pool.query(`CREATE TABLE IF NOT EXISTS qr_logins (
@@ -3155,6 +3156,7 @@ router.post(
 router.post(
   '/qr/approve',
   requireAuth,
+  qrApproveLimiter,
   body('session_id').isString().trim().isLength({ min: 1, max: 64 }),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
@@ -3204,9 +3206,15 @@ router.get(
       return res.json(EXPIRED);
     }
     if (rec.status !== 'approved') return res.json({ status: 'pending' });
-    // Tek kullanım: jeton basılmadan önce kayıt silinir.
-    await pool.query('DELETE FROM qr_logins WHERE id = $1', [sessionId]);
-    if (rec.is_master) {
+    // Tek kullanim (2026-10-21 F2, atomik): SELECT+DELETE yarisi engellenir.
+    // Onayli kayit tek sorguda silinir; yarisi kaybeden taraf 'expired' alir.
+    const del = await pool.query(
+      `DELETE FROM qr_logins WHERE id = $1 AND status = 'approved' RETURNING is_master, user_id`,
+      [sessionId]
+    );
+    if (!del.rowCount) return res.json(EXPIRED);
+    const appr = del.rows[0];
+    if (appr.is_master) {
       const masterToken = signMasterToken();
       const masterJti = (jwt.decode(masterToken) || {}).jti || null;
       await logMasterAudit('master_qr_login', 'auth', masterJti);
@@ -3214,7 +3222,7 @@ router.get(
     }
     const { rows: urows } = await pool.query(
       'SELECT id, email, name, nickname, phone, is_admin, customer_code, is_blocked FROM users WHERE id = $1',
-      [rec.user_id]
+      [appr.user_id]
     );
     const row = urows[0];
     if (!row || row.is_blocked) return res.json(EXPIRED);

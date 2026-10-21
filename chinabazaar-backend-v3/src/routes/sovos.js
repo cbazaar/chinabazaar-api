@@ -245,7 +245,8 @@ router.get('/invoice-pdf/:order_id', requireAuth, async (req, res) => {
     return res.send(pdfBuffer);
   } catch (e) {
     console.error('[sovos] invoice-pdf hatası:', e.message);
-    return res.status(500).json({ error: 'sovos_error', message: e.message });
+    // 2026-10-21 F5: ham hata metni istemciye sizdirilmaz (detay sunucu logunda kalir).
+    return res.status(500).json({ error: 'sovos_error', message: 'Fatura PDF oluşturulamadı.' });
   }
 });
 

@@ -225,6 +225,7 @@ const asyncHandler = require('../middleware/asyncHandler');
 const { checkValidation } = require('../middleware/validate');
 const { requireAuth, optionalAuth } = require('../middleware/auth');
 const { requireAdmin } = require('../middleware/admin');
+const { isMasterJtiRevoked } = require('../middleware/masterRevoke'); // 2026-10-21 F1: iptal edilmis master jeton reddedilir
 const pool = require('../db');
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
@@ -1984,14 +1985,25 @@ function requireFactoryAuth(req, res, next) {
 // (yonetici jetonu bir kullanici jetonudur). Normal kullanici jetonu chat-upload'i kullanmaya
 // DEVAM EDER (CBAI sohbet dosya yukleme) — fix10c yalnizca fabrika erisimini EKLER,
 // mevcut hicbir erisimi kapatmaz.
-function requireUserOrFactoryAuth(req, res, next) {
+async function requireUserOrFactoryAuth(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'unauthorized', message: 'Giriş gerekli.' });
   let payload;
   try { payload = jwt.verify(token, cfg.jwtSecret, { algorithms: cfg.jwtAlgorithms }); } catch { return res.status(401).json({ error: 'invalid_token', message: 'Oturumunuz geçersiz veya süresi dolmuş. Lütfen tekrar giriş yapın.' }); }
   if (payload && payload.role === 'factory' && Number.isInteger(payload.factory_id)) { req.factoryId = payload.factory_id; return next(); }
-  if (payload && payload.role === 'master' && payload.is_admin === true) { req.isMaster = true; req.user = { id: 'cbai', email: null, role: 'master' }; return next(); }
+  if (payload && payload.role === 'master' && payload.is_admin === true) {
+
+    // 2026-10-21 F1: iptal edilmis master jeton reddedilir.
+    if (payload.jti && (await isMasterJtiRevoked(payload.jti))) {
+
+      return res.status(401).json({ error: 'token_revoked' });
+
+    }
+
+    req.isMaster = true; req.user = { id: 'cbai', email: null, role: 'master' }; return next();
+
+  }
   if (payload && payload.sub) { req.user = { id: payload.sub, email: payload.email, role: payload.role || 'user' }; return next(); }
   return res.status(401).json({ error: 'unauthorized', message: 'Giriş gerekli.' });
 }
@@ -2044,13 +2056,24 @@ function myFactoryPhoneCandidates(identifier) {
 // Fabrika: role 'factory' + tamsayi factory_id → req.factoryId.
 // Master: role 'master' + is_admin true → req.isMaster = true (factory_id YOK).
 // Token yok/bozuk/süresi dolmuş => 401; geçerli ama ne fabrika ne master => 403.
-function requireFactoryOrMasterAuth(req, res, next) {
+async function requireFactoryOrMasterAuth(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'unauthorized', message: 'Giriş gerekli. Lütfen ChinaBazaar My Factory hesabınızla giriş yapın.' });
   let payload;
   try { payload = jwt.verify(token, cfg.jwtSecret, { algorithms: cfg.jwtAlgorithms }); } catch { return res.status(401).json({ error: 'invalid_token', message: 'Oturumunuz geçersiz veya süresi dolmuş. Lütfen tekrar giriş yapın.' }); }
-  if (payload && payload.role === 'master' && payload.is_admin === true) { req.isMaster = true; return next(); }
+  if (payload && payload.role === 'master' && payload.is_admin === true) {
+
+    // 2026-10-21 F1: iptal edilmis master jeton reddedilir.
+    if (payload.jti && (await isMasterJtiRevoked(payload.jti))) {
+
+      return res.status(401).json({ error: 'token_revoked' });
+
+    }
+
+    req.isMaster = true; return next();
+
+  }
   if (payload && payload.role === 'factory' && Number.isInteger(payload.factory_id)) { req.factoryId = payload.factory_id; return next(); }
   return res.status(403).json({ error: 'forbidden', message: 'Bu işlem için fabrika hesabı gerekli.' });
 }
