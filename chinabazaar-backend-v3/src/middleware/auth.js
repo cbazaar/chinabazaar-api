@@ -11,6 +11,8 @@ const jwt = require('jsonwebtoken');
 
 const cfg = require('../config');
 
+const { isMasterJtiRevoked } = require('./masterRevoke'); // 2026-10-21 F1: iptal edilmis master jeton reddedilir
+
 
 function signToken(user) {
 
@@ -31,7 +33,7 @@ function userFromPayload(payload) {
 }
 
 
-function requireAuth(req, res, next) {
+async function requireAuth(req, res, next) {
 
   const header = req.headers.authorization || '';
 
@@ -42,6 +44,16 @@ function requireAuth(req, res, next) {
   try {
 
     const payload = jwt.verify(token, cfg.jwtSecret, { algorithms: cfg.jwtAlgorithms });
+
+    // 2026-10-21 F1: iptal edilmis master jeton reddedilir. Yalniz master
+    // dalinda DB'ye gidilir; isMasterJtiRevoked DB hatasinda fail-open
+    // oldugundan iptal altyapisi hazir degilse kilitlenme olmaz.
+    if (payload && payload.role === 'master' && payload.is_admin === true && payload.jti
+        && (await isMasterJtiRevoked(payload.jti))) {
+
+      return res.status(401).json({ error: 'token_revoked' });
+
+    }
 
     req.user = userFromPayload(payload);
 
