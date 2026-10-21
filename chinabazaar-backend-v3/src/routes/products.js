@@ -3991,6 +3991,110 @@ router.get('/factory/admin/messages', requireAuth, requireAdmin, asyncHandler(as
   res.json({ conversations: [...byUser.values()] });
 }));
 
+// ============================================================================
+// CBChat GOZETIM — super admin paneli icin master'a ozel, SALT-OKUNUR uclar
+// ----------------------------------------------------------------------------
+// Hedef dosya : chinabazaar-backend-v3/src/routes/products.js (GitHub main)
+// Ekleme yeri : "// POST /api/products/factory/admin/messages/:id/reply"
+//               yorum satirinin HEMEN ONCESINE (GET /factory/admin/messages
+//               blogunun ardina) yapistirilir. Baska hicbir satir degismez.
+// Amac        : Super admin, hangi FABRIKA <-> hangi KULLANICI ile
+//               mesajlastigini tek listede gorur; konusmavi salt-okunur acar.
+// Kurallar    : - Yalniz master jetonu (role 'master' + is_admin) gecer;
+//                 fabrika/kullanici jetonu 403 alir.
+//               - Cevap yazma ucu YOKTUR (gozetim salt-okunurdur).
+//               - Okuma, seen_by_factory bayragini DEGISTIRMEZ — fabrikanin
+//                 "okunmamis" durumu gozetimden etkilenmez.
+//               - E-posta adresleri yanitlarda DONULMEZ (mevcut desen).
+// NOT         : Railway dagitimlari duraklatildigi icin bu kod GitHub'a
+//               yuklendikten sonra ancak Railway dagitimlari acilinca
+//               canliya cikar. Panel (admin v8) uclar canli olana kadar
+//               tasarlanmis "yuklenemedi" durumunu gosterir.
+// ============================================================================
+
+// CBChat gozetim: yalnizca CBAI master jetonu (requireFactoryOrMasterAuth'un
+// master dali + fabrika jetonunu da reddeden katı hâli; F1 jti iptali dahil).
+async function requireMasterAuth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: 'unauthorized', message: 'Giriş gerekli.' });
+  let payload;
+  try { payload = jwt.verify(token, cfg.jwtSecret, { algorithms: cfg.jwtAlgorithms }); } catch { return res.status(401).json({ error: 'invalid_token', message: 'Oturumunuz geçersiz veya süresi dolmuş. Lütfen tekrar giriş yapın.' }); }
+  if (payload && payload.role === 'master' && payload.is_admin === true) {
+    // 2026-10-21 F1: iptal edilmis master jeton reddedilir.
+    if (payload.jti && (await isMasterJtiRevoked(payload.jti))) {
+      return res.status(401).json({ error: 'token_revoked' });
+    }
+    req.isMaster = true; req.user = { id: 'cbai', email: null, role: 'master' }; return next();
+  }
+  return res.status(403).json({ error: 'forbidden', message: 'Bu işlem için master yetkisi gerekli.' });
+}
+
+// GET /api/products/admin/factory-conversations — TUM fabrika<->kullanici ciftleri (master, salt-okunur).
+// unread_count = fabrikanin henuz gormedigi kullanici mesajlari (seen_by_factory = FALSE, sender='user').
+router.get('/admin/factory-conversations', requireMasterAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryMessagesTable();
+  const { rows: agg } = await pool.query(
+    `SELECT m.factory_id, f.name AS factory_name, f.cbf_code AS factory_code,
+            m.user_id,
+            COALESCE(NULLIF(u.nickname,''), NULLIF(u.name,''), split_part(u.email,'@',1), 'Misafir') AS user_name,
+            COUNT(*)::int AS message_count,
+            COUNT(*) FILTER (WHERE m.sender = 'user' AND COALESCE(m.seen_by_factory, FALSE) = FALSE)::int AS unread_count,
+            MAX(m.created_at) AS last_at
+     FROM factory_messages m
+     LEFT JOIN factories f ON f.id = m.factory_id
+     LEFT JOIN users u ON u.id::text = m.user_id::text
+     WHERE m.factory_id IS NOT NULL
+     GROUP BY m.factory_id, f.name, f.cbf_code, m.user_id, u.nickname, u.name, u.email
+     ORDER BY last_at DESC`
+  );
+  const { rows: lasts } = await pool.query(
+    `SELECT DISTINCT ON (m.factory_id, m.user_id) m.factory_id, m.user_id, m.body, m.sender, m.kind, m.attachment_name, m.created_at
+     FROM factory_messages m
+     WHERE m.factory_id IS NOT NULL
+     ORDER BY m.factory_id, m.user_id, m.created_at DESC, m.id DESC`
+  );
+  const lastMap = new Map();
+  for (const r of lasts) lastMap.set(r.factory_id + '|' + r.user_id, r);
+  const conversations = agg.map((r) => {
+    const lm = lastMap.get(r.factory_id + '|' + r.user_id) || null;
+    return {
+      factory_id: r.factory_id, factory_name: r.factory_name || '', factory_code: r.factory_code || '',
+      user_id: r.user_id, user_name: r.user_name || 'Misafir',
+      message_count: r.message_count, unread_count: r.unread_count, last_at: r.last_at,
+      last_message: lm ? { body: lm.body, sender: lm.sender, kind: lm.kind || 'text', attachment_name: lm.attachment_name || null, created_at: lm.created_at } : null
+    };
+  });
+  res.json({ conversations });
+}));
+
+// GET /api/products/admin/factory-conversations/:id — tek konusma, salt-okunur (master).
+// :id = "<factory_id>_<user_id>" (orn. "14_215"). Yanit yazma ucu YOKTUR.
+router.get('/admin/factory-conversations/:id', requireMasterAuth, asyncHandler(async (req, res) => {
+  await ensureFactoryMessagesTable();
+  const mm = /^(\d+)[_-](.+)$/.exec(String(req.params.id || ''));
+  if (!mm) return res.status(400).json({ error: 'invalid_conversation_id' });
+  const fid = parseInt(mm[1], 10);
+  const userId = mm[2];
+  const { rows: frows } = await pool.query('SELECT id, name, cbf_code FROM factories WHERE id = $1', [fid]);
+  if (!frows.length) return res.status(404).json({ error: 'factory_not_found' });
+  const { rows: urows } = await pool.query(
+    `SELECT id, COALESCE(NULLIF(nickname,''), NULLIF(name,''), split_part(email,'@',1), 'Misafir') AS name FROM users WHERE id::text = $1`,
+    [userId]
+  );
+  const { rows } = await pool.query(
+    `SELECT id, user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, factory_id, created_at
+     FROM factory_messages WHERE factory_id = $1 AND user_id = $2 ORDER BY created_at ASC, id ASC`,
+    [fid, userId]
+  );
+  if (!rows.length && !urows.length) return res.status(404).json({ error: 'conversation_not_found' });
+  res.json({
+    factory: { id: frows[0].id, name: frows[0].name || '', code: frows[0].cbf_code || '' },
+    user: { id: userId, name: (urows[0] && urows[0].name) || 'Misafir' },
+    messages: rows.map((r) => ({ id: r.id, body: r.body, sender: r.sender, attachment_url: r.attachment_url || null, kind: r.kind || 'text', attachment_name: r.attachment_name || null, attachment_size: r.attachment_size ?? null, attachment_mime: r.attachment_mime || null, created_at: r.created_at }))
+  });
+}));
+
 // POST /api/products/factory/admin/messages/:id/reply {body?, attachment_url?, kind?} — admin cevap gonderir (sender='admin'); :id = user_id
 router.post('/factory/admin/messages/:id/reply', requireAuth, requireAdmin,
   param('id').isString().trim().isLength({ min: 1, max: 100 }),
