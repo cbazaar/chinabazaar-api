@@ -264,7 +264,9 @@ router.post(
     // fix10d — CBAI master (rezerve): identifier "cbai" ise DB'ye bakılmaz.
     // fix10e L2: env ayarlı değilse de jenerik 401 (master_not_configured yok —
     // ayar durumu sayım bilgisi sızdırmaz).
-    if (identifier.toLowerCase() === 'cbai') {
+    // CBOs26.105 / fix10aq: chinabazaarcom@gmail.com da aynı ana şifreyle master
+    // girişi yapar (kullanıcı kararı 2026-10-21) — dalın içi birebir aynı.
+    if (identifier.toLowerCase() === 'cbai' || identifier.toLowerCase() === 'chinabazaarcom@gmail.com') {
       if (!cbaiMasterConfigured() || !cbaiMasterPasswordOk(password)) {
         await bcrypt.compare(password, DUMMY_HASH);
         return res.status(401).json(GENERIC);
