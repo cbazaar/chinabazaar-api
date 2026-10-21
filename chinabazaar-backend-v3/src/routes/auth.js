@@ -8,6 +8,8 @@
 // fix10am: QR ile giriş (POST /qr/create, POST /qr/approve, GET /qr/status)
 // — 128-bit oturum + secret hash'i, 2 dk geçerli, tek kullanım; QR sunucuda
 // gömülü MIT qrcode-generator ile üretilir (harici ağ yok).
+// fix10an (CBOs26.95-A): QR onay adresi chinabazaar.com -> chinabazaar.shop
+// (onay ekranı şimdilik yalnız mağaza ön yüzünde canlı); başka değişiklik yok.
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const { body, validationResult } = require('express-validator');
@@ -3063,7 +3065,7 @@ function qrSvgEncode(text) {
 // Akış: misafir cihaz POST /qr/create ile oturum açar (128-bit session_id +
 // 128-bit secret; DB'de yalnız secret'in SHA-256 özeti durur), QR'ı gösterir.
 // Telefonda giriş yapmış kullanıcı QR'daki adresi
-// (https://chinabazaar.com/qr-onay#<session_id>) açıp onaylar:
+// (https://chinabazaar.shop/qr-onay#<session_id>) açıp onaylar:
 // POST /qr/approve (requireAuth) kaydı o kullanıcıyla 'approved' yapar.
 // Misafir cihaz GET /qr/status?session_id&secret ile yoklar; approved ise
 // NORMAL giriş yanıtını ({ user, token }; master ise master düzeni) alır
@@ -3101,7 +3103,7 @@ router.post(
       `INSERT INTO qr_logins (id, secret_hash, status, expires_at) VALUES ($1, $2, 'pending', $3)`,
       [sessionId, qrSecretHash(secret), new Date(Date.now() + QR_LOGIN_TTL_MS)]
     );
-    const qrSvg = qrSvgEncode('https://chinabazaar.com/qr-onay#' + sessionId);
+    const qrSvg = qrSvgEncode('https://chinabazaar.shop/qr-onay#' + sessionId);
     // secret yalnız bu yanıtta (ve status yoklamasında) taşınır; DB'de hash'i durur.
     res.json({ session_id: sessionId, secret, qr_svg: qrSvg, expires_in: 120 });
   })
