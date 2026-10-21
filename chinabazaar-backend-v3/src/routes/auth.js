@@ -14,6 +14,11 @@
 // için INT sütuna UUID yazma denemesi canlıda 500 veriyordu; CREATE tanımı
 // düzeltildi + canlıda INT oluşmuş tablo için ensureQrLogins() içine
 // idempotent ALTER göçü eklendi. Başka değişiklik yok.
+// fix10ap (CBOs26.98): kayıtta kullanıcı adı (nickname) desteği — register
+// artık nickname'i PATCH /me ile aynı sözleşmeyle doğrulayıp kaydediyor
+// (geçersiz 400 validation_failed, rezerve 400 nickname_reserved, dolu 409
+// conflict; verilmezse NULL — eski davranış). PATCH /me'ye de açık dolu-ad
+// kontrolü eklendi (önceden yalnız DB 23505 yakalamasına dayanıyordu).
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const { body, validationResult } = require('express-validator');
@@ -139,7 +144,7 @@ async function nicknameSuggestions(base){
   return out;
 }
 
-// POST /api/auth/register  { email, password, name, phone?, admin_key? }
+// POST /api/auth/register  { email, password, name, phone?, nickname?, admin_key? }
 // admin_key: ADMIN_SETUP_KEY env doluysa ve eşleşiyorsa kullanıcı admin olur.
 router.post(
   '/register',
@@ -147,15 +152,25 @@ router.post(
   body('email').isEmail().normalizeEmail(),
   body('password').isLength({ min: 8 }).custom((v) => passwordStrong(v)), // fix10e L4
   body('name').trim().isLength({ min: 2, max: 100 }),
+  body('nickname').optional({ values: 'falsy' }).trim().isLength({ min: 2, max: 30 }).matches(/^[\p{L}\p{N}_.-]+$/u), // fix10ap: PATCH /me ile aynı kural; boş/yok = verilmemiş
   body('phone').optional().matches(/^\+?[0-9][0-9\s\-().]{6,19}$/),
   body('admin_key').optional().isString().isLength({ max: 128 }),
   body('source').optional().isIn(['myfactory', 'shop']),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     const { email, password, name, phone, admin_key } = req.body;
+    const nickname = typeof req.body.nickname === 'string' ? req.body.nickname.trim() : '';
     const source = req.body.source === 'myfactory' ? 'myfactory' : 'shop';
     // fix10e H-D: admin_key kıyaslaması timing-safe (uzunluk erken dönüşü yok).
     const makeAdmin = Boolean(cfg.adminSetupKey && admin_key && timingSafeEqualDigest(admin_key, cfg.adminSetupKey));
+    // fix10ap: kullanıcı adı verilmişse PATCH /me ile aynı sözleşme —
+    // rezerve ad 400 nickname_reserved, dolu ad 409 conflict (büyük/küçük
+    // harf duyarsız LOWER karşılaştırması). Verilmemişse nickname NULL.
+    if (nickname && await isReserved(nickname)) return res.status(400).json({ error: 'nickname_reserved' });
+    if (nickname) {
+      const { rows: nickTaken } = await pool.query('SELECT id FROM users WHERE LOWER(nickname) = LOWER($1) LIMIT 1', [nickname]);
+      if (nickTaken.length) return res.status(409).json({ error: 'conflict' });
+    }
     const hash = await bcrypt.hash(password, 12);
     // fix10e M6: telefon benzersizliği (normalizasyonlu; kendi dışı kontrol).
     // Çakışma da jenerik 409 döner — hangi alanın çakıştığı söylenmez (L2).
@@ -169,9 +184,9 @@ router.post(
     try {
       await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'shop'`);
       const { rows } = await pool.query(
-        `INSERT INTO users (email, password_hash, name, phone, is_admin, source)
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, email, name, phone, is_admin`,
-        [email, hash, name, phone || null, makeAdmin, source]
+        `INSERT INTO users (email, password_hash, name, phone, nickname, is_admin, source)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id, email, name, nickname, phone, is_admin`,
+        [email, hash, name, phone || null, nickname || null, makeAdmin, source]
       );
       const user = publicUser(rows[0]);
       res.status(201).json({ user, token: signToken(user) });
@@ -492,6 +507,14 @@ router.patch(
     const phone = (req.body.phone || '').trim();
     if (!nick && !name && !email && !phone) return res.status(400).json({ error: 'nothing_to_update' });
     if (nick && await isReserved(nick)) return res.status(400).json({ error: 'nickname_reserved' }); // L3: 'cbai' isReserved içinde
+    // fix10ap: kullanıcı adı benzersizliği AÇIK kontrol (kendi dışı, büyük/
+    // küçük harf duyarsız). Önceden kontrol yoktu — yalnız aşağıdaki UPDATE'in
+    // DB 23505 yakalamasına dayanılıyordu; nickname üzerinde benzersiz indeks
+    // tanımlı değilse mükerrer ad sessizce yazılabiliyordu.
+    if (nick) {
+      const { rows: exNick } = await pool.query('SELECT id FROM users WHERE LOWER(nickname) = LOWER($1) AND id <> $2 LIMIT 1', [nick, req.user.id]);
+      if (exNick.length) return res.status(409).json({ error: 'conflict' });
+    }
     // fix10e M6: e-posta/telefon benzersizliği (kendi dışı). Çakışma jenerik 409.
     if (email) {
       const { rows: ex } = await pool.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1) AND id <> $2 LIMIT 1', [email, req.user.id]);
