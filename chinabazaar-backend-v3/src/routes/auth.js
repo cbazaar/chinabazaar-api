@@ -10,6 +10,10 @@
 // gömülü MIT qrcode-generator ile üretilir (harici ağ yok).
 // fix10an (CBOs26.95-A): QR onay adresi chinabazaar.com -> chinabazaar.shop
 // (onay ekranı şimdilik yalnız mağaza ön yüzünde canlı); başka değişiklik yok.
+// fix10ao (CBOs26.96-A): qr_logins.user_id INT -> TEXT. users.id UUID olduğu
+// için INT sütuna UUID yazma denemesi canlıda 500 veriyordu; CREATE tanımı
+// düzeltildi + canlıda INT oluşmuş tablo için ensureQrLogins() içine
+// idempotent ALTER göçü eklendi. Başka değişiklik yok.
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const { body, validationResult } = require('express-validator');
@@ -3079,11 +3083,25 @@ async function ensureQrLogins() {
     id TEXT PRIMARY KEY,
     secret_hash TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
-    user_id INT,
+    user_id TEXT,
     is_master BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ DEFAULT now(),
     expires_at TIMESTAMPTZ NOT NULL
   )`);
+  // fix10ao göçü: canlı tablo fix10am ile user_id INT olarak oluşmuş olabilir.
+  // users.id UUID (TEXT) olduğundan INT sütun onayı 500'e düşürüyordu. Tip
+  // hâlâ 'integer' ise TEXT'e çevir; değilse dokunma (idempotent). Göç hatası
+  // akışı bozmasın ama logda görünsün.
+  try {
+    const { rows } = await pool.query(
+      `SELECT data_type FROM information_schema.columns WHERE table_name = 'qr_logins' AND column_name = 'user_id'`
+    );
+    if (rows[0] && rows[0].data_type === 'integer') {
+      await pool.query(`ALTER TABLE qr_logins ALTER COLUMN user_id TYPE TEXT USING user_id::TEXT`);
+    }
+  } catch (e) {
+    console.error('[qr] user_id TEXT gocu basarisiz:', e && e.message ? e.message : e);
+  }
 }
 function qrSecretHash(secret) {
   return crypto.createHash('sha256').update(String(secret)).digest('hex');
