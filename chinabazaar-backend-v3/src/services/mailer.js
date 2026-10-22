@@ -165,6 +165,7 @@ async function sendViaResend(to, { subject, text, html, attachments }, eff) {
 async function dispatch(to, mail) {
   const eff = await resolveEmailCfg();
   if (!enabledOf(eff)) throw new Error('email_not_configured');
+  if (eff.resendKey) return sendViaResend(to, mail, eff);
   if (eff.smtpHost && eff.smtpUser) return sendViaSmtp(to, mail, eff);
   return sendViaResend(to, mail, eff);
 }
