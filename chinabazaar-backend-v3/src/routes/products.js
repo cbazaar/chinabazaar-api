@@ -761,6 +761,8 @@ async function ensureFactoryTables() {
   try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS is_verified BOOLEAN DEFAULT FALSE`); } catch (e) { /* is_verified kolonu eklenemezse akis bozulmaz */ }
   // FACTORY EMAIL (fix5): fabrika e-posta adresi (opsiyonel, max 254, e-posta bicimi). Her ALTER kendi try/catch'indedir.
   try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS email TEXT`); } catch (e) { /* email kolonu eklenemezse akis bozulmaz */ }
+  // v295 (CBOs27.5): fabrika WEB SITESI (opsiyonel; normalize edilmis http(s) adresi veya NULL — cleanFactoryWebsite). Her ALTER kendi try/catch'indedir.
+  try { await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS website TEXT`); } catch (e) { /* website kolonu eklenemezse akis bozulmaz */ }
   // fix10c — My Factory giris hesabi: fabrika bazli kullanici adi (benzersiz) + sifre hash'i.
   // SIRA KRITIK (canlida eski fabrika giris verisi olabilir — veri kaybi YOK):
   // 1) yeni myfactory_* sutunlarini ekle, 2) eski sutunlarda veri varsa
@@ -1130,6 +1132,7 @@ function toFactoryPublic(r, opts) {
     years: r.years || '',
     main_products: r.main_products || '',
     cover_image: r.cover_image || '',
+    website: r.website || '', // v295 (CBOs27.5): fabrika web sitesi — sosyal baglantilar gibi ACIK bilgidir (public liste + detay tasir; iletisim kapisi yalniz adres/telefon/e-posta/WeChat/WhatsApp icindir)
     hashtags: r.hashtags || '',
     socials: parseFactorySocials(r.socials),
     certificates: parseFactoryCertificates(r.certificates), // fix10ae: sertifika belgeleri [{title, url}] (yoksa [])
@@ -1272,6 +1275,34 @@ function cleanFactoryEmail(v) {
   if (t.length > 254) return null;
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(t)) return null;
   return t;
+}
+
+// v295 (CBOs27.5): fabrika web sitesi — undefined => dokunma, ''/null => '' (handler NULL saklar),
+// gecersiz (string degil / 300'den uzun / bosluklu / http(s) disi sema / noktasiz alan adi /
+// kullanici bilgili) => null (handler 400 doner). Protokolsuz deger https:// ile normalize
+// edilir; donen deger her zaman http(s):// ile baslayan kanonik adrestir (URL normalizasyonu).
+function cleanFactoryWebsite(v) {
+  if (v === undefined) return undefined;
+  if (v === null) return '';
+  if (typeof v !== 'string') return null;
+  let t = v.trim();
+  if (t === '') return '';
+  if (t.length > 300) return null;
+  if (/\s/.test(t)) return null;
+  if (!/^https?:\/\//i.test(t)) {
+    // http(s) disi sema reddedilir; "alanadi:port" bicimi sema sayilmaz (sonrasi yalniz rakam + istege bagli yol).
+    const m = t.match(/^[a-z][a-z0-9+.-]*:/i);
+    if (m && !/^\d+(\/|$)/.test(t.slice(m[0].length))) return null;
+    t = 'https://' + t;
+  }
+  let u;
+  try { u = new URL(t); } catch (e) { return null; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+  if (!u.hostname || u.hostname.indexOf('.') === -1) return null;
+  if (u.username || u.password) return null;
+  const out = u.toString();
+  if (out.length > 300) return null;
+  return out;
 }
 
 
@@ -2216,7 +2247,7 @@ router.get('/factory/myfactory/me', requireFactoryOrMasterAuth, asyncHandler(asy
 // PUT /api/products/factory/myfactory/profile — SADECE kendi fabrikasini gunceller.
 // Duzenlenebilir: name (fix10af — yalniz string, trim sonrasi 2-120 krk; baska turlu sessizce
 // atlanir), desc, city, category, main_products, certs, features, hashtags, tags,
-// address, phone, contact, wechat, whatsapp, email, import_countries, employees,
+// address, phone, contact, wechat, whatsapp, email, website (v295), import_countries, employees,
 // annual_revenue, factory_area, years, socials, cover_image, videos, certificates (fix10ae).
 // YASAK (sessizce yoksayilir): cbf_code, is_verified, is_active (+ moq/stock/capacity).
 // fix10d — master: factory_id gövdede/query'de ZORUNLU (yoksa 400), master her fabrikayı
@@ -2281,6 +2312,7 @@ router.put('/factory/myfactory/profile', requireFactoryOrMasterAuth, asyncHandle
   if (body.wechat !== undefined) { const c = cleanFactoryText(body.wechat, 200); if (c === null) return bad('invalid_wechat', 'WeChat geçerli değil.'); push('wechat', c); }
   if (body.whatsapp !== undefined) { const c = cleanFactoryText(body.whatsapp, 200); if (c === null) return bad('invalid_whatsapp', 'WhatsApp geçerli değil.'); push('whatsapp', c); }
   if (body.email !== undefined) { const c = cleanFactoryEmail(body.email); if (c === null) return bad('invalid_email', 'E-posta adresi geçerli değil.'); if (c !== '' && await factoryContactTaken('email', c, targetFactoryId)) return res.status(409).json({ error: 'contact_in_use', message: 'Bu e-posta başka bir fabrikada kullanılıyor.' }); push('email', c === '' ? null : c); } // fix10e M6
+  if (body.website !== undefined) { const c = cleanFactoryWebsite(body.website); if (c === null) return bad('invalid_website', 'Web sitesi geçerli değil.'); push('website', c === '' ? null : c); } // v295 (CBOs27.5): web sitesi — protokolsuzsa https:// eklenir, gecersizse 400
   if (body.import_countries !== undefined) { const c = cleanFactoryTags(body.import_countries); if (c === null) return bad('invalid_import_countries', 'İthalat ülkeleri geçerli değil.'); push('import_countries', c); }
   if (body.employees !== undefined) { const c = cleanFactoryText(body.employees, 2000); if (c === null) return bad('invalid_employees', 'Çalışan sayısı geçerli değil.'); push('employees', c); }
   if (body.annual_revenue !== undefined) { const c = cleanFactoryText(body.annual_revenue, 2000); if (c === null) return bad('invalid_annual_revenue', 'Yıllık ciro geçerli değil.'); push('annual_revenue', c); }
@@ -3278,6 +3310,8 @@ router.post('/factory/admin', requireAuth, requireAdmin,
     if (whatsappClean === null) return res.status(400).json({ error: 'invalid_whatsapp' });
     const emailClean = cleanFactoryEmail(req.body.email);
     if (emailClean === null) return res.status(400).json({ error: 'invalid_email' });
+    const websiteClean = cleanFactoryWebsite(req.body.website); // v295 (CBOs27.5)
+    if (websiteClean === null) return res.status(400).json({ error: 'invalid_website' });
     const socialsClean = cleanFactorySocials(req.body.socials);
     if (socialsClean === null) return res.status(400).json({ error: 'invalid_socials' });
     const tagsClean = cleanFactoryTags(req.body.tags);
@@ -3344,6 +3378,7 @@ router.post('/factory/admin', requireAuth, requireAdmin,
         if (req.body.wechat !== undefined) mergePush('wechat', wechatClean);
         if (req.body.whatsapp !== undefined) mergePush('whatsapp', whatsappClean);
         if (req.body.email !== undefined) mergePush('email', emailClean === '' ? null : emailClean);
+        if (req.body.website !== undefined) mergePush('website', websiteClean === '' ? null : websiteClean); // v295
         if (req.body.socials !== undefined) mergePush('socials', JSON.stringify(socialsClean), '::jsonb');
         if (req.body.tags !== undefined) mergePush('tags', tagsClean);
         // VERIFIED (CBF merge): body verirse guncelle, verilmezse degistirme.
@@ -3427,7 +3462,7 @@ router.post('/factory/admin', requireAuth, requireAdmin,
         verifiedCreate,
       ]
     );
-    if (addressClean !== undefined || phoneClean !== undefined || contactClean !== undefined || wechatClean !== undefined || whatsappClean !== undefined || emailClean !== undefined || socialsClean !== undefined || tagsClean !== undefined || importCountriesClean !== undefined || employeesClean !== undefined || annualRevenueClean !== undefined || coverImageClean !== undefined || factoryAreaClean !== undefined || yearsClean !== undefined || mainProductsClean !== undefined || myFactoryUsernameClean || myFactoryPasswordHash || createSubdomain) {
+    if (addressClean !== undefined || phoneClean !== undefined || contactClean !== undefined || wechatClean !== undefined || whatsappClean !== undefined || emailClean !== undefined || websiteClean !== undefined || socialsClean !== undefined || tagsClean !== undefined || importCountriesClean !== undefined || employeesClean !== undefined || annualRevenueClean !== undefined || coverImageClean !== undefined || factoryAreaClean !== undefined || yearsClean !== undefined || mainProductsClean !== undefined || myFactoryUsernameClean || myFactoryPasswordHash || createSubdomain) {
       const updSets = [];
       const updParams = [rows[0].id];
       const updPush = (col, val, cast) => { updParams.push(val); updSets.push(`${col} = $${updParams.length}${cast || ''}`); };
@@ -3437,6 +3472,7 @@ router.post('/factory/admin', requireAuth, requireAdmin,
       if (wechatClean !== undefined) updPush('wechat', wechatClean);
       if (whatsappClean !== undefined) updPush('whatsapp', whatsappClean);
       if (emailClean !== undefined) updPush('email', emailClean === '' ? null : emailClean);
+      if (websiteClean !== undefined) updPush('website', websiteClean === '' ? null : websiteClean); // v295
       if (socialsClean !== undefined) updPush('socials', JSON.stringify(socialsClean), '::jsonb');
       if (tagsClean !== undefined) updPush('tags', tagsClean);
       if (importCountriesClean !== undefined) updPush('import_countries', importCountriesClean);
@@ -3631,6 +3667,11 @@ router.put('/factory/admin/:id', requireAuth, requireAdmin,
       if (c === null) return res.status(400).json({ error: 'invalid_email' });
       if (c !== '' && await factoryContactTaken('email', c, id)) return res.status(409).json({ error: 'contact_in_use', message: 'Bu e-posta başka bir fabrikada kullanılıyor.' }); // fix10e M6
       push('email', c === '' ? null : c);
+    }
+    if (req.body.website !== undefined) { // v295 (CBOs27.5): web sitesi — protokolsuzsa https:// eklenir, gecersizse 400
+      const c = cleanFactoryWebsite(req.body.website);
+      if (c === null) return res.status(400).json({ error: 'invalid_website' });
+      push('website', c === '' ? null : c);
     }
     if (req.body.socials !== undefined) {
       const c = cleanFactorySocials(req.body.socials);
