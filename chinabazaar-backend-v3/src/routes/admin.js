@@ -47,6 +47,7 @@ async function ensureStreamUploadsTable() {
 const pool = require('../db');
 const translator = require('../services/translator'); // canlı çeviri (CBAi cevapları)
 const moderation = require('../utils/moderation'); // CBOs27.3: engel yönetimi + güvenlik olayları + mesaj silme
+const pushService = require('../services/pushService'); // push hazırlığı: admin cevabı -> müşteri cihazları
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -449,6 +450,13 @@ router.post('/chat/:id/reply', asyncHandler(async (req, res) => {
     `INSERT INTO chat_messages (conversation_id, sender, body, read_by_admin, translated_text, source_lang, target_lang) VALUES ($1,'admin',$2,true,$3,$4,$5) RETURNING *`,
     [req.params.id, body, tr.translated_text, tr.source_lang, tr.target_lang]);
   await pool.query(`UPDATE chat_conversations SET last_message_at=now(), status='open' WHERE id=$1`, [req.params.id]);
+  // Push (fire-and-forget): konuşmanın müşterisine CBAi bildirimi — cevap akışını bloklamaz.
+  (async () => {
+    try {
+      const c = await pool.query(`SELECT user_id FROM chat_conversations WHERE id=$1`, [req.params.id]);
+      if (c.rows.length) pushService.notifyUser(pool, c.rows[0].user_id, { channel: 'CBAi', preview: body, url: 'https://chinabazaar.shop' });
+    } catch (e) { /* push, cevap akışını asla bozmaz */ }
+  })();
   res.json({ ok: true, message: m.rows[0] });
 }));
 router.patch('/chat/:id', asyncHandler(async (req, res) => {

@@ -231,6 +231,7 @@ const { isMasterJtiRevoked } = require('../middleware/masterRevoke'); // 2026-10
 const pool = require('../db');
 const translator = require('../services/translator'); // canlı çeviri (CBChat/CBDestek mesajları)
 const moderation = require('../utils/moderation'); // CBOs27.3: içerik denetimi + otomatik engel + admin silme
+const pushService = require('../services/pushService'); // push hazırlığı: fabrika mesaj bildirimleri
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -2850,6 +2851,8 @@ router.post('/factory/myfactory/messages/:id/reply', requireFactoryOrMasterAuth,
       `INSERT INTO factory_messages (user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, factory_id, translated_text, source_lang, target_lang) VALUES ($1, $2, 'factory', $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id, user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, factory_id, translated_text, source_lang, target_lang, created_at`,
       [userId, text, att.attachmentUrl, att.kind, att.name, att.size, att.mime, fid, tr.translated_text, tr.source_lang, tr.target_lang]
     );
+    // Push (fire-and-forget): müşteriye CBChat bildirimi — cevap akışını bloklamaz.
+    pushService.notifyUser(pool, userId, { channel: 'CBChat', preview: text, kind: att.kind, url: 'https://chinabazaar.com' });
     res.status(201).json({ message: rows[0] });
   })
 );
@@ -4055,6 +4058,8 @@ router.post('/factory/messages', requireAuth, factorySpamLimiter,
       `INSERT INTO factory_messages (user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, factory_id, translated_text, source_lang, target_lang) VALUES ($1, $2, 'user', $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id, user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, factory_id, translated_text, source_lang, target_lang, created_at`,
       [req.user.id, text, att.attachmentUrl, att.kind, att.name, att.size, att.mime, msgFactoryId, tr.translated_text, tr.source_lang, tr.target_lang]
     );
+    // Push (fire-and-forget): mesaj belirli bir fabrikaya ise fabrika cihazlarına CBChat bildirimi.
+    if (msgFactoryId) pushService.notifyFactory(pool, msgFactoryId, { channel: 'CBChat', preview: text, kind: att.kind, url: 'https://chinabazaar.com/panel' });
     res.status(201).json({ message: rows[0] });
   })
 );
@@ -4258,6 +4263,8 @@ router.post('/factory/admin/messages/:id/reply', requireAuth, requireAdmin,
       `INSERT INTO factory_messages (user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, translated_text, source_lang, target_lang) VALUES ($1, $2, 'admin', $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id, user_id, body, sender, attachment_url, kind, attachment_name, attachment_size, attachment_mime, translated_text, source_lang, target_lang, created_at`,
       [userId, text, att.attachmentUrl, att.kind, att.name, att.size, att.mime, tr.translated_text, tr.source_lang, tr.target_lang]
     );
+    // Push (fire-and-forget): ziyaretçiye CBDestek bildirimi — cevap akışını bloklamaz.
+    pushService.notifyUser(pool, userId, { channel: 'CBDestek', preview: text, kind: att.kind, url: 'https://chinabazaar.com' });
     res.status(201).json({ message: rows[0] });
   })
 );

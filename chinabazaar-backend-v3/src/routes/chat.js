@@ -6,6 +6,7 @@ const { requireAuth } = require('../middleware/auth');
 const asyncHandler = require('../middleware/asyncHandler');
 const translator = require('../services/translator');
 const moderation = require('../utils/moderation'); // CBOs27.3: içerik denetimi + otomatik engel
+const pushService = require('../services/pushService'); // push hazırlığı: müşteri mesajı -> admin cihazları
 
 router.use(requireAuth);
 
@@ -36,6 +37,8 @@ router.post('/send', asyncHandler(async (req, res) => {
     `INSERT INTO chat_messages (conversation_id, sender, body, read_by_customer, translated_text, source_lang, target_lang) VALUES ($1,'customer',$2,true,$3,$4,$5) RETURNING *`,
     [conv.id, body, tr.translated_text, tr.source_lang, tr.target_lang]);
   await pool.query(`UPDATE chat_conversations SET last_message_at=now() WHERE id=$1`, [conv.id]);
+  // Push (fire-and-forget): admin cihazlarına CBAi bildirimi — mesaj akışını bloklamaz.
+  pushService.notifyAdmins(pool, { channel: 'CBAi', preview: body, url: 'https://anasadik.chinabazaar.com' });
   res.json({ ok: true, message: m.rows[0] });
 }));
 
