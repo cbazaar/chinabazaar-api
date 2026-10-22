@@ -5,6 +5,7 @@ const helmet = require('helmet');
 const cors = require('cors');
 const cfg = require('./config');
 const { apiLimiter } = require('./middleware/rateLimit');
+const { securityGuard } = require('./middleware/securityGuard'); // CBOs27.2: tarama yolu duvarı
 
 const app = express();
 
@@ -51,10 +52,18 @@ app.use(
   })
 );
 
+// CBOs27.2: uygulama katmanı güvenlik duvarı — bilinen tarama yolları
+// (/.env, /.git, /wp-admin, *.php ...) gövde ayrıştırılmadan ÖNCE 403 ile
+// kesilir ve security_events'e yazılır. Meşru yollar desene uymaz.
+app.use(securityGuard);
+
 // fix10e SABAH-4: WhatsApp webhook HMAC doğrulaması ham gövde ister (Meta, HMAC'i
 // ham baytlar üzerinden hesaplar). verify kancası ham gövdeyi req.rawBody'ye
 // saklar; JSON.stringify(req.body) yedeği ham baytları üretemez.
-app.use(express.json({ limit: '256kb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
+// CBOs27.2: JSON gövde limiti açıkça 100kb (256kb'den düşürüldü — meşru JSON
+// akışlarının tamamı birkaç KB; dosya/form yüklemeleri multipart ile gider,
+// bu parser'a girmez, davranışları değişmez).
+app.use(express.json({ limit: '100kb', verify: (req, _res, buf) => { req.rawBody = buf; } }));
 
 // v630: admin uzerinden yuklenen fabrika videolari — herkese acik sunum
 // (/api/admin/upload-video'nun dondugu /uploads/factory/<ad> URL'leri burada calisir).
@@ -76,6 +85,7 @@ app.use('/api/orders', require('./routes/orders'));
 app.use('/api/payments', require('./routes/payments'));
 app.use('/api/tracking', require('./routes/tracking')); // herkese açık, sınırlı kargo sorgusu
 app.use('/api/chat', require('./routes/chat')); // müşteri canlı destek
+app.use('/api/gate', require('./routes/gate')); // CBOs27.2 (BULGU-5): sunucu taraflı site kilidi — GATE_PASSWORD_HASH yoksa 503/pasif
 app.use('/api/translate', require('./routes/translate')); // canlı çeviri (sohbetler)
 app.use('/api/payment-methods', require('./routes/paymentMethods'));
 app.use('/api/admin/stream', require('./routes/stream')); // Cloudflare Stream video yönetimi (admin)
