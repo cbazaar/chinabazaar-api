@@ -19,6 +19,18 @@
 // (geçersiz 400 validation_failed, rezerve 400 nickname_reserved, dolu 409
 // conflict; verilmezse NULL — eski davranış). PATCH /me'ye de açık dolu-ad
 // kontrolü eklendi (önceden yalnız DB 23505 yakalamasına dayanıyordu).
+// CBOs27.2: hesap güvenliği sertleştirme — (1) hesap kilidi: 5 ardışık
+// başarısız şifreli girişte kademeli kilit (15 dk → 1 saat → 24 saat),
+// users.failed_login_count/locked_until/lock_level; master (cbai) dalı da
+// login_guard üzerinden aynı politikaya tabi. (2) Şifre politikası: en az
+// 10 karakter + harf + rakam + yaygın şifre kara listesi. (3) Jeton iptali:
+// JWT "tv" (users.token_version); şifre değişimi/sıfırlamada +1 — eski
+// jetonlar middleware'de 401 alır. (4) Yeni IP uyarısı: başarılı şifreli
+// girişte IP değiştiyse kullanıcıya bildirim e-postası (ilk girişte yalnız
+// last_login_ip kaydedilir).
+// CBOs27.3: engelli hesap (users.blocked/is_blocked) — şifre doğrulandıktan
+// sonra 403 { error: 'account_blocked' }. CBOs27.4: /login akış sırası
+// birleştirildi — kilit (429) → şifre (401) → engel (403) → tv'li jeton.
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const { body, validationResult } = require('express-validator');
@@ -32,6 +44,9 @@ const { signToken, requireAuth, optionalAuth } = require('../middleware/auth');
 const cfg = require('../config');
 const pool = require('../db');
 const mailer = require('../services/mailer');
+const moderation = require('../utils/moderation'); // CBOs27.3: engelli hesap kontrolü (blocked/is_blocked)
+const { MASTER_GUARD_KEY, nextFailureState, checkGuardLock, registerGuardFailure, registerGuardSuccess, getGuardTokenVersion } = require('../middleware/loginGuard'); // CBOs27.2
+const { logSecurityEvent } = require('../middleware/securityGuard'); // CBOs27.2
 const crypto = require('crypto');
 
 const router = express.Router();
@@ -55,9 +70,116 @@ function timingSafeEqualDigest(a, b) {
   return crypto.timingSafeEqual(da, db);
 }
 
-// fix10e L4: şifre politikası — en az 8 karakter + en az bir harf + en az bir rakam.
+// fix10e L4 → CBOs27.2: şifre politikası SERTLEŞTİRİLDİ — en az 10 karakter
+// + en az bir harf + en az bir rakam + yaygın şifre kara listesinde DEĞİL.
+// Kayıt ve şifre değiştirme/sıfırlama uçlarında zorunludur.
+const COMMON_PASSWORDS = new Set([
+  'password', 'password1', 'password123', 'passw0rd', 'p@ssw0rd', '123456', '1234567', '12345678', '123456789', '1234567890',
+  '12345', '1234', '123123', '123321', '111111', '000000', '654321', '555555', '666666', '7777777',
+  '88888888', '999999', '987654321', 'qwerty', 'qwerty123', 'qazwsx', '1q2w3e', '1q2w3e4r', 'q1w2e3r4', 'abc123',
+  'abcd1234', 'admin', 'admin123', 'administrator', 'letmein', 'welcome', 'welcome1', 'monkey', 'dragon', 'football',
+  'iloveyou', 'master', 'sunshine', 'ashley', 'bailey', 'shadow', 'superman', 'michael', 'ninja', 'mustang',
+  'charlie', 'jordan', 'taylor', 'computer', 'michelle', 'jessica', 'pepper', '1234abcd', 'abcd12345', 'changeme',
+  'parola', 'parola123', 'sifre', 'sifre123', 'sifre1234', 'turkiye', 'istanbul', 'ankara', 'galatasaray', 'fenerbahce',
+  'besiktas', 'trabzonspor', 'mustafa', 'mehmet', 'ahmet', 'fatma', 'ayse', 'emre', 'burak', 'deniz',
+  'kemal', 'aslan', 'kaplan', 'yilmaz', 'kaya', 'demir', 'sahin', 'arslan', 'dogan', 'kurt',
+  'seheryeli', 'chinabazaar', 'chinabazaar1', 'chinabazaar123', 'market123', 'magaza123', 'fabrika', 'fabrika123', 'admin2024', 'admin2025',
+  'admin2026', 'user1234', 'test1234', 'test12345', 'deneme123', 'merhaba', 'merhaba123', 'gunes123', 'yildiz123', 'kral123',
+]);
+const PASSWORD_POLICY_MESSAGE = 'Şifreniz en az 10 karakter olmalı, en az bir harf ve bir rakam içermeli ve yaygın kullanılan bir şifre olmamalıdır.';
 function passwordStrong(pw) {
+  return typeof pw === 'string' && pw.length >= 10 && pw.length <= 256 && /[A-Za-z]/.test(pw) && /[0-9]/.test(pw) && !COMMON_PASSWORDS.has(pw.toLowerCase());
+}
+// Eski kural (min 8 + harf + rakam): yalnız verify-code gibi AYNI alanla
+// hem giriş hem kayıt yapan akışların doğrulayıcısında kalır — mevcut
+// kullanıcılar (8-9 karakterli şifreler) kodla girişte kilitlenmez.
+// Kayıt dalında passwordStrong ayrıca zorlanır.
+function passwordBasic(pw) {
   return typeof pw === 'string' && pw.length >= 8 && /[A-Za-z]/.test(pw) && /[0-9]/.test(pw);
+}
+
+// CBOs27.2: kullanıcı güvenlik sütunları — idempotent ALTER (ensureQrLogins
+// deseni). Login/kilit/jeton akışları kullanmadan önce çağrılır.
+let _userSecColsPromise = null;
+function ensureUserSecurityColumns() {
+  if (!_userSecColsPromise) {
+    _userSecColsPromise = (async () => {
+      await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS failed_login_count INT DEFAULT 0`);
+      await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS locked_until TIMESTAMPTZ`);
+      await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS lock_level INT DEFAULT 0`);
+      await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_ip TEXT`);
+      await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INT DEFAULT 0`);
+      // CBOs27.4 (birlesik ensure): CBOs27.3 engel sutunlari da ayni ensure
+      // icinde — iki paketin ALTER'leri tek noktadan, cakismadan uygulanir
+      // (moderation.ensureBlockSchema factories tarafini ve ayni users
+      // sutunlarini ayrica guvenceye alir; hepsi IF NOT EXISTS).
+      await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked BOOLEAN DEFAULT FALSE`);
+      await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked_reason TEXT`);
+      await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS blocked_at TIMESTAMPTZ`);
+      await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS violation_count INT DEFAULT 0`);
+    })().catch((e) => {
+      console.error('[auth] guvenlik sutunlari hazir degil:', e && e.message ? e.message : e);
+      _userSecColsPromise = null; // sonraki çağrıda yeniden dene
+    });
+  }
+  return _userSecColsPromise;
+}
+
+// CBOs27.2: başarısız şifreli giriş — sayaç/kilit geçişi loginGuard'daki
+// saf fonksiyonla hesaplanır (master ile aynı politika). Yazma hatası
+// giriş akışını bozmaz (yalnız loglanır).
+async function registerUserLoginFailure(req, row) {
+  try {
+    const st = nextFailureState(row);
+    await pool.query(
+      'UPDATE users SET failed_login_count = $2, lock_level = $3, locked_until = $4 WHERE id = $1',
+      [row.id, st.failed_login_count, st.lock_level, st.just_locked ? new Date(Date.now() + st.locked_for_ms) : (row.locked_until || null)]
+    );
+    if (st.just_locked) logSecurityEvent('account_locked', { userId: row.id, ip: req && req.ip, path: req && req.originalUrl });
+  } catch (e) {
+    console.error('[auth] kilit durumu yazilamadi:', e && e.message ? e.message : e);
+  }
+}
+
+// CBOs27.2: başarılı giriş — başarısız sayacı sıfırlanır, kilit kalkar,
+// son giriş IP'si güncellenir. IP önceki kayıttan FARKLIYSA kullanıcıya
+// "yeni giriş" e-postası gider (ilk girişte prev boştur: yalnız kaydedilir,
+// mail atılmaz). silent=true: kod tabanlı akışlar (mailbox sahipliği zaten
+// kanıtlı) — yalnız kayıt güncellenir, uyarı maili atılmaz.
+// Mail/kayıt hatası girişi ASLA engellemez.
+async function noteUserLoginSuccess(req, row, opts) {
+  try {
+    const silent = !!(opts && opts.silent);
+    const ip = (req && req.ip) || null;
+    const prev = row.last_login_ip || null;
+    await pool.query('UPDATE users SET failed_login_count = 0, locked_until = NULL, last_login_ip = $2 WHERE id = $1', [row.id, ip]);
+    if (!silent && ip && prev && prev !== ip && row.email) {
+      logSecurityEvent('login_new_ip', { userId: row.id, ip, path: req && req.originalUrl });
+      if (mailer.isEnabled()) {
+        const when = new Date().toLocaleString('tr-TR', { timeZone: 'Europe/Istanbul' });
+        const safeIp = String(ip).replace(/[<>&"']/g, '');
+        mailer
+          .sendMail(row.email, {
+            subject: 'ChinaBazaar — hesabınıza yeni bir giriş yapıldı',
+            text:
+              'Merhaba,\n\n' +
+              'Hesabınıza farklı bir IP adresinden giriş yapıldı.\n\n' +
+              'IP adresi: ' + ip + '\n' +
+              'Zaman: ' + when + '\n\n' +
+              'Bu giriş siz değilseniz şifrenizi hemen değiştirin.\n\n' +
+              'ChinaBazaar',
+            html:
+              '<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto;background:#0d0d12;color:#f5f5f7;padding:32px;border-radius:12px">' +
+              '<div style="font-size:20px;font-weight:700;margin-bottom:8px">ChinaBazaar</div>' +
+              '<p style="color:#b9b9c2">Hesabınıza farklı bir IP adresinden giriş yapıldı.</p>' +
+              '<p style="color:#f5f5f7">IP adresi: <b>' + safeIp + '</b><br>Zaman: ' + when + '</p>' +
+              '<p style="color:#b9b9c2;font-size:13px">Bu giriş siz değilseniz şifrenizi hemen değiştirin.</p>' +
+              '</div>',
+          })
+          .catch((e) => console.error('[mailer] yeni giris bildirimi gonderilemedi:', e.message));
+      }
+    }
+  } catch (e) { /* giriş akışı bozulmaz */ }
 }
 
 // fix10e L3: 'cbai' rezerve — kullanıcı adı / nickname olarak alınamaz.
@@ -98,8 +220,11 @@ function cbaiMasterPasswordOk(password) {
   if (!expected || typeof password !== 'string' || !password) return false;
   return timingSafeEqualDigest(password, expected);
 }
-function signMasterToken() {
-  return jwt.sign({ sub: 'cbai', role: 'master', is_admin: true, jti: crypto.randomUUID() }, cfg.jwtSecret, { expiresIn: '1d', algorithm: 'HS256' });
+// CBOs27.2: master jetonu tv taşır (login_guard 'master:cbai' sürümü).
+// POST /api/admin/master/revoke-all sürümü artırır → tüm master jetonları ölür.
+async function signMasterToken() {
+  const tv = (await getGuardTokenVersion(MASTER_GUARD_KEY)) || 0;
+  return jwt.sign({ sub: 'cbai', role: 'master', is_admin: true, jti: crypto.randomUUID(), tv }, cfg.jwtSecret, { expiresIn: '1d', algorithm: 'HS256' });
 }
 // Admin kullanıcı şekli (panel login + /me): kullanıcı satırı YOK, is_admin:true.
 function masterPublicUser() {
@@ -117,7 +242,7 @@ function isMasterCodeEmail(email) {
   return String(email || '').trim().toLowerCase() === MASTER_CODE_EMAIL;
 }
 async function sendMasterCodeLogin(res) {
-  const masterToken = signMasterToken();
+  const masterToken = await signMasterToken();
   const masterJti = (jwt.decode(masterToken) || {}).jti || null;
   await logMasterAudit('master_email_code_login', 'auth', masterJti);
   return res.json({ user: masterPublicUser(), token: masterToken, master: true });
@@ -167,7 +292,7 @@ router.post(
   '/register',
   registerLimiter,
   body('email').isEmail().normalizeEmail(),
-  body('password').isLength({ min: 8 }).custom((v) => passwordStrong(v)), // fix10e L4
+  body('password').isLength({ min: 10 }).custom((v) => passwordStrong(v)), // fix10e L4 → CBOs27.2: min 10 + kara liste
   body('name').trim().isLength({ min: 2, max: 100 }),
   body('nickname').optional({ values: 'falsy' }).trim().isLength({ min: 2, max: 30 }).matches(/^[\p{L}\p{N}_.-]+$/u), // fix10ap: PATCH /me ile aynı kural; boş/yok = verilmemiş
   body('phone').optional().matches(/^\+?[0-9][0-9\s\-().]{6,19}$/),
@@ -175,6 +300,7 @@ router.post(
   body('source').optional().isIn(['myfactory', 'shop']),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
+    await ensureUserSecurityColumns(); // CBOs27.2
     const { email, password, name, phone, admin_key } = req.body;
     const nickname = typeof req.body.nickname === 'string' ? req.body.nickname.trim() : '';
     const source = req.body.source === 'myfactory' ? 'myfactory' : 'shop';
@@ -240,10 +366,12 @@ router.post(
       return res.status(401).json({ error: 'invalid_code' });
     }
     await pool.query('UPDATE phone_codes SET consumed_at = now() WHERE id = $1', [rec.id]);
-    let { rows } = await pool.query('SELECT id, email, name, nickname, phone, is_admin, customer_code FROM users WHERE phone=$1', [phone]);
+    let { rows } = await pool.query('SELECT id, email, name, nickname, phone, is_admin, customer_code, token_version FROM users WHERE phone=$1', [phone]);
     let user;
+    let userTv = 0; // CBOs27.2
     if (rows.length) {
       user = publicUser(rows[0]);
+      userTv = rows[0].token_version || 0;
     } else {
       const email = 'phone_' + phone.replace(/\D/g, '') + '@phone.chinabazaar.local';
       const hash = await bcrypt.hash(crypto.randomBytes(16).toString('hex'), 12);
@@ -254,16 +382,19 @@ router.post(
       );
       user = publicUser(ins.rows[0]);
     }
-    res.json({ user, token: signToken(user) });
+    res.json({ user, token: signToken({ ...user, tv: userTv }) });
   })
 );
 
 // POST /api/auth/login  { identifier | email, password }
 // identifier: e-posta, kullanıcı adı (nickname) veya telefon.
-// GÜVENLİK: Tüm başarısızlıklar (kullanıcı yok / yanlış şifre / bozuk tanıtan /
-// engelli hesap) AYNI 401 { error: 'invalid_credentials' } cevabını döner —
-// kullanıcı sayımı (enumeration) yapılamaz. Katı hız limiti: IP başına ve
-// tanıtan başına 15 dakikada en fazla 10 BAŞARISIZ deneme.
+// GÜVENLİK: Başarısızlıklar (kullanıcı yok / yanlış şifre / bozuk tanıtan)
+// AYNI 401 { error: 'invalid_credentials' } cevabını döner — kullanıcı
+// sayımı (enumeration) yapılamaz. Katı hız limiti: IP başına ve tanıtan
+// başına 15 dakikada en fazla 10 BAŞARISIZ deneme.
+// CBOs27.3: ENGELLİ hesap, şifre DOĞRULANDIKTAN sonra 403
+// { error: 'account_blocked' } döner (şifreyi bilmeyen için sızıntı yok).
+// CBOs27.2: KİLİTLİ hesap, şifre kıyasından ÖNCE 429 döner (asagida).
 router.post(
   '/login',
   strictLoginLimiter,
@@ -284,17 +415,27 @@ router.post(
     // CBOs26.105 / fix10aq: chinabazaarcom@gmail.com da aynı ana şifreyle master
     // girişi yapar (kullanıcı kararı 2026-10-21) — dalın içi birebir aynı.
     if (identifier.toLowerCase() === 'cbai' || identifier.toLowerCase() === 'chinabazaarcom@gmail.com') {
+      // CBOs27.2: master dalı da hesap kilidine tabi (login_guard, aynı politika).
+      const mLock = await checkGuardLock(MASTER_GUARD_KEY);
+      if (mLock.locked) {
+        return res.status(429).json({ error: 'account_locked', message: 'Hesap geçici olarak kilitlendi. Lütfen ' + Math.ceil(mLock.retryAfterSec / 60) + ' dakika sonra tekrar deneyin.', retry_after: mLock.retryAfterSec });
+      }
       if (!cbaiMasterConfigured() || !cbaiMasterPasswordOk(password)) {
         await bcrypt.compare(password, DUMMY_HASH);
+        const gf = await registerGuardFailure(MASTER_GUARD_KEY);
+        if (gf.justLocked) logSecurityEvent('account_locked', { userId: 'cbai', ip: req.ip, path: req.originalUrl });
         return res.status(401).json(GENERIC);
       }
+      await registerGuardSuccess(MASTER_GUARD_KEY);
       // 2026-10-20 N1: jti denetim kaydına yazılır (şüpheli girişin jetonu
       // POST /api/admin/master/revoke ile iptal edilebilir).
-      const masterToken = signMasterToken();
+      const masterToken = await signMasterToken();
       const masterJti = (jwt.decode(masterToken) || {}).jti || null;
       await logMasterAudit('master_login', 'auth', masterJti);
       return res.json({ user: masterPublicUser(), token: masterToken, master: true });
     }
+    await ensureUserSecurityColumns(); // CBOs27.2
+    await moderation.ensureBlockSchema(pool); // CBOs27.3: users.blocked okunabilsin
     const candidates = phoneCandidates(identifier);
     const { rows } = await pool.query(
       `SELECT * FROM users
@@ -306,12 +447,27 @@ router.post(
       [identifier, candidates]
     );
     const row = rows[0];
+    // CBOs27.2: hesap kilidi şifre kıyasından ÖNCE denetlenir — kilitliyken
+    // doğru şifre bile reddedilir (429 + kalan süre).
+    if (row && row.locked_until && new Date(row.locked_until).getTime() > Date.now()) {
+      const retryAfter = Math.max(1, Math.ceil((new Date(row.locked_until).getTime() - Date.now()) / 1000));
+      return res.status(429).json({ error: 'account_locked', message: 'Hesabınız geçici olarak kilitlendi. Lütfen ' + Math.ceil(retryAfter / 60) + ' dakika sonra tekrar deneyin.', retry_after: retryAfter });
+    }
     const ok = await bcrypt.compare(password, row ? row.password_hash : DUMMY_HASH);
-    if (!row || !ok || row.is_blocked) {
+    if (!row || !ok) {
+      // CBOs27.4: kilit sayaci yalniz kimligi bulunan + engelli OLMAYAN
+      // hesapta isler (A); yanlis sifrede engel bilgisi SIZMAZ (B) — jenerik 401.
+      if (row && !ok && !(row.blocked || row.is_blocked)) await registerUserLoginFailure(req, row);
       return res.status(401).json(GENERIC);
     }
+    // CBOs27.3: engelli hesap (blocked OR is_blocked) — sifre dogrulandi,
+    // artik 403 soylenebilir (anti-enumeration korunur).
+    if (row.blocked || row.is_blocked) {
+      return res.status(403).json({ error: 'account_blocked' });
+    }
+    await noteUserLoginSuccess(req, row);
     const user = publicUser(row);
-    res.json({ user, token: signToken(user) });
+    res.json({ user, token: signToken({ ...user, tv: row.token_version || 0 }) });
   })
 );
 
@@ -323,7 +479,7 @@ router.post(
   adminResetLimiter,
   body('email').isEmail().normalizeEmail(),
   body('admin_key').notEmpty(),
-  body('new_password').isLength({ min: 8 }).custom((v) => passwordStrong(v)),
+  body('new_password').isLength({ min: 10 }).custom((v) => passwordStrong(v)), // CBOs27.2
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     const { email, admin_key, new_password } = req.body;
@@ -334,9 +490,12 @@ router.post(
     const row = rows[0];
     if (!row) return res.json({ ok: true }); // fix10e L2: jenerik (kullanıcı yokluğu söylenmez)
     const hash = await bcrypt.hash(new_password, 12);
-    await pool.query('UPDATE users SET password_hash = $1 WHERE email = $2', [hash, email]);
+    await ensureUserSecurityColumns(); // CBOs27.2
+    // CBOs27.2: şifre sıfırlamada jeton sürümü artar (eski jetonlar ölür),
+    // kilit/sayaç temizlenir (hesap kurtarma kilidi de açar).
+    await pool.query('UPDATE users SET password_hash = $1, token_version = COALESCE(token_version, 0) + 1, failed_login_count = 0, locked_until = NULL WHERE email = $2', [hash, email]);
     const user = publicUser(row);
-    res.json({ user, token: signToken(user) });
+    res.json({ user, token: signToken({ ...user, tv: (row.token_version || 0) + 1 }) });
   })
 );
 
@@ -383,7 +542,7 @@ router.post(
   codeLimiter,
   body('email').isEmail().normalizeEmail(),
   body('code').matches(/^[0-9]{6}$/),
-  body('password').isLength({ min: 8 }).custom((v) => passwordStrong(v)), // fix10e L4
+  body('password').isLength({ min: 8 }).custom((v) => passwordBasic(v)), // fix10e L4 → CBOs27.2: akış giriş de yapar, eski kural; yeni politika kayıt dalında zorlanır
   body('name').optional().trim().isLength({ min: 2, max: 100 }),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
@@ -404,21 +563,32 @@ router.post(
     // CBOs26.107 / fix10ar: info@chinabazaar.com kodu dogruysa master girisi —
     // kullanici satiri/sifre kontrolune girmeden master jetonu doner.
     if (isMasterCodeEmail(email)) return sendMasterCodeLogin(res);
+    await moderation.ensureBlockSchema(pool); // CBOs27.3
     const { rows: urows } = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     if (urows[0]) {
       const row = urows[0];
+      await ensureUserSecurityColumns(); // CBOs27.2
+      // CBOs27.2: kilitli hesap kod+şifreyle de giremez (429 + kalan süre).
+      if (row.locked_until && new Date(row.locked_until).getTime() > Date.now()) {
+        const retryAfter = Math.max(1, Math.ceil((new Date(row.locked_until).getTime() - Date.now()) / 1000));
+        return res.status(429).json({ error: 'account_locked', message: 'Hesabınız geçici olarak kilitlendi. Lütfen ' + Math.ceil(retryAfter / 60) + ' dakika sonra tekrar deneyin.', retry_after: retryAfter });
+      }
       if (!(await bcrypt.compare(password, row.password_hash))) {
+        await registerUserLoginFailure(req, row);
         return res.status(401).json({ error: 'invalid_credentials' });
       }
-      if (row.is_blocked) return res.status(403).json({ error: 'user_blocked' });
+      if (row.blocked || row.is_blocked) return res.status(403).json({ error: 'account_blocked' }); // CBOs27.4: B'nin birlesik adi (user_blocked -> account_blocked)
       await pool.query('UPDATE users SET email_verified = TRUE WHERE id = $1', [row.id]);
+      await noteUserLoginSuccess(req, row, { silent: true });
       const user = publicUser(row);
-      return res.json({ user, token: signToken(user) });
+      return res.json({ user, token: signToken({ ...user, tv: row.token_version || 0 }) });
     }
 
 
 // Yeni kayıt
     if (!name) return res.status(400).json({ error: 'name_required' });
+    // CBOs27.2: kayıt dalında YENİ şifre politikası zorunludur (min 10 + kara liste).
+    if (!passwordStrong(password)) return res.status(400).json({ error: 'weak_password', message: PASSWORD_POLICY_MESSAGE });
     const hash = await bcrypt.hash(password, 12);
     try {
       const { rows: nrows } = await pool.query(
@@ -462,13 +632,16 @@ router.post(
     // kullanici satiri aranmaz, sifre sorulmaz (paneldeki 'E-posta Kodu ile
     // Giris' bu ucu kullanir).
     if (isMasterCodeEmail(email)) return sendMasterCodeLogin(res);
+    await moderation.ensureBlockSchema(pool); // CBOs27.3
     const { rows: urows } = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     if (!urows[0]) return res.status(401).json({ error: 'invalid_credentials' }); // fix10e L2: jenerik (kullanıcı yokluğu söylenmez)
     const row = urows[0];
-    if (row.is_blocked) return res.status(403).json({ error: 'user_blocked' });
+    if (row.blocked || row.is_blocked) return res.status(403).json({ error: 'account_blocked' }); // CBOs27.4: B'nin birlesik adi
     await pool.query('UPDATE users SET email_verified = TRUE WHERE id = $1', [row.id]);
+    await ensureUserSecurityColumns(); // CBOs27.2
+    await noteUserLoginSuccess(req, row, { silent: true }); // CBOs27.2: sayaç/IP kaydı (mail yok — kod sahipliği kanıtlı)
     const user = publicUser(row);
-    res.json({ user, token: signToken(user) });
+    res.json({ user, token: signToken({ ...user, tv: row.token_version || 0 }) });
   })
 );
 
@@ -653,7 +826,7 @@ router.post(
   loginLimiter,
   body('phone').matches(/^\+?[0-9][0-9\s\-().]{6,19}$/),
   body('code').isLength({ min: 4, max: 10 }),
-  body('new_password').isString().isLength({ min: 8, max: 100 }).custom((v) => passwordStrong(v)), // fix10e L4
+  body('new_password').isString().isLength({ min: 10, max: 256 }).custom((v) => passwordStrong(v)), // fix10e L4 → CBOs27.2
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     let { phone, code, new_password } = req.body;
@@ -674,7 +847,9 @@ router.post(
     }
     await pool.query('UPDATE phone_codes SET consumed_at = now() WHERE id = $1', [rec.id]);
     const hash = await bcrypt.hash(String(new_password), 12);
-    const { rows } = await pool.query('UPDATE users SET password_hash = $2 WHERE phone = $1 RETURNING id', [phone, hash]);
+    await ensureUserSecurityColumns(); // CBOs27.2
+    // CBOs27.2: şifre sıfırlamada jeton sürümü artar (eski jetonlar ölür), kilit/sayaç temizlenir.
+    const { rows } = await pool.query('UPDATE users SET password_hash = $2, token_version = COALESCE(token_version, 0) + 1, failed_login_count = 0, locked_until = NULL WHERE phone = $1 RETURNING id', [phone, hash]);
     if (!rows.length) return res.json({ ok: true }); // fix10e L2: jenerik (kullanıcı yokluğu söylenmez)
     res.json({ ok: true });
   })
@@ -743,11 +918,12 @@ async function verifyAppleIdToken(idToken) {
 }
 
 async function findOrCreateSocialUser(email, name) {
+  await moderation.ensureBlockSchema(pool); // CBOs27.3
   const lower = String(email).toLowerCase();
   const { rows } = await pool.query('SELECT * FROM users WHERE email = $1', [lower]);
   if (rows.length) {
-    if (rows[0].is_blocked) return { blocked: true };
-    return { user: publicUser(rows[0]) };
+    if (rows[0].blocked || rows[0].is_blocked) return { blocked: true }; // CBOs27.3
+    return { user: publicUser(rows[0]), tv: rows[0].token_version || 0 }; // CBOs27.2 (yanıta yazılmaz, yalnız imzaya girer)
   }
   const hash = await bcrypt.hash(crypto.randomBytes(16).toString('hex'), 12);
   const ins = await pool.query(
@@ -770,8 +946,8 @@ router.post(
     else return res.status(400).json({ error: 'unknown_provider' });
     if (!profile || !profile.email) return res.status(401).json({ error: 'social_verify_failed' });
     const r = await findOrCreateSocialUser(profile.email, profile.name);
-    if (r.blocked) return res.status(403).json({ error: 'user_blocked' });
-    res.json({ user: r.user, token: signToken(r.user) });
+    if (r.blocked) return res.status(403).json({ error: 'account_blocked' }); // CBOs27.3
+    res.json({ user: r.user, token: signToken({ ...r.user, tv: r.tv || 0 }) });
   })
 );
 
@@ -3241,19 +3417,19 @@ router.get(
     if (!del.rowCount) return res.json(EXPIRED);
     const appr = del.rows[0];
     if (appr.is_master) {
-      const masterToken = signMasterToken();
+      const masterToken = await signMasterToken();
       const masterJti = (jwt.decode(masterToken) || {}).jti || null;
       await logMasterAudit('master_qr_login', 'auth', masterJti);
       return res.json({ user: masterPublicUser(), token: masterToken, master: true });
     }
     const { rows: urows } = await pool.query(
-      'SELECT id, email, name, nickname, phone, is_admin, customer_code, is_blocked FROM users WHERE id = $1',
+      'SELECT id, email, name, nickname, phone, is_admin, customer_code, is_blocked, token_version FROM users WHERE id = $1',
       [appr.user_id]
     );
     const row = urows[0];
     if (!row || row.is_blocked) return res.json(EXPIRED);
     const user = publicUser(row);
-    res.json({ user, token: signToken(user) });
+    res.json({ user, token: signToken({ ...user, tv: row.token_version || 0 }) }); // CBOs27.2
   })
 );
 

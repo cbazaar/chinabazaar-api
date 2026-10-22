@@ -223,11 +223,14 @@ const express = require('express');
 const { body, param } = require('express-validator');
 const asyncHandler = require('../middleware/asyncHandler');
 const { checkValidation } = require('../middleware/validate');
-const { requireAuth, optionalAuth } = require('../middleware/auth');
+const { requireAuth, optionalAuth, checkTokenVersion } = require('../middleware/auth'); // CBOs27.2: checkTokenVersion (tv)
+const { MASTER_GUARD_KEY, checkGuardLock, registerGuardFailure, registerGuardSuccess, getGuardTokenVersion } = require('../middleware/loginGuard'); // CBOs27.2
+const { logSecurityEvent } = require('../middleware/securityGuard'); // CBOs27.2: kilit olayı kaydı
 const { requireAdmin } = require('../middleware/admin');
 const { isMasterJtiRevoked } = require('../middleware/masterRevoke'); // 2026-10-21 F1: iptal edilmis master jeton reddedilir
 const pool = require('../db');
 const translator = require('../services/translator'); // canlı çeviri (CBChat/CBDestek mesajları)
+const moderation = require('../utils/moderation'); // CBOs27.3: içerik denetimi + otomatik engel + admin silme
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
@@ -732,6 +735,7 @@ async function ensureFactoryTables() {
   await pool.query(`ALTER TABLE factory_subscriptions ADD COLUMN IF NOT EXISTS provider TEXT`);
   await pool.query(`ALTER TABLE factory_subscriptions ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factories (id SERIAL PRIMARY KEY, name TEXT NOT NULL, city TEXT DEFAULT '', category TEXT DEFAULT '', description TEXT DEFAULT '', moq INT DEFAULT 0, stock INT DEFAULT 0, capacity TEXT DEFAULT '', certs TEXT DEFAULT '', features TEXT DEFAULT '', import_countries TEXT DEFAULT '', employees TEXT DEFAULT '', annual_revenue TEXT DEFAULT '', factory_area TEXT DEFAULT '', years TEXT DEFAULT '', main_products TEXT DEFAULT '', cover_image TEXT DEFAULT '', videos JSONB DEFAULT '[]', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now())`);
+  await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS token_version INT DEFAULT 0`); // CBOs27.2: fabrika jeton iptali (tv)
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS hashtags TEXT DEFAULT ''`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS address TEXT DEFAULT ''`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS phone TEXT DEFAULT ''`);
@@ -1967,15 +1971,32 @@ function resolveBrandTargetFactoryId(req, res) {
   return req.factoryId;
 }
 
+// CBOs27.2: fabrika jeton sürümü (tv) — factories.token_version ile kıyas.
+// Okunamazsa/satır yoksa fail-open (null → kabul): altyapı arızası fabrika
+// panellerini topluca kilitlemez. Şifre değişiminde sürüm artar, eski
+// fabrika jetonları 401 alır.
+async function factoryTvOk(payload) {
+  try {
+    const { rows } = await pool.query('SELECT token_version FROM factories WHERE id = $1', [payload.factory_id]);
+    if (!rows.length) return true;
+    const tv = Number.isInteger(payload.tv) ? payload.tv : 0;
+    return (Number(rows[0].token_version) || 0) === tv;
+  } catch (e) { return true; }
+}
+const FACTORY_TV_401 = { error: 'token_revoked', message: 'Oturumunuz güvenlik nedeniyle sonlandırıldı. Lütfen tekrar giriş yapın.' };
+
 // Fabrika JWT dogrulamasi: Bearer token + role === 'factory' + tamsayi factory_id.
 // Token yok/bozuk/suresi dolmus => 401; gecerli ama fabrika rolu degil => 403.
-function requireFactoryAuth(req, res, next) {
+async function requireFactoryAuth(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'unauthorized', message: 'Giriş gerekli. Lütfen ChinaBazaar My Factory hesabınızla giriş yapın.' });
   let payload;
   try { payload = jwt.verify(token, cfg.jwtSecret, { algorithms: cfg.jwtAlgorithms }); } catch { return res.status(401).json({ error: 'invalid_token', message: 'Oturumunuz geçersiz veya süresi dolmuş. Lütfen tekrar giriş yapın.' }); }
   if (!payload || payload.role !== 'factory' || !Number.isInteger(payload.factory_id)) return res.status(403).json({ error: 'forbidden', message: 'Bu işlem için fabrika hesabı gerekli.' });
+  if (!(await factoryTvOk(payload))) return res.status(401).json(FACTORY_TV_401); // CBOs27.2
+  // CBOs27.3: engelli fabrika hesabı kimlikli uçları kullanamaz (fail-open).
+  try { if (await moderation.getFactoryBlockState(pool, payload.factory_id)) return res.status(403).json({ error: 'account_blocked', message: 'Hesabınız engellendi.' }); } catch (e) { /* fail-open */ }
   req.factoryId = payload.factory_id;
   next();
 }
@@ -1992,7 +2013,12 @@ async function requireUserOrFactoryAuth(req, res, next) {
   if (!token) return res.status(401).json({ error: 'unauthorized', message: 'Giriş gerekli.' });
   let payload;
   try { payload = jwt.verify(token, cfg.jwtSecret, { algorithms: cfg.jwtAlgorithms }); } catch { return res.status(401).json({ error: 'invalid_token', message: 'Oturumunuz geçersiz veya süresi dolmuş. Lütfen tekrar giriş yapın.' }); }
-  if (payload && payload.role === 'factory' && Number.isInteger(payload.factory_id)) { req.factoryId = payload.factory_id; return next(); }
+  if (payload && payload.role === 'factory' && Number.isInteger(payload.factory_id)) {
+    if (!(await factoryTvOk(payload))) return res.status(401).json(FACTORY_TV_401); // CBOs27.2
+    // CBOs27.3: engelli fabrika hesabı (fail-open).
+    try { if (await moderation.getFactoryBlockState(pool, payload.factory_id)) return res.status(403).json({ error: 'account_blocked', message: 'Hesabınız engellendi.' }); } catch (e) { /* fail-open */ }
+    req.factoryId = payload.factory_id; return next();
+  }
   if (payload && payload.role === 'master' && payload.is_admin === true) {
 
     // 2026-10-21 F1: iptal edilmis master jeton reddedilir.
@@ -2002,10 +2028,18 @@ async function requireUserOrFactoryAuth(req, res, next) {
 
     }
 
+    // CBOs27.2: sürümü geçmiş master jeton reddedilir.
+    if (!(await checkTokenVersion(payload))) return res.status(401).json({ error: 'token_revoked' });
+
     req.isMaster = true; req.user = { id: 'cbai', email: null, role: 'master' }; return next();
 
   }
-  if (payload && payload.sub) { req.user = { id: payload.sub, email: payload.email, role: payload.role || 'user' }; return next(); }
+  if (payload && payload.sub) {
+    if (!(await checkTokenVersion(payload))) return res.status(401).json({ error: 'token_revoked' }); // CBOs27.2
+    // CBOs27.3: engelli kullanıcı (fail-open; master sub 'cbai' satırsız geçer).
+    try { if (await moderation.getUserBlockState(pool, payload.sub)) return res.status(403).json({ error: 'account_blocked', message: 'Hesabınız engellendi.' }); } catch (e) { /* fail-open */ }
+    req.user = { id: payload.sub, email: payload.email, role: payload.role || 'user' }; return next();
+  }
   return res.status(401).json({ error: 'unauthorized', message: 'Giriş gerekli.' });
 }
 
@@ -2028,8 +2062,10 @@ function cbaiMasterPasswordOk(password) {
   return crypto.timingSafeEqual(a, b);
 }
 // fix10e H-E: sub='cbai' + jti, süre 7 gün -> 1 gün, HS256 açık.
-function signMasterToken() {
-  return jwt.sign({ sub: 'cbai', role: 'master', is_admin: true, jti: crypto.randomUUID() }, cfg.jwtSecret, { expiresIn: '1d', algorithm: 'HS256' });
+// CBOs27.2: tv taşır (login_guard 'master:cbai' sürümü; auth.js ile aynı).
+async function signMasterToken() {
+  const tv = (await getGuardTokenVersion(MASTER_GUARD_KEY)) || 0;
+  return jwt.sign({ sub: 'cbai', role: 'master', is_admin: true, jti: crypto.randomUUID(), tv }, cfg.jwtSecret, { expiresIn: '1d', algorithm: 'HS256' });
 }
 // CBF tanımlayıcı normalizasyonu: "CBF-001" / "cbf001" / "cbf-001" → "CBF-001".
 // Eşleşmezse '' (CBF koşulu sorguya eklenmez).
@@ -2072,10 +2108,21 @@ async function requireFactoryOrMasterAuth(req, res, next) {
 
     }
 
+    // CBOs27.2: sürümü geçmiş master jeton reddedilir.
+    if (!(await checkTokenVersion(payload))) return res.status(401).json({ error: 'token_revoked' });
+
+    // CBOs27.3: engel kontrolü — master kimliğinin (sub 'cbai') users
+    // satırı yoktur; sorgu satır bulamazsa dal sessizce geçer (bozulmaz).
+    try { if (payload.sub && await moderation.getUserBlockState(pool, payload.sub)) return res.status(403).json({ error: 'account_blocked', message: 'Hesabınız engellendi.' }); } catch (e) { /* fail-open */ }
     req.isMaster = true; return next();
 
   }
-  if (payload && payload.role === 'factory' && Number.isInteger(payload.factory_id)) { req.factoryId = payload.factory_id; return next(); }
+  if (payload && payload.role === 'factory' && Number.isInteger(payload.factory_id)) {
+    if (!(await factoryTvOk(payload))) return res.status(401).json(FACTORY_TV_401); // CBOs27.2
+    // CBOs27.3: engelli fabrika hesabı (fail-open).
+    try { if (await moderation.getFactoryBlockState(pool, payload.factory_id)) return res.status(403).json({ error: 'account_blocked', message: 'Hesabınız engellendi.' }); } catch (e) { /* fail-open */ }
+    req.factoryId = payload.factory_id; return next();
+  }
   return res.status(403).json({ error: 'forbidden', message: 'Bu işlem için fabrika hesabı gerekli.' });
 }
 
@@ -2089,20 +2136,29 @@ async function requireFactoryOrMasterAuth(req, res, next) {
 // fix10e M1: tanıtan-bazlı limit (loginIdentifierLimiter) + IP limiti aynen.
 router.post('/factory/myfactory/login', loginLimiter, loginIdentifierLimiter, asyncHandler(async (req, res) => {
   await ensureFactoryTables();
+  await moderation.ensureBlockSchema(pool); // CBOs27.3: factories.blocked okunabilsin
   const identifier = typeof (req.body && (req.body.identifier ?? req.body.username)) === 'string' ? String(req.body.identifier ?? req.body.username).trim() : '';
   const password = req.body && req.body.password;
   if (!identifier || typeof password !== 'string' || !password) return res.status(401).json({ error: 'invalid_credentials', message: 'Kullanıcı adı veya şifre hatalı.' });
   // CBAI master (rezerve) — fabrika araması YAPILMAZ.
   if (isCbaiIdentifier(identifier)) {
+    // CBOs27.2: master dalı hesap kilidine tabi (login_guard, kullanıcılarla aynı politika).
+    const mLock = await checkGuardLock(MASTER_GUARD_KEY);
+    if (mLock.locked) {
+      return res.status(429).json({ error: 'account_locked', message: 'Hesap geçici olarak kilitlendi. Lütfen ' + Math.ceil(mLock.retryAfterSec / 60) + ' dakika sonra tekrar deneyin.', retry_after: mLock.retryAfterSec });
+    }
     if (!cbaiMasterConfigured() || !cbaiMasterPasswordOk(password)) {
       await bcrypt.compare(password, MYFACTORY_DUMMY_HASH);
+      const gf = await registerGuardFailure(MASTER_GUARD_KEY);
+      if (gf.justLocked) logSecurityEvent('account_locked', { userId: 'cbai', ip: req.ip, path: req.originalUrl });
       return res.status(401).json({ error: 'invalid_credentials', message: 'Kullanıcı adı veya şifre hatalı.' });
     }
+    await registerGuardSuccess(MASTER_GUARD_KEY);
     await logMasterAudit('master_login', 'factory', null);
     // fix10al (CBOs26.93-A): master fabrika baglami secmeden girer; panel bu
     // isaretle fabrika secim ekranini acar. Ek alandir — mevcut {token, master}
     // sozlesmesi aynen korunur; fabrika girisi davranisi degismez.
-    return res.json({ token: signMasterToken(), master: true, needs_factory_selection: true });
+    return res.json({ token: await signMasterToken(), master: true, needs_factory_selection: true });
   }
   const cbf = normalizeMyFactoryCbfIdentifier(identifier);
   const phoneCands = myFactoryPhoneCandidates(identifier);
@@ -2119,7 +2175,10 @@ router.post('/factory/myfactory/login', loginLimiter, loginIdentifierLimiter, as
   const row = matched[0];
   const ok = await bcrypt.compare(password, row && row.myfactory_password_hash ? row.myfactory_password_hash : MYFACTORY_DUMMY_HASH);
   if (!ok) return res.status(401).json({ error: 'invalid_credentials', message: 'Kullanıcı adı veya şifre hatalı.' });
-  const token = jwt.sign({ factory_id: row.id, role: 'factory' }, cfg.jwtSecret, { expiresIn: '7d', algorithm: 'HS256' });
+  // CBOs27.3: engelli fabrika hesabı giriş yapamaz (şifre doğrulandıktan
+  // sonra söylenir — sayım/sızma yaratmaz).
+  if (row.blocked) return res.status(403).json({ error: 'account_blocked', message: 'Hesabınız engellendi. Destek ile iletişime geçin.' });
+  const token = jwt.sign({ factory_id: row.id, role: 'factory', tv: row.token_version || 0 }, cfg.jwtSecret, { expiresIn: '7d', algorithm: 'HS256' }); // CBOs27.2: tv
   await attachFactoryBrands([row]); // fix10x
   res.json({ token, factory: toFactoryMyFactory(row) });
 }));
@@ -2300,6 +2359,9 @@ router.put('/factory/myfactory/credentials', requireFactoryOrMasterAuth, asyncHa
     }
     params.push(await bcrypt.hash(pw, 12));
     sets.push(`myfactory_password_hash = $${params.length}`);
+    // CBOs27.2: şifre değişiminde jeton sürümü artar — mevcut fabrika
+    // jetonları (bu oturum dahil) geçersiz olur, panel yeniden giriş ister.
+    sets.push('token_version = COALESCE(token_version, 0) + 1');
   }
   sets.push('updated_at = now()');
   const { rows } = await pool.query(`UPDATE factories SET ${sets.join(', ')} WHERE id = $1 RETURNING myfactory_username`, params);
@@ -2741,6 +2803,15 @@ router.post('/factory/myfactory/messages/:id/reply', requireFactoryOrMasterAuth,
       const own = await chatFileOwnedBy(att.attachmentUrl, req.isMaster ? 'cbai:master' : 'factory:' + fid);
       const factoryOwn = req.isMaster ? await chatFileOwnedBy(att.attachmentUrl, 'factory:' + fid) : false;
       if (!own && !factoryOwn) return res.status(403).json({ error: 'forbidden' });
+    }
+    // CBOs27.3: fabrika cevabı denetlenir (gövde + istemci çevirisi);
+    // master (admin) cevabı DENETİMDEN MUAFTIR.
+    if (!req.isMaster) {
+      const modFactory = moderation.checkTexts([text, req.body.translated_text]);
+      if (modFactory.blocked) {
+        await moderation.registerViolation(pool, { actorKind: 'factory', actorId: fid, ip: req.ip, category: modFactory.category, surface: 'factory_chat' });
+        return res.status(422).json({ error: 'content_blocked', category: modFactory.category });
+      }
     }
     const tr = await translator.resolveMessageTranslation(text, req.body);
     const { rows } = await pool.query(
@@ -3816,6 +3887,8 @@ async function ensureFactoryMessagesTable() {
   try { await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS translated_text TEXT`); } catch (e) { /* yoksay */ }
   try { await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS source_lang VARCHAR(8)`); } catch (e) { /* yoksay */ }
   try { await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS target_lang VARCHAR(8)`); } catch (e) { /* yoksay */ }
+  // CBOs27.3: admin silme işareti (hard delete yok; gövde '[silindi]' olur).
+  try { await pool.query(`ALTER TABLE factory_messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`); } catch (e) { /* yoksay */ }
 // fix7: sohbet dosyalari Postgres'te saklanir (Railway diski gecici — her redeploy
 // yuklenen dosyalari siler, bu yuzden resimler bozuluyordu). token = tahmin edilemez URL anahtari.
   await pool.query(`CREATE TABLE IF NOT EXISTS factory_chat_files (id SERIAL PRIMARY KEY, token TEXT NOT NULL UNIQUE, data BYTEA NOT NULL, mime TEXT NOT NULL, name TEXT, size INT, created_at TIMESTAMPTZ DEFAULT now())`);
@@ -3928,6 +4001,13 @@ router.post('/factory/messages', requireAuth, factorySpamLimiter,
     // fix10e M5: sohbet dosyası eki başkasına ait olamaz.
     if (att.attachmentUrl && att.attachmentUrl.startsWith('/api/products/factory/chat-file/')) {
       if (!(await chatFileOwnedBy(att.attachmentUrl, req.user.id))) return res.status(403).json({ error: 'forbidden' });
+    }
+    // CBOs27.3: içerik denetimi (gövde = ek metni/başlığı + istemci çevirisi).
+    // İhlalde 422 + sayaç + hesap ANINDA otomatik engellenir.
+    const modVisitor = moderation.checkTexts([text, req.body.translated_text]);
+    if (modVisitor.blocked) {
+      await moderation.registerViolation(pool, { actorKind: 'user', actorId: req.user.id, ip: req.ip, category: modVisitor.category, surface: 'factory_chat' });
+      return res.status(422).json({ error: 'content_blocked', category: modVisitor.category });
     }
     const tr = await translator.resolveMessageTranslation(text, req.body);
     const { rows } = await pool.query(
@@ -4138,6 +4218,23 @@ router.post('/factory/admin/messages/:id/reply', requireAuth, requireAdmin,
       [userId, text, att.attachmentUrl, att.kind, att.name, att.size, att.mime, tr.translated_text, tr.source_lang, tr.target_lang]
     );
     res.status(201).json({ message: rows[0] });
+  })
+);
+
+// CBOs27.3 — DELETE /api/products/factory/admin/messages/:id — admin bir
+// fabrika mesajini siler. HARD DELETE YOK: govde '[silindi]' olur, ek ve
+// ceviri temizlenir, deleted_at isaretlenir; satir/cevap semasi korunur.
+router.delete('/factory/admin/messages/:id', requireAuth, requireAdmin,
+  param('id').isInt({ min: 1 }),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    await ensureFactoryMessagesTable();
+    const { rows } = await pool.query(
+      `UPDATE factory_messages SET body = '[silindi]', translated_text = NULL, attachment_url = NULL, kind = 'text', attachment_name = NULL, deleted_at = now() WHERE id = $1 RETURNING id, user_id, body, sender, attachment_url, kind, factory_id, deleted_at, created_at`,
+      [parseInt(req.params.id, 10)]
+    );
+    if (!rows.length) return res.status(404).json({ error: 'not_found' });
+    res.json({ message: rows[0] });
   })
 );
 

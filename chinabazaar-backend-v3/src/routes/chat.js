@@ -5,6 +5,7 @@ const pool = require('../db');
 const { requireAuth } = require('../middleware/auth');
 const asyncHandler = require('../middleware/asyncHandler');
 const translator = require('../services/translator');
+const moderation = require('../utils/moderation'); // CBOs27.3: içerik denetimi + otomatik engel
 
 router.use(requireAuth);
 
@@ -18,9 +19,16 @@ async function myConv(userId) {
 // Müşteri mesaj gönderir — gövde ayrıca {translated_text, source_lang,
 // target_lang} (istemci çevirisi) ya da {translate_to} (sunucu çevirisi)
 // taşıyabilir; çeviri alanları RETURNING * ile yanıta aynen eklenir.
+// CBOs27.3: gönderim öncesi içerik denetimi — erotik/taciz içerik 422 ile
+// reddedilir, ihlal sayacı işlenir ve hesap ANINDA otomatik engellenir.
 router.post('/send', asyncHandler(async (req, res) => {
   const body = String(req.body.body || '').trim().slice(0, 2000);
   if (!body) return res.status(400).json({ ok: false, error: 'empty' });
+  const mod = moderation.checkTexts([body, req.body.translated_text]);
+  if (mod.blocked) {
+    await moderation.registerViolation(pool, { actorKind: 'user', actorId: req.user.id, ip: req.ip, category: mod.category, surface: 'shop_chat' });
+    return res.status(422).json({ ok: false, error: 'content_blocked', category: mod.category });
+  }
   await translator.ensureSchema();
   const tr = await translator.resolveMessageTranslation(body, req.body);
   const conv = await myConv(req.user.id);
@@ -29,6 +37,37 @@ router.post('/send', asyncHandler(async (req, res) => {
     [conv.id, body, tr.translated_text, tr.source_lang, tr.target_lang]);
   await pool.query(`UPDATE chat_conversations SET last_message_at=now() WHERE id=$1`, [conv.id]);
   res.json({ ok: true, message: m.rows[0] });
+}));
+
+// CBOs27.3 — POST /api/chat/report
+// a) Şikayet: { message_id?, reason } -> security_events 'chat_report'.
+//    message_id kullanıcının kendi konuşmasındaysa doğrulanır; değilse de
+//    kayıt düşülür (varlık bilgisi sızdırılmaz).
+// b) İstemci ihlal bildirimi: { type: 'violation' } -> yalnizca gönderenin
+//    KENDİ hesabına işlenir (jeton sahibi; gövdedeki kullanıcı alanı yok
+//    sayılır — başkasını engellemek için KULLANILAMAZ). Son 24 saatte 3
+//    istemci bildirimi otomatik engel doğurur.
+router.post('/report', asyncHandler(async (req, res) => {
+  const b = req.body || {};
+  if (b.type === 'violation') {
+    const r = await moderation.registerClientViolation(pool, { userId: req.user.id, ip: req.ip });
+    return res.json({ ok: true, blocked: r.blockedNow });
+  }
+  const messageId = b.message_id != null && String(b.message_id).trim() !== '' ? String(b.message_id).trim().slice(0, 64) : null;
+  const reason = typeof b.reason === 'string' ? b.reason.trim().slice(0, 500) : '';
+  let verified = false;
+  if (messageId && /^\d+$/.test(messageId)) {
+    const chk = await pool.query(
+      `SELECT m.id FROM chat_messages m JOIN chat_conversations c ON c.id = m.conversation_id WHERE m.id = $1 AND c.user_id = $2 LIMIT 1`,
+      [parseInt(messageId, 10), req.user.id]
+    );
+    verified = chk.rows.length > 0;
+  }
+  await moderation.logSecurityEvent(pool, {
+    type: 'chat_report', userId: req.user.id, ip: req.ip,
+    detail: { message_id: messageId, reason: reason || null, verified },
+  });
+  res.json({ ok: true });
 }));
 
 // Müşterinin mesajları (?conversation_id ile geçmiş sohbet de okunabilir)

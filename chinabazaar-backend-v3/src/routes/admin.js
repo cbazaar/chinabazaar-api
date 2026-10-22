@@ -15,6 +15,9 @@ const rateLimit = require('express-rate-limit');
 const { ipKeyGenerator } = require('express-rate-limit');
 const appCfg = require('../config');
 const { isMasterJtiRevoked, revokeMasterJti } = require('../middleware/masterRevoke'); // 2026-10-20 N1
+const { checkTokenVersion } = require('../middleware/auth'); // CBOs27.2: jeton sürümü (tv)
+const { MASTER_GUARD_KEY, bumpGuardTokenVersion } = require('../middleware/loginGuard'); // CBOs27.2
+const { ensureSecurityEventsTable } = require('../middleware/securityGuard'); // CBOs27.2
 
 // fix10e H-C: Stream uçları için rota hız limiti (IP + aktör bazlı; v8'de
 // req.ip doğrudan kullanılmaz — ipKeyGenerator zorunlu, M2).
@@ -43,6 +46,7 @@ async function ensureStreamUploadsTable() {
 }
 const pool = require('../db');
 const translator = require('../services/translator'); // canlı çeviri (CBAi cevapları)
+const moderation = require('../utils/moderation'); // CBOs27.3: engel yönetimi + güvenlik olayları + mesaj silme
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -69,6 +73,10 @@ async function requireAdminOrFactory(req, res, next) {
     if (payload.jti && (await isMasterJtiRevoked(payload.jti))) {
       return res.status(401).json({ error: 'token_revoked' });
     }
+    // CBOs27.2: sürümü geçmiş master jeton reddedilir (revoke-all sonrası).
+    if (!(await checkTokenVersion(payload))) {
+      return res.status(401).json({ error: 'token_revoked' });
+    }
     req.isMaster = true;
     req.isAdmin = true;
     req.user = { id: null, email: null, is_admin: true, role: 'master' };
@@ -78,7 +86,11 @@ async function requireAdminOrFactory(req, res, next) {
     if (req.method === 'POST' && (req.path === '/stream-upload-url' || req.path === '/stream-download-url')) { req.factoryId = payload.factory_id; return next(); }
     return res.status(403).json({ error: 'forbidden' });
   }
-  if (payload && payload.sub) { req.user = { id: payload.sub, email: payload.email, role: payload.role || 'user' }; return requireAdmin(req, res, next); }
+  if (payload && payload.sub) {
+    // CBOs27.2: sürümü geçmiş kullanıcı jetonu reddedilir.
+    if (!(await checkTokenVersion(payload))) return res.status(401).json({ error: 'token_revoked' });
+    req.user = { id: payload.sub, email: payload.email, role: payload.role || 'user' }; return requireAdmin(req, res, next);
+  }
   return res.status(401).json({ error: 'unauthorized' });
 }
 router.use(requireAdminOrFactory);
@@ -95,6 +107,33 @@ router.post('/master/revoke', asyncHandler(async (req, res) => {
   await revokeMasterJti(jti);
   try { await logMasterAudit('master_revoke', 'master', jti); } catch (_) { /* denetim kaydı akışı bozmaz */ }
   res.json({ ok: true });
+}));
+
+// POST /api/admin/master/revoke-all — CBOs27.2: master jeton sürümünü artırır;
+// mevcut TÜM master jetonları (jti'sine bakılmaksızın) geçersiz olur.
+// Yalnız admin/master (router geneli requireAdminOrFactory arkasında).
+router.post('/master/revoke-all', asyncHandler(async (req, res) => {
+  const tv = await bumpGuardTokenVersion(MASTER_GUARD_KEY);
+  try { await logMasterAudit('master_revoke_all', 'master', String(tv)); } catch (_) { /* denetim kaydı akışı bozmaz */ }
+  res.json({ ok: true, token_version: tv });
+}));
+
+// GET /api/admin/security-events?limit=100&type=... — CBOs27.4 BİRLEŞİK:
+// CBOs27.2 olayları (scanner_probe, account_locked, login_new_ip) +
+// CBOs27.3 olayları (content_blocked, auto_block, client_violation,
+// chat_report, unblock) TEK uçtan; tablo tanımı üst küme (path + detail).
+// limit 1..500 aralığına kısılır; ?type= süzgeci desteklenir; en yeniden eskiye.
+router.get('/security-events', asyncHandler(async (req, res) => {
+  await ensureSecurityEventsTable(); // CBOs27.2 (securityGuard)
+  await moderation.ensureSecurityEvents(pool); // CBOs27.3 — aynı birleşik tanım (IF NOT EXISTS)
+  const parsed = parseInt(req.query.limit, 10);
+  const limit = Number.isFinite(parsed) ? Math.min(500, Math.max(1, parsed)) : 100;
+  const type = typeof req.query.type === 'string' && req.query.type.trim() ? req.query.type.trim().slice(0, 64) : null;
+  const cols = 'id, type, user_id, ip, path, detail, created_at';
+  const { rows } = type
+    ? await pool.query(`SELECT ${cols} FROM security_events WHERE type = $1 ORDER BY id DESC LIMIT $2`, [type, limit])
+    : await pool.query(`SELECT ${cols} FROM security_events ORDER BY id DESC LIMIT $1`, [limit]);
+  res.json({ ok: true, items: rows });
 }));
 
 // GET /api/admin/users — kayıtlı profiller (?source=myfactory|shop filtresi)
@@ -416,6 +455,66 @@ router.patch('/chat/:id', asyncHandler(async (req, res) => {
   const st = req.body.status === 'closed' ? 'closed' : 'open';
   await pool.query(`UPDATE chat_conversations SET status=$2 WHERE id=$1`, [req.params.id, st]);
   res.json({ ok: true, status: st });
+}));
+
+/* ================= CBOs27.3: mesaj silme + engel yönetimi ================= */
+// DELETE /api/admin/chat/messages/:id — admin mağaza sohbeti mesajı siler.
+// HARD DELETE YOK: gövde '[silindi]' olur, çeviri temizlenir, deleted_at
+// işaretlenir; satır ve cevap şeması korunur.
+router.delete('/chat/messages/:id', asyncHandler(async (req, res) => {
+  const mid = parseInt(req.params.id, 10);
+  if (!Number.isInteger(mid) || mid < 1) return res.status(400).json({ ok: false, error: 'invalid_id' });
+  await pool.query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ`);
+  const r = await pool.query(
+    `UPDATE chat_messages SET body='[silindi]', translated_text=NULL, deleted_at=now() WHERE id=$1 RETURNING id, conversation_id, body, deleted_at`,
+    [mid]);
+  if (!r.rows.length) return res.status(404).json({ ok: false, error: 'not_found' });
+  res.json({ ok: true, message: r.rows[0] });
+}));
+
+// GET /api/admin/blocked-users — engelli hesaplar (kullanıcı + fabrika tek
+// liste; reason, violation_count, blocked_at ile). Eski is_blocked
+// kayıtları da (reason/sayaç boş olabilir) listeye girer.
+router.get('/blocked-users', asyncHandler(async (req, res) => {
+  await moderation.ensureBlockSchema(pool);
+  const u = await pool.query(
+    `SELECT id::text AS id, email, name, blocked_reason AS reason, COALESCE(violation_count, 0) AS violation_count, blocked_at
+     FROM users WHERE COALESCE(blocked, FALSE) OR COALESCE(is_blocked, FALSE)
+     ORDER BY blocked_at DESC NULLS LAST LIMIT 500`);
+  const f = await pool.query(
+    `SELECT id::text AS id, email, name, blocked_reason AS reason, COALESCE(violation_count, 0) AS violation_count, blocked_at
+     FROM factories WHERE COALESCE(blocked, FALSE)
+     ORDER BY blocked_at DESC NULLS LAST LIMIT 500`);
+  const items = [
+    ...u.rows.map((r) => ({ kind: 'user', ...r })),
+    ...f.rows.map((r) => ({ kind: 'factory', ...r })),
+  ].sort((a, b) => new Date(b.blocked_at || 0) - new Date(a.blocked_at || 0));
+  res.json({ ok: true, items });
+}));
+
+// POST /api/admin/users/:id/unblock — engeli kaldırır: blocked + is_blocked
+// iner, sayaç sıfırlanır, sebep/zaman temizlenir + 'unblock' olayı yazılır.
+router.post('/users/:id/unblock', asyncHandler(async (req, res) => {
+  await moderation.ensureBlockSchema(pool);
+  const r = await pool.query(
+    `UPDATE users SET blocked=FALSE, is_blocked=FALSE, blocked_reason=NULL, blocked_at=NULL, violation_count=0 WHERE id=$1 RETURNING id`,
+    [req.params.id]);
+  if (!r.rows.length) return res.status(404).json({ ok: false, error: 'not_found' });
+  await moderation.logSecurityEvent(pool, { type: 'unblock', userId: req.params.id, ip: req.ip, detail: { target_kind: 'user', actor: req.user ? String(req.user.id) : 'admin' } });
+  res.json({ ok: true });
+}));
+
+// POST /api/admin/factories/:id/unblock — fabrika karşılığı.
+router.post('/factories/:id/unblock', asyncHandler(async (req, res) => {
+  await moderation.ensureBlockSchema(pool);
+  const fid = parseInt(req.params.id, 10);
+  if (!Number.isInteger(fid) || fid < 1) return res.status(400).json({ ok: false, error: 'invalid_id' });
+  const r = await pool.query(
+    `UPDATE factories SET blocked=FALSE, blocked_reason=NULL, blocked_at=NULL, violation_count=0 WHERE id=$1 RETURNING id`,
+    [fid]);
+  if (!r.rows.length) return res.status(404).json({ ok: false, error: 'not_found' });
+  await moderation.logSecurityEvent(pool, { type: 'unblock', userId: 'factory:' + fid, ip: req.ip, detail: { target_kind: 'factory', actor: req.user ? String(req.user.id) : 'admin' } });
+  res.json({ ok: true });
 }));
 
 // Konuşmadaki müşterinin profil bilgileri + otomatik müşteri kodu
