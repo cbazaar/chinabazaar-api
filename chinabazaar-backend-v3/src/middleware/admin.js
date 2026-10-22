@@ -16,6 +16,7 @@ const jwt = require('jsonwebtoken');
 const cfg = require('../config');
 const pool = require('../db');
 const { isMasterJtiRevoked } = require('./masterRevoke'); // 2026-10-20 N1: master iptal kontrolü
+const { checkTokenVersion } = require('./auth'); // CBOs27.2: master jeton sürümü (tv) kontrolü
 
 function isMasterClaim(claim) {
   return !!claim && claim.role === 'master' && claim.is_admin === true;
@@ -33,6 +34,10 @@ const requireAdmin = asyncHandler(async (req, res, next) => {
       if (isMasterClaim(payload)) {
         // 2026-10-20 N1: iptal edilmiş master jeton reddedilir (sızıntı durumunda).
         if (payload.jti && (await isMasterJtiRevoked(payload.jti))) {
+          return res.status(401).json({ error: 'token_revoked' });
+        }
+        // CBOs27.2: sürümü geçmiş master jeton reddedilir (revoke-all sonrası).
+        if (!(await checkTokenVersion(payload))) {
           return res.status(401).json({ error: 'token_revoked' });
         }
         return next();
