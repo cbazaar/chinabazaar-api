@@ -733,11 +733,13 @@ async function ensureFactoryTables() {
   // Eski (odemeli) satirlarda yalniz ends_at dolu olabilir — /me ikisini COALESCE ile okur,
   // grant her iki sutunu da ayni degere yazar; boylece ends_at okuyan mevcut kod bozulmaz.
   await pool.query(`ALTER TABLE factory_subscriptions ADD COLUMN IF NOT EXISTS plan TEXT`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS lens_logs (id SERIAL PRIMARY KEY, labels JSONB, categories JSONB, match_count INTEGER DEFAULT 0, lang TEXT, created_at TIMESTAMPTZ DEFAULT now())`); // CBOs27.6: CBLens tarama kayitlari
   await pool.query(`ALTER TABLE factory_subscriptions ADD COLUMN IF NOT EXISTS provider TEXT`);
   await pool.query(`ALTER TABLE factory_subscriptions ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ`);
   await pool.query(`CREATE TABLE IF NOT EXISTS factories (id SERIAL PRIMARY KEY, name TEXT NOT NULL, city TEXT DEFAULT '', category TEXT DEFAULT '', description TEXT DEFAULT '', moq INT DEFAULT 0, stock INT DEFAULT 0, capacity TEXT DEFAULT '', certs TEXT DEFAULT '', features TEXT DEFAULT '', import_countries TEXT DEFAULT '', employees TEXT DEFAULT '', annual_revenue TEXT DEFAULT '', factory_area TEXT DEFAULT '', years TEXT DEFAULT '', main_products TEXT DEFAULT '', cover_image TEXT DEFAULT '', videos JSONB DEFAULT '[]', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now())`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS token_version INT DEFAULT 0`); // CBOs27.2: fabrika jeton iptali (tv)
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS hashtags TEXT DEFAULT ''`);
+  await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS contact_title TEXT DEFAULT ''`); // CBOs27.6: yetkili gorevi
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS address TEXT DEFAULT ''`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS phone TEXT DEFAULT ''`);
   await pool.query(`ALTER TABLE factories ADD COLUMN IF NOT EXISTS contact TEXT DEFAULT ''`);
@@ -936,6 +938,16 @@ const factoryPresenceLimiter = rateLimit({
   keyGenerator: (req) => 'factory-presence:' + ipKeyGenerator(req.ip),
 });
 
+// CBOs27.6: CBLens tarama kaydi limiteri
+const factoryLensLogLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'too_many_requests' },
+  keyGenerator: (req) => 'factory-lens-log:' + ipKeyGenerator(req.ip),
+});
+
 // SHOP SECURITY: gizli jeton karsilastirmasi icin zamanlama-saldirisina dayanikli esitlik.
 // fix10e L1: uzunluk erken dönüşü YOK — iki değer de SHA-256 ile sabit
 // uzunluklu özetlere indirgenir, timingSafeEqual özetler üzerinde çalışır.
@@ -1092,6 +1104,7 @@ function toFactoryPublic(r, opts) {
     address: r.address || '',
     phone: r.phone || '',
     contact: r.contact || '',
+    contact_title: r.contact_title || '',
     email: r.email || null,
     wechat: r.wechat || '',
     whatsapp: r.whatsapp || '',
@@ -1099,6 +1112,7 @@ function toFactoryPublic(r, opts) {
     address: '',
     phone: '',
     contact: '',
+    contact_title: '',
     email: null,
     wechat: '',
     whatsapp: '',
@@ -1727,6 +1741,42 @@ router.post('/factory/presence', factoryPresenceLimiter, asyncHandler(async (req
   res.json({ ok: true });
 }));
 
+// CBOs27.6: POST /api/products/factory/lens-log — CBLens tarama kaydi (herkese acik, kimlik yok).
+// Foto sunucuya gelmez; yalniz etiket/kategori istatistigi. On yuz hatayi yutar.
+router.post('/factory/lens-log', factoryLensLogLimiter, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const cleanList = (v) => {
+    if (!Array.isArray(v)) return null;
+    const out = [];
+    for (const x of v.slice(0, 10)) {
+      const s = String(x == null ? '' : x).trim().slice(0, 120);
+      if (s) out.push(s);
+    }
+    return out;
+  };
+  const labels = cleanList(req.body && req.body.labels);
+  const categories = cleanList(req.body && req.body.categories);
+  if (labels === null || categories === null) return res.status(400).json({ error: 'invalid_payload' });
+  let matchCount = Number(req.body && req.body.match_count);
+  if (!Number.isFinite(matchCount) || matchCount < 0) matchCount = 0;
+  matchCount = Math.min(Math.floor(matchCount), 100000);
+  const lang = String((req.body && req.body.lang) || '').trim().slice(0, 8) || null;
+  await pool.query(
+    `INSERT INTO lens_logs (labels, categories, match_count, lang) VALUES ($1::jsonb, $2::jsonb, $3, $4)`,
+    [JSON.stringify(labels), JSON.stringify(categories), matchCount, lang]
+  );
+  res.json({ ok: true });
+}));
+
+// CBOs27.6: GET /api/products/admin/lens-logs — super admin: son 200 CBLens tarama kaydi.
+router.get('/admin/lens-logs', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  await ensureFactoryTables();
+  const { rows } = await pool.query(
+    `SELECT id, labels, categories, match_count, lang, created_at FROM lens_logs ORDER BY id DESC LIMIT 200`
+  );
+  res.json({ logs: rows });
+}));
+
 // GET /api/products/factory/comments?video=F-V — en yeni 50 yorum (herkese acik)
 router.get('/factory/comments', asyncHandler(async (req, res) => {
   await ensureFactoryTables();
@@ -2310,6 +2360,7 @@ router.put('/factory/myfactory/profile', requireFactoryOrMasterAuth, asyncHandle
   if (body.address !== undefined) { const c = cleanFactoryText(body.address, 500); if (c === null) return bad('invalid_address', 'Adres geçerli değil.'); push('address', c); }
   if (body.phone !== undefined) { const c = cleanFactoryText(body.phone, 200); if (c === null) return bad('invalid_phone', 'Telefon geçerli değil.'); if (c !== '' && await factoryContactTaken('phone', c, targetFactoryId)) return res.status(409).json({ error: 'contact_in_use', message: 'Bu telefon başka bir fabrikada kullanılıyor.' }); push('phone', c); } // fix10e M6
   if (body.contact !== undefined) { const c = cleanFactoryText(body.contact, 200); if (c === null) return bad('invalid_contact', 'İlgili kişi geçerli değil.'); push('contact', c); }
+  if (body.contact_title !== undefined) { const c = cleanFactoryText(body.contact_title, 200); if (c === null) return bad('invalid_contact_title', 'Yetkili görevi geçerli değil.'); push('contact_title', c); }
   if (body.wechat !== undefined) { const c = cleanFactoryText(body.wechat, 200); if (c === null) return bad('invalid_wechat', 'WeChat geçerli değil.'); push('wechat', c); }
   if (body.whatsapp !== undefined) { const c = cleanFactoryText(body.whatsapp, 200); if (c === null) return bad('invalid_whatsapp', 'WhatsApp geçerli değil.'); push('whatsapp', c); }
   if (body.email !== undefined) { const c = cleanFactoryEmail(body.email); if (c === null) return bad('invalid_email', 'E-posta adresi geçerli değil.'); if (c !== '' && await factoryContactTaken('email', c, targetFactoryId)) return res.status(409).json({ error: 'contact_in_use', message: 'Bu e-posta başka bir fabrikada kullanılıyor.' }); push('email', c === '' ? null : c); } // fix10e M6
@@ -3253,6 +3304,7 @@ const factoryValidators = [
   body('address').optional().trim().isLength({ max: 500 }),
   body('phone').optional().trim().isLength({ max: 200 }),
   body('contact').optional().trim().isLength({ max: 200 }),
+  body('contact_title').optional().trim().isLength({ max: 200 }),
   body('wechat').optional().trim().isLength({ max: 200 }),
   body('whatsapp').optional().trim().isLength({ max: 200 }),
   body('tags').optional().custom((v) => {
@@ -3307,6 +3359,8 @@ router.post('/factory/admin', requireAuth, requireAdmin,
     if (phoneClean === null) return res.status(400).json({ error: 'invalid_phone' });
     const contactClean = cleanFactoryText(req.body.contact, 200);
     if (contactClean === null) return res.status(400).json({ error: 'invalid_contact' });
+    const contactTitleClean = cleanFactoryText(req.body.contact_title, 200);
+    if (contactTitleClean === null) return res.status(400).json({ error: 'invalid_contact_title' });
     const wechatClean = cleanFactoryText(req.body.wechat, 200);
     if (wechatClean === null) return res.status(400).json({ error: 'invalid_wechat' });
     const whatsappClean = cleanFactoryText(req.body.whatsapp, 200);
@@ -3378,6 +3432,7 @@ router.post('/factory/admin', requireAuth, requireAdmin,
         if (req.body.address !== undefined) mergePush('address', addressClean);
         if (req.body.phone !== undefined) mergePush('phone', phoneClean);
         if (req.body.contact !== undefined) mergePush('contact', contactClean);
+        if (req.body.contact_title !== undefined) mergePush('contact_title', contactTitleClean);
         if (req.body.wechat !== undefined) mergePush('wechat', wechatClean);
         if (req.body.whatsapp !== undefined) mergePush('whatsapp', whatsappClean);
         if (req.body.email !== undefined) mergePush('email', emailClean === '' ? null : emailClean);
@@ -3465,13 +3520,14 @@ router.post('/factory/admin', requireAuth, requireAdmin,
         verifiedCreate,
       ]
     );
-    if (addressClean !== undefined || phoneClean !== undefined || contactClean !== undefined || wechatClean !== undefined || whatsappClean !== undefined || emailClean !== undefined || websiteClean !== undefined || socialsClean !== undefined || tagsClean !== undefined || importCountriesClean !== undefined || employeesClean !== undefined || annualRevenueClean !== undefined || coverImageClean !== undefined || factoryAreaClean !== undefined || yearsClean !== undefined || mainProductsClean !== undefined || myFactoryUsernameClean || myFactoryPasswordHash || createSubdomain) {
+    if (addressClean !== undefined || phoneClean !== undefined || contactClean !== undefined || contactTitleClean !== undefined || wechatClean !== undefined || whatsappClean !== undefined || emailClean !== undefined || websiteClean !== undefined || socialsClean !== undefined || tagsClean !== undefined || importCountriesClean !== undefined || employeesClean !== undefined || annualRevenueClean !== undefined || coverImageClean !== undefined || factoryAreaClean !== undefined || yearsClean !== undefined || mainProductsClean !== undefined || myFactoryUsernameClean || myFactoryPasswordHash || createSubdomain) {
       const updSets = [];
       const updParams = [rows[0].id];
       const updPush = (col, val, cast) => { updParams.push(val); updSets.push(`${col} = $${updParams.length}${cast || ''}`); };
       if (addressClean !== undefined) updPush('address', addressClean);
       if (phoneClean !== undefined) updPush('phone', phoneClean);
       if (contactClean !== undefined) updPush('contact', contactClean);
+      if (contactTitleClean !== undefined) updPush('contact_title', contactTitleClean);
       if (wechatClean !== undefined) updPush('wechat', wechatClean);
       if (whatsappClean !== undefined) updPush('whatsapp', whatsappClean);
       if (emailClean !== undefined) updPush('email', emailClean === '' ? null : emailClean);
@@ -3654,6 +3710,11 @@ router.put('/factory/admin/:id', requireAuth, requireAdmin,
       const c = cleanFactoryText(req.body.contact, 200);
       if (c === null) return res.status(400).json({ error: 'invalid_contact' });
       push('contact', c);
+    }
+    if (req.body.contact_title !== undefined) {
+      const c = cleanFactoryText(req.body.contact_title, 200);
+      if (c === null) return res.status(400).json({ error: 'invalid_contact_title' });
+      push('contact_title', c);
     }
     if (req.body.wechat !== undefined) {
       const c = cleanFactoryText(req.body.wechat, 200);
