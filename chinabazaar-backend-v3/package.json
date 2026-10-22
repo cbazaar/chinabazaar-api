@@ -10,7 +10,8 @@
     "jsonwebtoken": "^9.0.2",
     "nodemailer": "^10.1.7",
     "pdfkit": "^0.17.1",
-    "pg": "^8.13.1"
+    "pg": "^8.13.1",
+    "web-push": "^3.6.7"
   },
   "description": "ChinaBazaar Türkiye — dikey video e-ticaret backend API (Express + PostgreSQL + PayTR).",
   "engines": {
