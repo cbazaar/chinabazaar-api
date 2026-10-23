@@ -2144,11 +2144,50 @@ function cbaiMasterPasswordOk(password) {
   const b = crypto.createHash('sha256').update(expected).digest();
   return crypto.timingSafeEqual(a, b);
 }
+// CBOs32 (CBOs30 paritesi): auth.js'deki güncel mantıkla BİREBİR — master
+// kimliğinin users tablosundaki karşılık satırı. Etkileşim uçları (beğeni/
+// favori/ürün yorumu) users(id) FK'si + UUID sorgusu ister; sub='cbai' UUID
+// olmadığı için o uçlar master oturumunda hata veriyordu. auth.js'deki
+// resolveMasterUserId ile aynı davranış (fail-open dahil): satır
+// çözülemezse jeton eski biçimde (sub 'cbai') basılır, master girişi çalışır.
+const MASTER_USER_EMAIL = 'chinabazaarcom@gmail.com';
+let masterUserIdCache = null;
+async function resolveMasterUserId() {
+  if (masterUserIdCache) return masterUserIdCache;
+  try {
+    const { rows } = await pool.query('SELECT id FROM users WHERE email = $1', [MASTER_USER_EMAIL]);
+    if (rows.length) { masterUserIdCache = rows[0].id; return masterUserIdCache; }
+    // Satır yoksa bir kez oluştur (idempotent): şifre rastgele ve
+    // kullanılamaz — bu adrese şifreli giriş zaten master dalında kesilir,
+    // satır yalnız kimlik çapasıdır. is_admin FALSE: yönetici yetkisi
+    // satırdan değil master jetonunun iddiasından gelir.
+    const hash = await bcrypt.hash(crypto.randomBytes(32).toString('hex'), 12);
+    const ins = await pool.query(
+      `INSERT INTO users (email, password_hash, name, phone, nickname, is_admin, source)
+       VALUES ($1, $2, 'ChinaBazaar', NULL, 'cbai', FALSE, 'shop')
+       ON CONFLICT (email) DO NOTHING RETURNING id`,
+      [MASTER_USER_EMAIL, hash]
+    );
+    if (ins.rows.length) { masterUserIdCache = ins.rows[0].id; return masterUserIdCache; }
+    const again = await pool.query('SELECT id FROM users WHERE email = $1', [MASTER_USER_EMAIL]);
+    if (again.rows.length) { masterUserIdCache = again.rows[0].id; return masterUserIdCache; }
+    return null;
+  } catch (e) {
+    // FAIL-OPEN (auth.js ile aynı): DB hatası master girişini kilitlemez.
+    console.error('[products] CBOs32 master kullanici satiri cozulemedi (fail-open):', e && e.message ? e.message : e);
+    return null;
+  }
+}
 // fix10e H-E: sub='cbai' + jti, süre 7 gün -> 1 gün, HS256 açık.
 // CBOs27.2: tv taşır (login_guard 'master:cbai' sürümü; auth.js ile aynı).
+// CBOs32: sub artık master kullanıcı satırının UUID'si (actor='cbai') —
+// auth.js signMasterToken ile birebir aynı mantık.
 async function signMasterToken() {
   const tv = (await getGuardTokenVersion(MASTER_GUARD_KEY)) || 0;
-  return jwt.sign({ sub: 'cbai', role: 'master', is_admin: true, jti: crypto.randomUUID(), tv }, cfg.jwtSecret, { expiresIn: '1d', algorithm: 'HS256' });
+  const masterUid = await resolveMasterUserId(); // CBOs32 (CBOs30 paritesi)
+  const payload = { sub: masterUid || 'cbai', role: 'master', is_admin: true, jti: crypto.randomUUID(), tv };
+  if (masterUid) payload.actor = 'cbai'; // CBOs32: 'cbai' işareti (denetim/okunabilirlik)
+  return jwt.sign(payload, cfg.jwtSecret, { expiresIn: '1d', algorithm: 'HS256' });
 }
 // CBF tanımlayıcı normalizasyonu: "CBF-001" / "cbf001" / "cbf-001" → "CBF-001".
 // Eşleşmezse '' (CBF koşulu sorguya eklenmez).
@@ -3551,6 +3590,19 @@ router.post('/factory/admin', requireAuth, requireAdmin,
     await attachFactoryBrands(rows); // fix10x
     if (myFactoryUsernameClean) ensureFactoryDomainAlias(myFactoryUsernameClean); // fix10ag: alt alan adi alias'i (fire-and-forget)
     if (createSubdomain) ensureFactoryDomainAlias(createSubdomain); // fix10ak: etkin alt adres alias'i (fire-and-forget)
+    // CBOs32: yeni fabrika duyurusu (yalnız oluşturmada; düzenlemede yok).
+    // Gövde pushService'de "Yeni Fabrika: <önizleme>" kurulur; üretim alanı
+    // category, yoksa main_products'tan alınır. Bildirim hatası fabrika
+    // eklemeyi ASLA bozmaz (kanca yalıtıldı).
+    try {
+      const fName = String(rows[0].name || '').trim();
+      const fArea = String(rows[0].category || rows[0].main_products || '').trim();
+      const fPreview = fArea
+        ? fName + ' — ' + fArea + ' üreticisi aramıza katıldı — ChinaBazaar.com · Dünyanın Fabrikası'
+        : fName + ' aramıza katıldı — ChinaBazaar.com · Dünyanın Fabrikası';
+      const fp = pushService.notifyApp(pool, 'factory', { channel: 'Yeni Fabrika', preview: fPreview, url: 'https://chinabazaar.com' });
+      if (fp && typeof fp.catch === 'function') fp.catch(() => {});
+    } catch (e) { /* bildirim hatası yoksayılır */ }
     res.status(201).json(toFactoryAdmin(rows[0]));
   })
 );
@@ -5044,6 +5096,16 @@ router.post(
           warranty_months != null ? parseInt(warranty_months, 10) : null,
         ]
       );
+      // CBOs32: yeni ürün duyurusu — yalnız yayındaki üründe (aktif ve
+      // "yakında" değil). Gövde pushService'de "Yeni Ürün: <önizleme>"
+      // kurulur; nihai metin kullanıcının kesin biçimiyle aynıdır.
+      // Bildirim hatası ürün eklemeyi ASLA bozmaz (kanca yalıtıldı).
+      try {
+        if (rows[0].is_active && !rows[0].is_upcoming) {
+          const np = pushService.notifyApp(pool, 'shop', { channel: 'Yeni Ürün', preview: String(rows[0].name || '').trim() + ' eklendi — ChinaBazaar.shop · Çin Artık Cebinizde', url: 'https://chinabazaar.shop' });
+          if (np && typeof np.catch === 'function') np.catch(() => {});
+        }
+      } catch (e) { /* bildirim hatası yoksayılır */ }
       res.status(201).json(toProduct({ ...rows[0], category_slug: null, category_name: null }));
     } catch (err) {
       if (err.code === '23505') return res.status(409).json({ error: 'sku_in_use' });
