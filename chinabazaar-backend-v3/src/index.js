@@ -88,6 +88,7 @@ app.use('/api/chat', require('./routes/chat')); // müşteri canlı destek
 app.use('/api/gate', require('./routes/gate')); // CBOs27.2 (BULGU-5): sunucu taraflı site kilidi — GATE_PASSWORD_HASH yoksa 503/pasif
 app.use('/api/translate', require('./routes/translate')); // canlı çeviri (sohbetler)
 app.use('/api/push', require('./routes/push')); // push cihaz kaydı (kilit ekranı bildirimleri)
+app.use('/api/stats', require('./routes/stats')); // CBOs31: ziyaret kalp atisi (panel trafik istatistikleri)
 app.use('/api/admin/push', require('./routes/push')); // admin cihaz listesi: GET /api/admin/push/devices
 app.use('/api/payment-methods', require('./routes/paymentMethods'));
 app.use('/api/admin/stream', require('./routes/stream')); // Cloudflare Stream video yönetimi (admin)
