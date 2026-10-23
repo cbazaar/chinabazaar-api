@@ -237,6 +237,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cfg = require('../config');
 const { loginLimiter, loginIdentifierLimiter } = require('../middleware/rateLimit');
+const stats = require('./stats'); // CBOs31: izlenme olay kaydi (hafif; hata sayaci bozmaz)
 
 // Fabrika yoksa bile karsilastirma yapilir (zamanlama ile kullanici sayimini zorlastirmak icin).
 const MYFACTORY_DUMMY_HASH = bcrypt.hashSync('__chinabazaar_no_such_myfactory__', 12); // fix10e L1: 10 -> 12
@@ -4226,14 +4227,13 @@ async function requireMasterAuth(req, res, next) {
     // 2026-10-21 F1: iptal edilmis master jeton reddedilir.
     if (payload.jti && (await isMasterJtiRevoked(payload.jti))) {
       return res.status(401).json({ error: 'token_revoked' });
-    }// 2026-10-23: revoke-all (tv) de burada kontrol edilir — diger master
-// dallarindaki desenle ayni (requireFactoryOrMasterAuth, requireUserOrFactoryAuth).
-if (!(await checkTokenVersion(payload))) {
-  return res.status(401).json({ error: 'token_revoked' });
-}
-
+    }
+    // 2026-10-23: revoke-all (tv) de burada kontrol edilir — diger master
+    // dallarindaki desenle ayni (requireFactoryOrMasterAuth, requireUserOrFactoryAuth).
+    if (!(await checkTokenVersion(payload))) {
+      return res.status(401).json({ error: 'token_revoked' });
+    }
     req.isMaster = true; req.user = { id: 'cbai', email: null, role: 'master' }; return next();
-    
   }
   return res.status(403).json({ error: 'forbidden', message: 'Bu işlem için master yetkisi gerekli.' });
 }
@@ -5162,12 +5162,21 @@ router.delete(
 );
 
 // POST /api/products/:id/view — izlenme sayacı (herkese açık, sessiz artar)
+// CBOs31: gunluk seri icin olay satiri da yazilir (view_events) — sayac
+// davranisi birebir ayni, olay yazimi hata verirse yoksayilir (recordViewEvent
+// icinde try/catch). sid/app govdeden OPSIYONEL: mevcut on yuz govde
+// gondermez (sid NULL, app 'shop' yazilir); gonderen istemci icin sid
+// SESSION_RE ile dogrulanir.
 router.post(
   '/:id/view',
   param('id').isUUID(),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
     await pool.query('UPDATE products SET view_count = view_count + 1 WHERE id = $1', [req.params.id]);
+    await stats.recordViewEvent(req.params.id, {
+      sid: req.body && typeof req.body.sid === 'string' ? req.body.sid : null,
+      app: req.body && req.body.app === 'factory' ? 'factory' : 'shop',
+    });
     res.json({ ok: true });
   })
 );
