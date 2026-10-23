@@ -319,62 +319,6 @@ router.get(
   })
 );
 
-// ---- My Factory abonelik geri bildirimi (auth'suz; PayTR sunucusu cagirir, form-encoded) ----
-// Dogrulama: canli /paytr/callback ile ayni paytr.verifyCallback (merchantSalt ile hash).
-// FARK: canli siparis callback'indeki PayTR IP izin listesi burada uygulanmaz —
-// sozlesme yalniz hash dogrulamasi ister (hash gecersizse 400).
-// Idempotent: status 'pending' degilse (active/failed) satir aynen birakilir, ends_at uzatilmez.
-router.post(
-  '/factory-subscription/callback',
-  express.urlencoded({ extended: false }),
-  asyncHandler(async (req, res) => {
-    const { merchant_oid, status, total_amount, hash } = req.body || {};
-    if (!paytr.verifyCallback({ merchant_oid, status, total_amount, hash })) {
-      return res.status(400).send('INVALID_HASH');
-    }
-    const ok = status === 'success';
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      const { rows } = await client.query(
-        'SELECT * FROM factory_subscriptions WHERE paytr_merchant_oid = $1 FOR UPDATE',
-        [merchant_oid]
-      );
-      const sub = rows[0];
-      if (!sub) {
-        await client.query('ROLLBACK');
-        return res.status(404).send('NOT_FOUND');
-      }
-      if (sub.status !== 'pending') {
-        await client.query('ROLLBACK');
-        return res.send('OK'); // tekrar bildirimi — ends_at iki kez uzatilmez
-      }
-      if (!ok) {
-        await client.query(`UPDATE factory_subscriptions SET status='failed', updated_at=now() WHERE id=$1`, [sub.id]);
-        await client.query('COMMIT');
-        return res.send('OK');
-      }
-      // Tutar uyuşmazlığı → güvenlik nedeniyle başarısız say (canli siparis akisiyla ayni)
-      if (String(total_amount) !== String(sub.amount)) {
-        await client.query(`UPDATE factory_subscriptions SET status='failed', updated_at=now() WHERE id=$1`, [sub.id]);
-        await client.query('COMMIT');
-        return res.send('OK');
-      }
-      await client.query(
-        `UPDATE factory_subscriptions SET status='active', started_at=now(), ends_at=now() + interval '30 days', updated_at=now() WHERE id=$1`,
-        [sub.id]
-      );
-      await client.query('COMMIT');
-      return res.send('OK');
-    } catch (err) {
-      await client.query('ROLLBACK');
-      throw err;
-    } finally {
-      client.release();
-    }
-  })
-);
-
 router.use(requireAuth);
 
 function clientIp(req) {
