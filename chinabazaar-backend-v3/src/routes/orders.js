@@ -10,6 +10,7 @@ const { requireAdmin } = require('../middleware/admin');
 const { STAGES, TERMINAL } = require('../orderStages');
 const cfg = require('../config');
 const pool = require('../db');
+const pushService = require('../services/pushService'); // CBOs32: sipariş push bildirimleri
 
 // ---- fix10e: TCKN/VKN checksum + at-rest şifreleme + yanıtlarda maskeleme ----
 const crypto = require('crypto');
@@ -369,6 +370,11 @@ router.post(
       // fix10e (M15): "sipariş alındı" SMS'i yalnızca COMMIT sonrası (başarılı siparişte).
       notifyOrderSms(order.id, 'received').catch(() => {});
 
+      // CBOs32: müşteriye "Siparişiniz alındı" push'u + admine yeni sipariş
+      // push'u (COMMIT sonrası; safePush hatayı yutar, akış bozulmaz).
+      safePush(() => pushService.notifyUser(pool, req.user.id, { channel: 'Sipariş', preview: 'Siparişiniz alındı', url: 'https://chinabazaar.shop' }));
+      safePush(() => pushService.notifyAdmins(pool, { channel: 'Yeni Sipariş', preview: order.order_no + ' — ' + formatTryText(order.total_cents), url: 'https://anasadik.chinabazaar.com' }));
+
       // OTOMATİK FATURA OLUŞTUR
       try {
         const invNo = 'FTR-' + order.order_no;
@@ -480,6 +486,38 @@ router.delete(
   })
 );
 
+// CBOs32: sipariş push bildirimleri — kullanıcının KESİN metinleri (2026-10-24).
+// pushService gövdeyi "<kanal>: <önizleme>" biçiminde kurar; kanal 'Sipariş'
+// + aşağıdaki önizlemeler, telefonda birebir onaylanan metinleri verir:
+//   "Sipariş: Siparişiniz alındı" / "Sipariş: Kargonuz kargoya verildi" /
+//   "Sipariş: Kargonuz yolda" / "Sipariş: Siparişiniz teslim edildi"
+// Bildirim hatası sipariş akışını ASLA bozmaz: pushService içte fırlatmaz,
+// kanca tarafı da safePush ile ayrıca yalıtılır.
+const ORDER_STATUS_PUSH_TEXT = {
+  shipped: 'Kargonuz kargoya verildi',
+  in_transit: 'Kargonuz yolda',
+  delivered: 'Siparişiniz teslim edildi',
+};
+function safePush(call) {
+  try {
+    const p = call();
+    if (p && typeof p.catch === 'function') p.catch(() => {});
+  } catch (e) { /* bildirim hatası akışı bozmaz */ }
+}
+function formatTryText(cents) {
+  const v = (Number(cents) || 0) / 100;
+  return '₺' + v.toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+// Durum GERÇEKTEN değiştiğinde müşteriye push. Eşleşmeyen yeni durumda
+// (packing/ready/arriving/cancelled/refunded) bildirim YOK; eski durum
+// bilinmiyorsa veya durum aynıysa da yok (çift bildirim engeli).
+function notifyOrderStatusPush(userId, oldStatus, newStatus) {
+  if (!userId || !oldStatus || oldStatus === newStatus) return;
+  const text = ORDER_STATUS_PUSH_TEXT[newStatus];
+  if (!text) return;
+  safePush(() => pushService.notifyUser(pool, userId, { channel: 'Sipariş', preview: text, url: 'https://chinabazaar.shop' }));
+}
+
 // v609: siparis SMS bildirimleri (Netgsm) — asla ana akisi bozmaz, hata yutulur.
 // Turler: received (siparis alindi), shipped (kargoya verildi / yolda), delivered (teslim edildi).
 async function notifyOrderSms(orderId, kind) {
@@ -514,7 +552,7 @@ router.patch(
     if (cargo_company === undefined && tracking_number === undefined) {
       return res.status(400).json({ error: 'nothing_to_update' });
     }
-    const { rows: oldRows } = await pool.query('SELECT status FROM orders WHERE id = $1', [req.params.id]);
+    const { rows: oldRows } = await pool.query('SELECT status, user_id FROM orders WHERE id = $1', [req.params.id]);
     const oldStatus = oldRows[0] ? oldRows[0].status : null;
     const { rows } = await pool.query(
       `UPDATE orders
@@ -530,6 +568,9 @@ router.patch(
     if (!rows.length) return res.status(404).json({ error: 'order_not_found' });
     // v609: takip no eklenince durum shipped olduysa SMS
     if ((oldStatus === 'packing' || oldStatus === 'ready') && rows[0].status === 'shipped') notifyOrderSms(rows[0].id, 'shipped').catch(() => {});
+    // CBOs32: aynı geçişte müşteriye push ("Sipariş: Kargonuz kargoya verildi");
+    // durum değişmediyse yardımcı sessiz kalır.
+    notifyOrderStatusPush(oldRows[0] ? oldRows[0].user_id : null, oldStatus, rows[0].status);
     res.json(rows[0]);
   })
 );
@@ -547,7 +588,7 @@ router.patch(
     .withMessage('invalid_status'),
   asyncHandler(async (req, res) => {
     if (!checkValidation(req, res)) return;
-    const { rows: oldRows } = await pool.query('SELECT status FROM orders WHERE id = $1', [req.params.id]);
+    const { rows: oldRows } = await pool.query('SELECT status, user_id FROM orders WHERE id = $1', [req.params.id]);
     const oldStatus = oldRows[0] ? oldRows[0].status : null;
     const { rows } = await pool.query(
       `UPDATE orders SET status = $2, updated_at = now() WHERE id = $1
@@ -561,6 +602,9 @@ router.patch(
       if (rows[0].status === 'shipped') notifyOrderSms(rows[0].id, 'shipped').catch(() => {});
       else if (rows[0].status === 'delivered') notifyOrderSms(rows[0].id, 'delivered').catch(() => {});
     }
+    // CBOs32: durum değiştiyse müşteriye push (shipped / in_transit /
+    // delivered metinleri; diğer durumlarda yardımcı sessiz kalır).
+    notifyOrderStatusPush(oldRows[0] ? oldRows[0].user_id : null, oldStatus, rows[0].status);
     res.json(rows[0]);
   })
 );
