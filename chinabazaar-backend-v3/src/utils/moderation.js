@@ -1,6 +1,13 @@
 // CBOs27.3 — Sohbet içerik denetimi + güvenlik olayları + otomatik engel.
 //
 // 1) checkText(text): TR/EN/ZH/RU/AR erotik-cinsel ve taciz içerik denetimi.
+//    CBOs34: 'politics' kategorisi eklendi (TR + EN temel listeler: parti
+//    adları + siyasi ittifak/sloganlar). Ayni modul sohbet (chat.js,
+//    products.js mesaj uclari) VE yorum uclarinda (urun + fabrika yorumlari)
+//    kullanilir — tek liste, iki taraf tutarli. Genel kelimeler ('secim',
+//    'tip', 'dem' tek basina) LISTEDE YOK: ticaret dilini bloklamamak icin
+//    yalniz cok kelimeli / ayirt edici terimler + kisa parti kisaltmalari
+//    (kelime siniri eslemesiyle) kullanilir.
 //    Normalizasyon: küçük harf (Türkçe duyarlı), aksan katlama, Arapça
 //    hareke/uzatma temizliği, basit leetspeak katlama; kısa terimlerde
 //    kelime sınırı, uzun terimlerde alt-dize, Çince'de alt-dize eşleşmesi.
@@ -79,7 +86,27 @@ const HARASSMENT = {
   ],
 };
 
-const LISTS = { sexual: SEXUAL, harassment: HARASSMENT };
+// CBOs34 — siyaset: parti adlari + ittifak/sloganlar (TR + EN temel liste).
+// Kisa kisaltmalar (akp/chp/mhp/hdp: squash <= 4) mevcut kural geregi yalniz
+// KELIME SINIRINDA eslesir; cok kelimeli terimler alt-dize ile eslesir ama
+// ayirt edici olduklari icin masum ticaret metnine denk gelmez.
+const POLITICS = {
+  tr: [
+    'ak parti', 'akp', 'chp', 'mhp', 'iyi parti', 'hdp', 'dem parti',
+    'hüdapar', 'saadet partisi', 'gelecek partisi', 'deva partisi',
+    'yeniden refah', 'zafer partisi', 'memleket partisi',
+    'türkiye işçi partisi', 'büyük birlik partisi', 'vatan partisi',
+    'demokrat parti', 'cumhur ittifakı', 'millet ittifakı',
+    'her şey çok güzel olacak', 'tek adam rejimi',
+  ],
+  en: [
+    'republican party', 'democratic party', 'labour party',
+    'conservative party', 'trump', 'biden', 'kamala harris',
+    'make america great again', 'maga',
+  ],
+};
+
+const LISTS = { sexual: SEXUAL, harassment: HARASSMENT, politics: POLITICS };
 
 /* ============================ normalizasyon ============================ */
 
@@ -135,6 +162,7 @@ function compileList(byLang) {
 const COMPILED = {
   sexual: compileList(SEXUAL),
   harassment: compileList(HARASSMENT),
+  politics: compileList(POLITICS),
 };
 
 function termMatches(entry, normText, squashedText) {
@@ -148,13 +176,13 @@ function termMatches(entry, normText, squashedText) {
   return normText.includes(entry.n) || squashedText.includes(entry.s);
 }
 
-// checkText(text) -> { blocked: boolean, category: 'sexual'|'harassment'|null }
+// checkText(text) -> { blocked: boolean, category: 'sexual'|'harassment'|'politics'|null }
 function checkText(text) {
   const raw = String(text == null ? '' : text);
   if (!raw.trim()) return { blocked: false, category: null };
   const norm = normalizeText(raw);
   const squashed = squashText(raw);
-  for (const category of ['sexual', 'harassment']) {
+  for (const category of ['sexual', 'harassment', 'politics']) {
     for (const entry of COMPILED[category]) {
       if (termMatches(entry, norm, squashed)) return { blocked: true, category };
     }
