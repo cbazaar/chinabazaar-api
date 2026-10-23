@@ -31,6 +31,11 @@
 // CBOs27.3: engelli hesap (users.blocked/is_blocked) — şifre doğrulandıktan
 // sonra 403 { error: 'account_blocked' }. CBOs27.4: /login akış sırası
 // birleştirildi — kilit (429) → şifre (401) → engel (403) → tv'li jeton.
+// CBOs30: master jetonu sub olarak master kullanıcı satırının
+// (chinabazaarcom@gmail.com) gerçek UUID'sini taşır (+ actor:'cbai') —
+// yönetici oturumu da beğeni/favori/yorum yapabilir; satır yoksa ilk
+// master girişinde idempotent oluşturulur, çözümleme fail-open'dır.
+// Bkz. resolveMasterUserId().
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const { body, validationResult } = require('express-validator');
@@ -212,6 +217,8 @@ function phoneCandidates(identifier) {
 // Master şifresi YALNIZCA Railway env'den okunur (CBAI_MASTER_PASSWORD).
 // Şifre ASLA kodda/DB'de/test dosyasında/sohbette olmaz, ASLA loglanmaz.
 // fix10e H-E: jeton sub='cbai' + jti taşır, süre 7 gün -> 1 gün.
+// CBOs30: sub artık master kullanıcı satırının UUID'si (actor='cbai');
+// satır çözülemezse eski biçim (sub='cbai') yedek kalır.
 function cbaiMasterConfigured() {
   return !!(process.env.CBAI_MASTER_PASSWORD || '');
 }
@@ -220,11 +227,55 @@ function cbaiMasterPasswordOk(password) {
   if (!expected || typeof password !== 'string' || !password) return false;
   return timingSafeEqualDigest(password, expected);
 }
+// CBOs30: master kimliğinin users tablosundaki karşılık satırı.
+// Etkileşim uçları (beğeni/favori/ürün yorumu) product_likes / favorites /
+// comments tablolarında users(id) FK'si + UUID sorgusu ister; sub='cbai'
+// UUID olmadığı için bu uçlar master oturumunda 500 veriyordu (canlı kanıt:
+// "Yorum gönderilemedi", beğenide yönetici engeli). Çözüm: master jetonunun
+// sub'si artık master kullanıcı satırının gerçek UUID'si olur. Master
+// yetkisi sub'dan DEĞİL role:'master' + is_admin iddiasından gelir —
+// kodda sub='cbai' karşılaştırması yapan master kontrolü yoktur
+// (requireAdmin, /me, QR dalları rol tabanlıdır); 'cbai' işareti actor
+// iddiasında korunur. tv/jti iptal mantığı ve 1 günlük ömür aynen.
+const MASTER_USER_EMAIL = 'chinabazaarcom@gmail.com';
+let masterUserIdCache = null;
+async function resolveMasterUserId() {
+  if (masterUserIdCache) return masterUserIdCache;
+  try {
+    const { rows } = await pool.query('SELECT id FROM users WHERE email = $1', [MASTER_USER_EMAIL]);
+    if (rows.length) { masterUserIdCache = rows[0].id; return masterUserIdCache; }
+    // Satır yoksa bir kez oluştur (idempotent): şifre rastgele ve
+    // kullanılamaz — bu adrese şifreli giriş zaten master dalında kesilir,
+    // satır yalnız kimlik çapasıdır. is_admin FALSE: yönetici yetkisi
+    // satırdan değil master jetonunun iddiasından gelir; bu satıra normal
+    // jeton basılırsa (örn. kodla giriş) yetki sızıntısı olmaz.
+    const hash = await bcrypt.hash(crypto.randomBytes(32).toString('hex'), 12);
+    const ins = await pool.query(
+      `INSERT INTO users (email, password_hash, name, phone, nickname, is_admin, source)
+       VALUES ($1, $2, 'ChinaBazaar', NULL, 'cbai', FALSE, 'shop')
+       ON CONFLICT (email) DO NOTHING RETURNING id`,
+      [MASTER_USER_EMAIL, hash]
+    );
+    if (ins.rows.length) { masterUserIdCache = ins.rows[0].id; return masterUserIdCache; }
+    const again = await pool.query('SELECT id FROM users WHERE email = $1', [MASTER_USER_EMAIL]);
+    if (again.rows.length) { masterUserIdCache = again.rows[0].id; return masterUserIdCache; }
+    return null;
+  } catch (e) {
+    // FAIL-OPEN (kod tabanı deseni): DB hatası master girişini kilitlemez;
+    // null dönülürse jeton eski biçimde (sub 'cbai') basılır — yönetici
+    // girişi çalışır, etkileşim uçları o oturumda hata vermeye devam eder.
+    console.error('[auth] CBOs30 master kullanici satiri cozulemedi (fail-open):', e && e.message ? e.message : e);
+    return null;
+  }
+}
 // CBOs27.2: master jetonu tv taşır (login_guard 'master:cbai' sürümü).
 // POST /api/admin/master/revoke-all sürümü artırır → tüm master jetonları ölür.
 async function signMasterToken() {
   const tv = (await getGuardTokenVersion(MASTER_GUARD_KEY)) || 0;
-  return jwt.sign({ sub: 'cbai', role: 'master', is_admin: true, jti: crypto.randomUUID(), tv }, cfg.jwtSecret, { expiresIn: '1d', algorithm: 'HS256' });
+  const masterUid = await resolveMasterUserId(); // CBOs30
+  const payload = { sub: masterUid || 'cbai', role: 'master', is_admin: true, jti: crypto.randomUUID(), tv };
+  if (masterUid) payload.actor = 'cbai'; // CBOs30: 'cbai' işareti (denetim/okunabilirlik)
+  return jwt.sign(payload, cfg.jwtSecret, { expiresIn: '1d', algorithm: 'HS256' });
 }
 // Admin kullanıcı şekli (panel login + /me): kullanıcı satırı YOK, is_admin:true.
 function masterPublicUser() {
