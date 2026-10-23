@@ -82,49 +82,49 @@ function formatFrom(eff) {
 function codeEmail(code) {
   const subject = `ChinaBazaar doğrulama kodunuz: ${code}`;
   const text =
-    `ChinaBazaar'a hoş geldiniz.\n\n` +
-    `Doğrulama kodunuz: ${code}\n\n` +
-    `Bu kod 10 dakika geçerlidir.\n` +
-    `Kodunuzu kimseyle paylaşmayın. ChinaBazaar ekibi sizden asla kod istemez.\n` +
-    `Bu işlemi siz yapmadıysanız bu e-postayı görmezden gelin.\n\n` +
-    `---\n\n` +
-    `Your ChinaBazaar verification code: ${code}\n\n` +
-    `This code expires in 10 minutes.\n` +
-    `Never share your code with anyone. The ChinaBazaar team will never ask for your code.\n` +
-    `If you did not request this, please ignore this email.\n\n` +
+    `Merhaba,\n\n` +
+    `ChinaBazaar hesabınıza giriş için doğrulama kodunuz: ${code}\n\n` +
+    `Kod 10 dakika geçerlidir.\n\n` +
+    `Kodunuzu kimseyle paylaşmayın. ChinaBazaar ekibi sizden asla kod istemez.\n\n` +
+    `Bu isteği siz yapmadıysanız bu e-postayı görmezden gelebilirsiniz; hesabınız güvendedir.\n\n` +
     `---\n` +
-    `HAi © 2026 ChinaBazaar.com Tüm Hakları Saklıdır`;
+    `HAi © 2026 ChinaBazaar\n` +
+    `www.chinabazaar.shop`;
   const html =
-    `<div style="margin:0;padding:24px 12px;background:#ececf0;font-family:Arial,Helvetica,sans-serif">` +
-    `<table role="presentation" cellpadding="0" cellspacing="0" align="center" style="max-width:520px;width:100%;background:#ffffff;border:1px solid #e3e3ea;border-radius:16px;overflow:hidden">` +
-    `<tr><td style="padding:28px 32px 0;text-align:center">` +
-    `<img src="https://chinabazaar.shop/panda-logo.png" width="72" height="72" alt="ChinaBazaar" style="display:inline-block;border-radius:16px">` +
-    `<div style="font-size:22px;font-weight:800;color:#141419;margin-top:12px;letter-spacing:.2px">China<span style="color:#e32645">Bazaar</span></div>` +
-    `<div style="font-size:12px;color:#8a8a95;margin-top:2px">Çin Artık Cebinizde</div>` +
-    `</td></tr>` +
-    `<tr><td style="padding:20px 32px 0"><div style="border-top:1px solid #eeeef2"></div></td></tr>` +
-    `<tr><td style="padding:20px 32px 0;text-align:center">` +
-    `<div style="font-size:13px;font-weight:700;color:#55555f;text-transform:uppercase;letter-spacing:1.5px">Doğrulama Kodunuz</div>` +
-    `<div style="font-size:11px;color:#9a9aa4;letter-spacing:1.2px;margin-top:2px">YOUR VERIFICATION CODE</div>` +
-    `<div style="margin:18px auto 4px;background:#f7f7fa;border:1.5px solid #e8e8ef;border-radius:12px;padding:18px 8px;max-width:340px">` +
-    `<span style="font-size:38px;font-weight:800;letter-spacing:10px;color:#141419">${code}</span></div>` +
-    `<p style="font-size:13px;color:#6d6d77;margin:14px 0 0">Bu kod <b style="color:#141419">10 dakika</b> geçerlidir.<br>` +
-    `<span style="font-size:12px">This code expires in <b>10 minutes</b>.</span></p>` +
-    `</td></tr>` +
-    `<tr><td style="padding:20px 32px 0">` +
-    `<div style="background:#fff5f6;border:1px solid #ffd9de;border-radius:10px;padding:12px 14px;text-align:center">` +
-    `<span style="font-size:13px;font-weight:700;color:#c21735">Kodunuzu kimseyle paylaşmayın.</span><br>` +
-    `<span style="font-size:12px;color:#8a4a55">ChinaBazaar ekibi sizden asla kod istemez. / Never share your code — our team will never ask for it.</span>` +
-    `</div>` +
-    `<p style="font-size:12px;color:#9a9aa4;text-align:center;margin:14px 0 0">Bu işlemi siz yapmadıysanız bu e-postayı görmezden gelin.<br>If you did not request this, please ignore this email.</p>` +
-    `</td></tr>` +
-    `<tr><td style="padding:22px 32px 26px;text-align:center">` +
-    `<div style="border-top:1px solid #eeeef2;padding-top:16px">` +
-    `<a href="https://chinabazaar.shop" style="font-size:12px;color:#e32645;text-decoration:none;font-weight:700">www.chinabazaar.shop</a>` +
-    `<span style="font-size:12px;color:#c9c9d2"> &nbsp;·&nbsp; </span>` +
-    `<a href="https://chinabazaar.com" style="font-size:12px;color:#e32645;text-decoration:none;font-weight:700">www.chinabazaar.com</a>` +
-    `<div style="font-size:11px;color:#a5a5af;margin-top:10px">HAi © 2026 ChinaBazaar.com Tüm Hakları Saklıdır</div>` +
-    `</div></td></tr></table></div>`;
+    `<!DOCTYPE html>` +
+    `<html lang="tr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>` +
+    `<body style="margin:0;padding:0;background:#F4F4F5;font-family:Arial,Helvetica,sans-serif;">` +
+    `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#F4F4F5;padding:32px 12px;">` +
+    `<tr><td align="center">` +
+    `<table role="presentation" width="560" cellpadding="0" cellspacing="0" style="max-width:560px;width:100%;background:#FFFFFF;border-radius:16px;overflow:hidden;border:1px solid #E7E7EA;">` +
+    `  <tr><td align="center" style="padding:28px 32px 8px 32px;">` +
+    `    <img src="https://chinabazaar.shop/panda-logo.png" width="64" height="64" alt="ChinaBazaar" style="display:block;border-radius:14px;">` +
+    `    <div style="font-size:26px;font-weight:bold;color:#16161A;padding-top:12px;">ChinaBazaar</div>` +
+    `    <div style="font-size:14px;color:#C8102E;font-weight:bold;padding-top:4px;">Çin Artık Cebinizde</div>` +
+    `  </td></tr>` +
+    `  <tr><td style="padding:16px 32px 0 32px;"><div style="height:3px;background:#C8102E;border-radius:2px;"></div></td></tr>` +
+    `  <tr><td style="padding:24px 32px 0 32px;color:#16161A;font-size:16px;line-height:24px;">` +
+    `    Merhaba,<br>ChinaBazaar hesabınıza giriş için doğrulama kodunuz:` +
+    `  </td></tr>` +
+    `  <tr><td align="center" style="padding:20px 32px 0 32px;">` +
+    `    <div style="background:#FDF2F4;border:2px solid #C8102E;border-radius:12px;padding:18px 10px;font-size:40px;font-weight:bold;letter-spacing:12px;color:#16161A;">${code}</div>` +
+    `    <div style="font-size:13px;color:#71717A;padding-top:10px;">Kod 10 dakika geçerlidir.</div>` +
+    `  </td></tr>` +
+    `  <tr><td style="padding:22px 32px 0 32px;">` +
+    `    <div style="background:#FFF7ED;border-left:4px solid #C8102E;border-radius:8px;padding:12px 14px;font-size:14px;line-height:21px;color:#7C2D12;">` +
+    `      <b style="color:#C8102E;">Kodunuzu kimseyle paylaşmayın.</b> ChinaBazaar ekibi sizden asla kod istemez.` +
+    `    </div>` +
+    `  </td></tr>` +
+    `  <tr><td style="padding:18px 32px 28px 32px;font-size:13px;color:#A1A1AA;line-height:19px;">` +
+    `    Bu isteği siz yapmadıysanız bu e-postayı görmezden gelebilirsiniz; hesabınız güvendedir.` +
+    `  </td></tr>` +
+    `  <tr><td align="center" style="background:#16161A;padding:16px 32px;">` +
+    `    <div style="font-size:13px;color:#FFFFFF;">HAi © 2026 ChinaBazaar</div>` +
+    `    <div style="font-size:12px;color:#A1A1AA;padding-top:4px;">www.chinabazaar.shop</div>` +
+    `  </td></tr>` +
+    `</table>` +
+    `</td></tr></table>` +
+    `</body></html>`;
   return { subject, text, html };
 }
 
