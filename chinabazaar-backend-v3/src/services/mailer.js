@@ -100,19 +100,19 @@ function codeEmail(code) {
     `  <tr><td align="center" style="padding:28px 32px 8px 32px;">` +
     `    <img src="https://chinabazaar.shop/panda-logo.png" width="64" height="64" alt="ChinaBazaar" style="display:block;border-radius:14px;">` +
     `    <div style="font-size:26px;font-weight:bold;color:#16161A;padding-top:12px;">ChinaBazaar</div>` +
-    `    <div style="font-size:14px;color:#C8102E;font-weight:bold;padding-top:4px;">Çin Artık Cebinizde</div>` +
+    `    <div style="font-size:14px;color:#D9272E;font-weight:bold;padding-top:4px;">Çin Artık Cebinizde</div>` +
     `  </td></tr>` +
-    `  <tr><td style="padding:16px 32px 0 32px;"><div style="height:3px;background:#C8102E;border-radius:2px;"></div></td></tr>` +
+    `  <tr><td style="padding:16px 32px 0 32px;"><div style="height:3px;background:#D9272E;border-radius:2px;"></div></td></tr>` +
     `  <tr><td style="padding:24px 32px 0 32px;color:#16161A;font-size:16px;line-height:24px;">` +
     `    Merhaba,<br>ChinaBazaar hesabınıza giriş için doğrulama kodunuz:` +
     `  </td></tr>` +
     `  <tr><td align="center" style="padding:20px 32px 0 32px;">` +
-    `    <div style="background:#FDF2F4;border:2px solid #C8102E;border-radius:12px;padding:18px 10px;font-size:40px;font-weight:bold;letter-spacing:12px;color:#16161A;">${code}</div>` +
+    `    <div style="background:#FEF3F3;border:2px solid #D9272E;border-radius:12px;padding:18px 10px;font-size:40px;font-weight:bold;letter-spacing:12px;color:#16161A;">${code}</div>` +
     `    <div style="font-size:13px;color:#71717A;padding-top:10px;">Kod 10 dakika geçerlidir.</div>` +
     `  </td></tr>` +
     `  <tr><td style="padding:22px 32px 0 32px;">` +
-    `    <div style="background:#FFF7ED;border-left:4px solid #C8102E;border-radius:8px;padding:12px 14px;font-size:14px;line-height:21px;color:#7C2D12;">` +
-    `      <b style="color:#C8102E;">Kodunuzu kimseyle paylaşmayın.</b> ChinaBazaar ekibi sizden asla kod istemez.` +
+    `    <div style="background:#FFF7ED;border-left:4px solid #D9272E;border-radius:8px;padding:12px 14px;font-size:14px;line-height:21px;color:#7C2D12;">` +
+    `      <b style="color:#D9272E;">Kodunuzu kimseyle paylaşmayın.</b> ChinaBazaar ekibi sizden asla kod istemez.` +
     `    </div>` +
     `  </td></tr>` +
     `  <tr><td style="padding:18px 32px 28px 32px;font-size:13px;color:#A1A1AA;line-height:19px;">` +
