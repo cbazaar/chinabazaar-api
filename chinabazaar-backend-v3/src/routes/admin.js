@@ -180,6 +180,89 @@ router.patch(
   })
 );
 
+// DELETE /api/admin/users/:id — kullanıcı hesabını kalıcı sil (CBOs35)
+// Lansman öncesi test hesaplarının temizliği için eklendi; panelde karşılığı
+// yok, yalnız API ile çağrılır. Router requireAdminOrFactory arkasındadır
+// (master = tam yetki; normal adminde requireAdmin DB is_admin doğrular).
+// Korumalar:
+//  - Yönetici (is_admin=true) hesaplar silinemez (adminkey vb. korunur) -> 403.
+//  - Jeton sahibi kendi hesabını silemez (PATCH'teki cannot_modify_self deseni) -> 400.
+//  - Siparişi olan hesap silinemez: orders.user_id CASCADE'sizdir (NOT NULL,
+//    aksiyon tanımsız) — önce siparişler silinmelidir -> 409 user_has_orders.
+// Silmede comments / product_likes / favorites / addresses / payment_methods /
+// chat_conversations ON DELETE CASCADE ile birlikte gider; product_shares
+// SET NULL ile anonim kalır (şema kararı, dokunulmaz). returns / stock_moves
+// gibi CASCADE'siz bağlı kayıt çıkarsa FK hatası (23503) 409'a çevrilir.
+router.delete(
+  '/users/:id',
+  param('id').isUUID(),
+  asyncHandler(async (req, res) => {
+    if (!checkValidation(req, res)) return;
+    if (req.user && req.params.id === req.user.id) {
+      return res.status(400).json({ error: 'cannot_delete_self', message: 'Kendi hesabınızı silemezsiniz.' });
+    }
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows: targets } = await client.query(
+        'SELECT id, email, is_admin FROM users WHERE id = $1 FOR UPDATE',
+        [req.params.id]
+      );
+      const target = targets[0];
+      if (!target) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'user_not_found' }); }
+      if (target.is_admin) {
+        await client.query('ROLLBACK');
+        return res.status(403).json({ error: 'cannot_delete_admin', message: 'Yönetici (is_admin) hesapları silinemez.' });
+      }
+      const { rows: ord } = await client.query('SELECT count(*)::int AS n FROM orders WHERE user_id = $1', [target.id]);
+      if (ord[0].n > 0) {
+        await client.query('ROLLBACK');
+        return res.status(409).json({
+          error: 'user_has_orders',
+          message: 'Hesabın siparişleri var; önce siparişleri silin.',
+          order_count: ord[0].n,
+        });
+      }
+      const countFor = async (table) => {
+        const { rows } = await client.query(`SELECT count(*)::int AS n FROM ${table} WHERE user_id = $1`, [target.id]);
+        return rows[0].n;
+      };
+      const removed = {
+        comments: await countFor('comments'),
+        likes: await countFor('product_likes'),
+        favorites: await countFor('favorites'),
+        addresses: await countFor('addresses'),
+        payment_methods: await countFor('payment_methods'),
+        conversations: await countFor('chat_conversations'),
+      };
+      const sharesAnonymized = await countFor('product_shares');
+      const { rows: deleted } = await client.query(
+        'DELETE FROM users WHERE id = $1 RETURNING id, email',
+        [target.id]
+      );
+      await client.query('COMMIT');
+      res.json({
+        deleted: true,
+        id: deleted[0].id,
+        email: deleted[0].email,
+        removed,
+        shares_anonymized: sharesAnonymized,
+      });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      if (err && err.code === '23503') {
+        return res.status(409).json({
+          error: 'user_has_related_records',
+          message: 'Hesaba bağlı başka kayıtlar var (örn. iade / stok hareketi); önce bu kayıtları temizleyin.',
+        });
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
+  })
+);
+
 // GET /api/admin/comments — tüm yorumlar (ürün + kullanıcı bilgisiyle)
 router.get(
   '/comments',
