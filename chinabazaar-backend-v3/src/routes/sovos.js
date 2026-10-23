@@ -188,7 +188,7 @@ router.post('/send-invoice', requireAuth, requireAdmin, async (req, res) => {
     });
   } catch (e) {
     console.error('[sovos] send-invoice hatası:', e.message);
-    return res.status(500).json({ error: 'sovos_error', message: e.message });
+    return res.status(500).json({ error: 'sovos_error', message: 'Fatura gönderilemedi.' });
   }
 });
 
@@ -214,7 +214,7 @@ router.post('/resend-email', requireAuth, requireAdmin, async (req, res) => {
     return res.json({ ok: true, emailed: true, to: order.customer_email });
   } catch (e) {
     console.error('[sovos] resend-email hatası:', e.message);
-    return res.status(500).json({ error: 'sovos_error', message: e.message });
+    return res.status(500).json({ error: 'sovos_error', message: 'Fatura e-postası gönderilemedi.' });
   }
 });
 
