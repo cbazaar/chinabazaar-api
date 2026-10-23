@@ -1038,4 +1038,117 @@ router.get(
   })
 );
 
+// GET /api/admin/traffic — CBOs31: panel trafik kartlari + canli grafik serisi.
+// SAHTE SAYI YOK: her deger gercek tablodan turetilir. Olay tablolari
+// birikmeye basladigi gunden itibaren doludur; gecmis yalnizca totals'ta
+// (sayaç toplamlari) gorunur. Gun sinirlari Europe/Istanbul (/stats deseni).
+// Kaynaklar:
+//   views    : view_events (magaza, CBOs31 sonrasi) + factory_video_view_events (fabrika, CBOs26.4 sonrasi)
+//   likes    : product_likes + factory_likes created_at (toggle-off satiri siler -> "net yeni begeni")
+//   comments : comments + factory_comments created_at
+//   visitors : site_visits first_seen (sid benzersiz; CBOs31 sonrasi, on yuz ping gonderdikce)
+//              Fabrika ziyaretcisi ayri olculmuyor -> by_app.factory.visitors = null (uydurma yok).
+//   online   : site_visits son 5 dk (magaza) + factory_presence son 5 dk (fabrika, CBOs26.72)
+router.get(
+  '/traffic',
+  asyncHandler(async (_req, res) => {
+    const { ensureStatsTables } = require('./stats');
+    await ensureStatsTables();
+    const TZ = 'Europe/Istanbul';
+    const todayLocal = `(now() AT TIME ZONE '${TZ}')::date`;
+    const dayOf = (col) => `((${col} AT TIME ZONE '${TZ}')::date)`;
+    // Guvenli sorgu: kaynak tablo henuz yoksa bos don (fabrika deseni:
+    // "tablo yoksa 0, akis bozulmaz") — tek kaynak eksigi ucu dusurmez.
+    const safe = async (sql, params) => {
+      try { const r = await pool.query(sql, params || []); return r.rows; } catch (e) { return []; }
+    };
+    const count1 = async (sql) => { const rows = await safe(sql); return rows[0] ? Number(rows[0].n) || 0 : 0; };
+
+    // Son 14 gun (bugun dahil) — etiketler + gun basina doldurma iskeleti
+    const dayRows = await safe(
+      `SELECT to_char(d, 'YYYY-MM-DD') AS day FROM generate_series(${todayLocal} - 13, ${todayLocal}, interval '1 day') AS d`
+    );
+    const labels = dayRows.map((r) => r.day);
+    const idx = new Map(labels.map((d, i) => [d, i]));
+    const fill = (rows) => {
+      const out = new Array(labels.length).fill(0);
+      for (const r of rows) { const i = idx.get(r.day); if (i !== undefined) out[i] = Number(r.n) || 0; }
+      return out;
+    };
+    const perDay = (table, col) => safe(
+      `SELECT to_char(${dayOf(col)}, 'YYYY-MM-DD') AS day, count(*)::int AS n
+       FROM ${table} WHERE ${dayOf(col)} >= ${todayLocal} - 13 GROUP BY 1 ORDER BY 1`
+    );
+    const merge = (a, b) => a.map((v, i) => v + (b[i] || 0));
+
+    const [viewsShop, viewsFactory, likesShop, likesFactory, commentsShop, commentsFactory, visitorsSeries] = await Promise.all([
+      perDay('view_events', 'created_at'),
+      perDay('factory_video_view_events', 'created_at'),
+      perDay('product_likes', 'created_at'),
+      perDay('factory_likes', 'created_at'),
+      perDay('comments', 'created_at'),
+      perDay('factory_comments', 'created_at'),
+      perDay('site_visits', 'first_seen'),
+    ]);
+    const sViewsShop = fill(viewsShop), sViewsFactory = fill(viewsFactory);
+    const sLikesShop = fill(likesShop), sLikesFactory = fill(likesFactory);
+    const sComments = merge(fill(commentsShop), fill(commentsFactory));
+    const sViews = merge(sViewsShop, sViewsFactory);
+    const sLikes = merge(sLikesShop, sLikesFactory);
+    const sVisitors = fill(visitorsSeries);
+    const last = (arr) => arr[arr.length - 1] || 0;
+
+    const [onlineShop, onlineFactory, totalViewsCounter, totalViewsFactory, totalLikesShop, totalLikesFactory, totalCommentsShop, totalCommentsFactory, totalVisitors] = await Promise.all([
+      count1(`SELECT count(*)::int AS n FROM site_visits WHERE app = 'shop' AND last_seen > now() - INTERVAL '5 minutes'`),
+      count1(`SELECT count(DISTINCT session_id)::int AS n FROM factory_presence WHERE last_seen > now() - INTERVAL '5 minutes'`),
+      count1(`SELECT COALESCE(SUM(view_count), 0)::int AS n FROM products`),
+      count1(`SELECT COALESCE(SUM(views), 0)::int AS n FROM factory_video_views`),
+      count1(`SELECT count(*)::int AS n FROM product_likes`),
+      count1(`SELECT count(*)::int AS n FROM factory_likes`),
+      count1(`SELECT count(*)::int AS n FROM comments`),
+      count1(`SELECT count(*)::int AS n FROM factory_comments`),
+      count1(`SELECT count(*)::int AS n FROM site_visits`),
+    ]);
+
+    res.json({
+      ok: true,
+      tz: TZ,
+      generated_at: new Date().toISOString(),
+      today: {
+        date: labels[labels.length - 1] || null,
+        views: last(sViews),
+        likes: last(sLikes),
+        comments: last(sComments),
+        visitors: last(sVisitors),
+      },
+      online: onlineShop + onlineFactory,
+      online_detail: { shop: onlineShop, factory: onlineFactory },
+      series: { labels, views: sViews, likes: sLikes, visitors: sVisitors },
+      totals: {
+        views: totalViewsCounter + totalViewsFactory, // sayaç toplamları (tum zamanlar)
+        likes: totalLikesShop + totalLikesFactory,     // mevcut begeni sayisi (toggle-off dahil net)
+        comments: totalCommentsShop + totalCommentsFactory,
+        visitors: totalVisitors,                        // site_visits'te kayitli benzersiz sid (CBOs31 sonrasi)
+      },
+      by_app: {
+        today: {
+          shop: { views: last(sViewsShop), likes: last(sLikesShop), comments: last(fill(commentsShop)), visitors: last(sVisitors), online: onlineShop },
+          // Fabrika ziyaretcisi sid bazinda olculmuyor (presence yalniz online sayar) -> null.
+          factory: { views: last(sViewsFactory), likes: last(sLikesFactory), comments: last(fill(commentsFactory)), visitors: null, online: onlineFactory },
+        },
+        series: {
+          views: { shop: sViewsShop, factory: sViewsFactory },
+          likes: { shop: sLikesShop, factory: sLikesFactory },
+        },
+      },
+      sources: {
+        views: 'view_events (CBOs31 sonrasi) + factory_video_view_events (CBOs26.4 sonrasi); gecmis totals.views sayacinda',
+        likes: 'product_likes + factory_likes created_at — begeni geri alinirsa satir silinir, seri NET yeni begenidir',
+        visitors: 'site_visits first_seen — on yuz POST /api/stats/ping gondermeye basladigi gunden itibaren birikir',
+        online: 'magaza: site_visits son 5 dk; fabrika: factory_presence son 5 dk',
+      },
+    });
+  })
+);
+
 module.exports = router;
