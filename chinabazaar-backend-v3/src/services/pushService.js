@@ -78,6 +78,15 @@ async function listOwnerDevices(pool, ownerKind, ownerId) {
   return rows;
 }
 
+async function listAppDevices(pool, app) {
+  await ensurePushSchema(pool);
+  const { rows } = await pool.query(
+    `SELECT id, token, kind, platform, app, subscription FROM push_devices WHERE app = $1`,
+    [String(app)]
+  );
+  return rows;
+}
+
 async function listAllDevices(pool, limit) {
   await ensurePushSchema(pool);
   const { rows } = await pool.query(
@@ -132,12 +141,11 @@ function getWebPush() {
   return webpush;
 }
 
-// Ana giriş: bir sahibe (user/factory/admin) bildirim gönderir.
+// Gönderim çekirdeği: verilen cihaz listesine bildirimi yollar.
 // opts: { channel, preview, kind, url } — ASLA fırlatmaz.
-async function notifyOwner(pool, ownerKind, ownerId, opts) {
+async function sendToDevices(pool, devices, opts) {
   const out = { sent: 0, pruned: 0, skipped: 0 };
   try {
-    const devices = await listOwnerDevices(pool, ownerKind, ownerId);
     if (!devices.length) return out;
     const body = `${opts.channel || 'Mesaj'}: ${cleanPreview(opts.preview, opts.kind)}`;
     const url = opts.url || 'https://chinabazaar.com';
@@ -187,9 +195,32 @@ async function notifyOwner(pool, ownerKind, ownerId, opts) {
       }
     }
   } catch (e) {
-    console.error('[push] notifyOwner hatası:', e && e.message ? e.message : e);
+    console.error('[push] sendToDevices hatası:', e && e.message ? e.message : e);
   }
   return out;
+}
+
+// Ana giriş: bir sahibe (user/factory/admin) bildirim gönderir.
+async function notifyOwner(pool, ownerKind, ownerId, opts) {
+  try {
+    const devices = await listOwnerDevices(pool, ownerKind, ownerId);
+    return await sendToDevices(pool, devices, opts || {});
+  } catch (e) {
+    console.error('[push] notifyOwner hatası:', e && e.message ? e.message : e);
+    return { sent: 0, pruned: 0, skipped: 0 };
+  }
+}
+
+// Toplu duyuru: bir uygulamaya (shop/factory) kayıtlı TÜM cihazlara gönderir.
+async function notifyApp(pool, app, opts) {
+  try {
+    const devices = await listAppDevices(pool, app);
+    const out = await sendToDevices(pool, devices, opts || {});
+    return { ...out, devices: devices.length };
+  } catch (e) {
+    console.error('[push] notifyApp hatası:', e && e.message ? e.message : e);
+    return { sent: 0, pruned: 0, skipped: 0, devices: 0 };
+  }
 }
 
 function notifyUser(pool, userId, opts) { return notifyOwner(pool, 'user', userId, opts); }
@@ -201,8 +232,10 @@ module.exports = {
   upsertDevice,
   removeDevice,
   listOwnerDevices,
+  listAppDevices,
   listAllDevices,
   notifyOwner,
+  notifyApp,
   notifyUser,
   notifyFactory,
   notifyAdmins,
