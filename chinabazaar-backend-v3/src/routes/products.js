@@ -1804,6 +1804,12 @@ router.post('/factory/comments', requireAuth, factorySpamLimiter,
     if (me.rows[0]?.is_blocked) return res.status(403).json({ error: 'user_blocked' });
     const video = String(req.body.video);
     const text = String(req.body.body).trim();
+    // CBOs34: yorum içerik denetimi (sohbetle AYNI modül) — küfür/taciz/erotik/
+    // siyasi içerik taşıyan yorum KAYDEDİLMEZ, kullanıcıya gerekçe döner.
+    const modComment = moderation.checkTexts([text, req.body.translated_text]);
+    if (modComment.blocked) {
+      return res.status(400).json({ error: 'comment_blocked', category: modComment.category, message: 'Yorumunuz topluluk kurallarına aykırı içerik içeriyor (küfür, taciz, erotik veya siyasi içerik). Lütfen düzenleyip tekrar deneyin.' });
+    }
     const { rows } = await pool.query(
       `INSERT INTO factory_comments (user_id, video_key, body) VALUES ($1, $2, $3) RETURNING id, body, created_at`,
       [req.user.id, video, text]
@@ -5271,6 +5277,12 @@ router.post(
     if (!checkValidation(req, res)) return;
     const me = await pool.query('SELECT is_blocked FROM users WHERE id = $1', [req.user.id]);
     if (me.rows[0]?.is_blocked) return res.status(403).json({ error: 'user_blocked' });
+    // CBOs34: yorum içerik denetimi (sohbetle AYNI modül) — küfür/taciz/erotik/
+    // siyasi içerik taşıyan yorum KAYDEDİLMEZ, kullanıcıya gerekçe döner.
+    const modComment = moderation.checkTexts([req.body.body, req.body.translated_text]);
+    if (modComment.blocked) {
+      return res.status(400).json({ error: 'comment_blocked', category: modComment.category, message: 'Yorumunuz topluluk kurallarına aykırı içerik içeriyor (küfür, taciz, erotik veya siyasi içerik). Lütfen düzenleyip tekrar deneyin.' });
+    }
     // SHOP SECURITY: olmayan/pasif urune yorum FK hatasiyla 500 degil 404 doner.
     const { rows: pr } = await pool.query('SELECT id FROM products WHERE id = $1 AND is_active = TRUE', [req.params.id]);
     if (!pr.length) return res.status(404).json({ error: 'product_not_found' });
