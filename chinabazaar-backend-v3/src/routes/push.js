@@ -85,4 +85,20 @@ router.get('/devices', requireAuth, requireAdmin, asyncHandler(async (req, res) 
   res.json({ ok: true, items });
 }));
 
+// Admin: toplu duyuru — bir uygulamaya kayıtlı tüm cihazlara bildirim.
+// POST /api/admin/push/broadcast  { app: 'shop'|'factory', text, url? }
+router.post('/broadcast', requireAuth, requireAdmin, asyncHandler(async (req, res) => {
+  const b = req.body || {};
+  const app = b.app === 'shop' || b.app === 'factory' ? b.app : null;
+  if (!app) return res.status(400).json({ ok: false, error: 'invalid_app' });
+  const text = String(b.text || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+  if (!text) return res.status(400).json({ ok: false, error: 'empty_text' });
+  const fallback = app === 'shop' ? 'https://chinabazaar.shop' : 'https://chinabazaar.com';
+  const url = typeof b.url === 'string' && b.url.startsWith('https://') ? b.url.slice(0, 500) : fallback;
+  const CHANNELS = ['Duyuru', 'Reklam', 'Yeni Ürün', 'Sipariş', 'Yeni Fabrika'];
+  const channel = CHANNELS.includes(b.channel) ? b.channel : 'Duyuru';
+  const out = await pushService.notifyApp(pool, app, { channel, preview: text, url });
+  res.json({ ok: true, app, ...out });
+}));
+
 module.exports = router;
