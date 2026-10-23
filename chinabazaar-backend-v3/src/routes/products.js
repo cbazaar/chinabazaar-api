@@ -4226,8 +4226,14 @@ async function requireMasterAuth(req, res, next) {
     // 2026-10-21 F1: iptal edilmis master jeton reddedilir.
     if (payload.jti && (await isMasterJtiRevoked(payload.jti))) {
       return res.status(401).json({ error: 'token_revoked' });
-    }
+    }// 2026-10-23: revoke-all (tv) de burada kontrol edilir — diger master
+// dallarindaki desenle ayni (requireFactoryOrMasterAuth, requireUserOrFactoryAuth).
+if (!(await checkTokenVersion(payload))) {
+  return res.status(401).json({ error: 'token_revoked' });
+}
+
     req.isMaster = true; req.user = { id: 'cbai', email: null, role: 'master' }; return next();
+    
   }
   return res.status(403).json({ error: 'forbidden', message: 'Bu işlem için master yetkisi gerekli.' });
 }
