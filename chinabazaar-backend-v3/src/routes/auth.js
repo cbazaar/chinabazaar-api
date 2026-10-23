@@ -36,6 +36,12 @@
 // yönetici oturumu da beğeni/favori/yorum yapabilir; satır yoksa ilk
 // master girişinde idempotent oluşturulur, çözümleme fail-open'dır.
 // Bkz. resolveMasterUserId().
+// CBOs31.1: e-posta kodu ile giriş denetimi — akış (send-code →
+// login-with-code) zaten her kayıtlı kullanıcıya normal jeton üretiyordu;
+// iki sertleştirme eklendi: (1) login-with-code'a /login + verify-code ile
+// aynı locked_until kilit kontrolü (kod akışı şifre kilidini aşamıyordu),
+// (2) send-code'a e-posta başına 60 sn cooldown (phone M11 deseninin aynısı;
+// yanıt jenerik { sent: true }, hesap varlığı sızmaz).
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const { body, validationResult } = require('express-validator');
@@ -560,6 +566,21 @@ router.post(
     if (!checkValidation(req, res)) return;
     if (!mailer.isEnabled()) return res.status(503).json({ error: 'email_not_configured' });
     const { email } = req.body;
+    // CBOs31.1: e-posta başına 60 sn cooldown (phone-send-code M11 deseninin
+    // aynısı) — son 60 sn içinde bu adrese tüketilmemiş kod gittiyse yeni kod
+    // üretilmez ve mail gönderilmez; yanıt yine { sent: true } (hesap varlığı
+    // da gönderim durumu da sızmaz). Kayıt akışı da bu ucu kullandığı için
+    // kayıt kontrolü BİLEREK yok — yalnız sıklık sınırı var. Sorgu hatası
+    // (ör. tablo ilk kurulumda henüz yoksa) akışı bozmaz, devam edilir.
+    try {
+      const { rows: lastCode } = await pool.query(
+        `SELECT created_at FROM email_codes WHERE email = $1 AND consumed_at IS NULL ORDER BY created_at DESC LIMIT 1`,
+        [email]
+      );
+      if (lastCode.length && (Date.now() - new Date(lastCode[0].created_at).getTime()) < 60 * 1000) {
+        return res.json({ sent: true });
+      }
+    } catch (e) { /* cooldown okunamazsa normal akış devam eder */ }
     const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
     const codeHash = await bcrypt.hash(code, 10);
     const client = await pool.connect();
@@ -687,9 +708,17 @@ router.post(
     const { rows: urows } = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
     if (!urows[0]) return res.status(401).json({ error: 'invalid_credentials' }); // fix10e L2: jenerik (kullanıcı yokluğu söylenmez)
     const row = urows[0];
+    await ensureUserSecurityColumns(); // CBOs27.2 (CBOs31.1: kilit kontrolünden önce)
+    // CBOs31.1: kilitli hesap kodla da giremez — /login ve verify-code
+    // kullanıcı dalıyla aynı politika (önceden bu uç kilidi sessizce
+    // aşıyordu; noteUserLoginSuccess kilidi temizlediği için kilit, kod
+    // sahipliği kanıtına rağmen atlanıyordu).
+    if (row.locked_until && new Date(row.locked_until).getTime() > Date.now()) {
+      const retryAfter = Math.max(1, Math.ceil((new Date(row.locked_until).getTime() - Date.now()) / 1000));
+      return res.status(429).json({ error: 'account_locked', message: 'Hesabınız geçici olarak kilitlendi. Lütfen ' + Math.ceil(retryAfter / 60) + ' dakika sonra tekrar deneyin.', retry_after: retryAfter });
+    }
     if (row.blocked || row.is_blocked) return res.status(403).json({ error: 'account_blocked' }); // CBOs27.4: B'nin birlesik adi
     await pool.query('UPDATE users SET email_verified = TRUE WHERE id = $1', [row.id]);
-    await ensureUserSecurityColumns(); // CBOs27.2
     await noteUserLoginSuccess(req, row, { silent: true }); // CBOs27.2: sayaç/IP kaydı (mail yok — kod sahipliği kanıtlı)
     const user = publicUser(row);
     res.json({ user, token: signToken({ ...user, tv: row.token_version || 0 }) });
